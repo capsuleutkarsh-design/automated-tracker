@@ -117,6 +117,14 @@ def build_3d_tab(win, tab, presets):
         "on slow moves - exported frame numbers are adjusted to match."
     )
     form_row(sbody, "Frame step", win.spin_step)
+
+    win.spin_start_frame_3d = QSpinBox()
+    win.spin_start_frame_3d.setRange(0, 9999999)
+    win.spin_start_frame_3d.setValue(1)
+    win.spin_start_frame_3d.setToolTip("Frame number the shot's first frame sits on in your timeline.\nLeave at 1 unless the plate is numbered from something else -\na 1001-1200 sequence needs 1001, or the exported keys land\noff the end of your comp and read as a single static value.")
+    form_row(sbody, "Timeline start", win.spin_start_frame_3d)
+    sbody.addWidget(hint_label(
+        "Auto-filled from the file numbering when you select an image sequence."))
     ins.addWidget(solver_card)
 
     # ---- Options --------------------------------------------------------

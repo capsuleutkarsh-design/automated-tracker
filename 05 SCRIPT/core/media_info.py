@@ -11,19 +11,15 @@ import json
 import subprocess
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
+from core.app_paths import BASE_DIR, ffprobe_exe as _resolved_ffprobe
+from core.proc import hidden_kwargs
 
 DEFAULT_FPS = 24.0
 
 
 def _ffprobe_exe():
-    for candidate in (
-        BASE_DIR / "03 FFMPEG" / "bin" / "ffprobe.exe",
-        BASE_DIR / "03 FFMPEG" / "ffprobe.exe",
-    ):
-        if candidate.exists():
-            return candidate
-    return None
+    exe = _resolved_ffprobe()
+    return exe if exe.exists() else None
 
 
 def _parse_rational(text):
@@ -58,7 +54,6 @@ def probe_fps(video_path, default=DEFAULT_FPS):
     exe = _ffprobe_exe()
     if exe is not None:
         try:
-            creationflags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
             res = subprocess.run(
                 [
                     str(exe), "-v", "error",
@@ -66,8 +61,7 @@ def probe_fps(video_path, default=DEFAULT_FPS):
                     "-show_entries", "stream=r_frame_rate,avg_frame_rate",
                     "-of", "json", str(video_path),
                 ],
-                capture_output=True, text=True, timeout=10,
-                creationflags=creationflags,
+                text=True, timeout=10, **hidden_kwargs(capture=True),
             )
             if res.returncode == 0 and res.stdout.strip():
                 streams = json.loads(res.stdout).get("streams") or []
@@ -100,7 +94,6 @@ def probe_frame_count(video_path, fps=None, default=0):
     exe = _ffprobe_exe()
     if exe is not None:
         try:
-            creationflags = 0x08000000 if os.name == "nt" else 0
             res = subprocess.run(
                 [
                     str(exe), "-v", "error",
@@ -109,8 +102,7 @@ def probe_frame_count(video_path, fps=None, default=0):
                     "-show_entries", "stream=nb_read_packets,nb_frames,duration",
                     "-of", "json", str(video_path),
                 ],
-                capture_output=True, text=True, timeout=20,
-                creationflags=creationflags,
+                text=True, timeout=20, **hidden_kwargs(capture=True),
             )
             if res.returncode == 0 and res.stdout.strip():
                 streams = json.loads(res.stdout).get("streams") or []
@@ -133,3 +125,51 @@ def probe_frame_count(video_path, fps=None, default=0):
             pass
 
     return int(default)
+
+
+SEQ_EXTS = {".jpg", ".jpeg", ".png", ".exr", ".tif", ".tiff", ".dpx"}
+
+
+def detect_sequence_start(folder, default=1):
+    """
+    First frame number of an image sequence, read from its filenames.
+
+    A plate delivered as shot_a_1001.exr .. shot_a_1200.exr belongs on frames
+    1001-1200 of the timeline, but the pipeline renumbers everything to
+    frame_000001 on import - so without this the exports would be keyed from 1
+    and land nowhere near the plate.
+
+    Returns `default` when the folder is not a numbered sequence.
+    """
+    import re
+
+    folder = Path(folder)
+    if not folder.is_dir():
+        return int(default)
+
+    files = sorted(f for f in folder.iterdir()
+                   if f.is_file() and f.suffix.lower() in SEQ_EXTS)
+    if not files:
+        return int(default)
+
+    # the frame number is the last run of digits in the stem
+    m = re.findall(r"(\d+)", files[0].stem)
+    if not m:
+        return int(default)
+    try:
+        first = int(m[-1])
+    except ValueError:
+        return int(default)
+
+    # sanity: the second file should be the next frame (or close to it)
+    if len(files) > 1:
+        m2 = re.findall(r"(\d+)", files[1].stem)
+        if m2:
+            try:
+                second = int(m2[-1])
+            except ValueError:
+                return first
+            if not (0 < second - first <= 100):
+                return int(default)
+
+    return first

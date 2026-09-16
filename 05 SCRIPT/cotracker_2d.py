@@ -22,10 +22,16 @@ from PIL import Image, ImageDraw
 import torch
 import torch.nn.functional as F
 
-# Add 06 COTRACKER to sys.path
-BASE_DIR = Path(__file__).resolve().parent.parent
-COTRACKER_DIR = BASE_DIR / "06 COTRACKER"
-if str(COTRACKER_DIR) not in sys.path:
+_here = Path(__file__).resolve().parent
+if not getattr(sys, 'frozen', False) and str(_here) not in sys.path:
+    sys.path.insert(0, str(_here))
+
+from core.app_paths import BASE_DIR, COTRACKER_DIR, ffmpeg_exe
+from core.proc import run_hidden
+
+# The cotracker package is vendored in 06 COTRACKER when running from source;
+# frozen, it is bundled into the executable and already importable.
+if not getattr(sys, 'frozen', False) and str(COTRACKER_DIR) not in sys.path:
     sys.path.insert(0, str(COTRACKER_DIR))
 
 try:
@@ -34,9 +40,7 @@ try:
 except ImportError:
     HAS_COTRACKER = False
 
-FFMPEG_EXE = BASE_DIR / "03 FFMPEG" / "bin" / "ffmpeg.exe"
-if not FFMPEG_EXE.exists():
-    FFMPEG_EXE = BASE_DIR / "03 FFMPEG" / "ffmpeg.exe"
+FFMPEG_EXE = ffmpeg_exe()
 
 
 def get_default_device():
@@ -95,7 +99,7 @@ def load_video_frames(video_path, max_dimension=720, frame_step=1, in_point=0, o
                 "-qscale:v", "2",
                 str(tmp_dir / "f_%06d.jpg")
             ]
-            subprocess.run(cmd, check=True)
+            run_hidden(cmd, check=True)
             jpgs = sorted(list(tmp_dir.glob("*.jpg")))
             if out_point >= 0:
                 jpgs = jpgs[in_point:out_point + 1]
@@ -1326,9 +1330,12 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
     out_pt = config.get("out_point", -1)
     step = max(1, int(step))
     in_pt = max(0, int(in_pt))
-    # 1-based source frame this tracking range starts on, used by every exporter so the
-    # curves land on the right frames in Nuke / AE / Blender.
-    export_start_frame = in_pt + 1
+    # Frame number the exported curves start on. timeline_start is the frame the
+    # clip's first frame sits on in the edit (1 unless the shot is numbered from
+    # something else, e.g. a 1001-1200 plate); the In point is then an offset
+    # within it.
+    timeline_start = int(config.get("timeline_start", 1) or 1)
+    export_start_frame = timeline_start + in_pt
     frames_np, (orig_w, orig_h) = load_video_frames(video_path, max_dimension=max_dim, frame_step=step, in_point=in_pt, out_point=out_pt)
 
     T, proc_h, proc_w, _ = frames_np.shape
@@ -1637,6 +1644,7 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
         "track_count": total_points,
         "frame_count": T,
         "start_frame": export_start_frame,
+        "timeline_start": timeline_start,
         "frame_step": step,
         "layers_count": len(layers_results),
         "json_path": str(json_path),

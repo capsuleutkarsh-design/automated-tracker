@@ -9,6 +9,8 @@ import subprocess
 import ctypes
 from typing import Dict
 
+from core.proc import hidden_kwargs
+
 
 class MemoryStruct(ctypes.Structure):
     _fields_ = [
@@ -140,15 +142,8 @@ class GPUInfoProvider:
     def _query_slow_fallbacks(self) -> Dict[str, any]:
         # nvidia-smi fallback (silent, no window)
         try:
-            startupinfo = None
-            creationflags = 0
-            if os.name == 'nt':
-                creationflags = 0x08000000  # CREATE_NO_WINDOW
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
             cmd = ['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total,name', '--format=csv,noheader,nounits']
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=1, startupinfo=startupinfo, creationflags=creationflags)
+            res = subprocess.run(cmd, text=True, timeout=1, **hidden_kwargs(capture=True))
             if res.returncode == 0 and res.stdout.strip():
                 parts = [p.strip() for p in res.stdout.strip().split(',')]
                 if len(parts) >= 4:

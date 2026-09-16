@@ -1,0 +1,6 @@
+# build products
+dist/
+work/
+Output/
+version.txt
+app_icon.ico

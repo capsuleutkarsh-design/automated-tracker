@@ -49,7 +49,15 @@ MONO_STACK = "'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace"
 import os
 from pathlib import Path
 
-_ICON_DIR = Path(__file__).resolve().parent / "assets" / "_ui"
+try:
+    from core.app_paths import bundled_dir, writable_cache_dir
+except Exception:  # theme.py imported before the package is on sys.path
+    bundled_dir = lambda: Path(__file__).resolve().parent.parent
+    writable_cache_dir = lambda: Path(__file__).resolve().parent / "assets"
+
+# Prefer icons shipped with the build; fall back to a writable cache when the
+# install directory is read-only (Program Files).
+_ICON_DIR = bundled_dir() / "gui" / "assets" / "_ui"
 
 
 def _make_chevron(path, colour, up=False, size=18, thickness=2):
@@ -79,11 +87,17 @@ def _chevrons():
     out = {}
     for name, (colour, up) in wanted.items():
         f = _ICON_DIR / name
-        try:
-            if not f.exists():
-                _make_chevron(f, colour, up=up)
+        if f.exists():
             out[name] = f.as_posix()
-        except Exception:
+            continue
+        for target in (f, writable_cache_dir() / "ui" / name):
+            try:
+                _make_chevron(target, colour, up=up)
+                out[name] = target.as_posix()
+                break
+            except Exception:
+                continue
+        else:
             out[name] = ""
     return out
 

@@ -12,6 +12,7 @@ from PySide6.QtCore import QThread, Signal
 
 from mask_animator import AnimatedMask, rasterize_masks_to_png
 from core.media_info import probe_fps
+from core.proc import popen_hidden, hidden_kwargs
 
 
 class TrackerWorker(QThread):
@@ -374,7 +375,8 @@ class TrackerWorker(QThread):
                         track_dir,
                         blender_path=b_path,
                         log_callback=lambda m, c: self.log_signal.emit(m, c),
-                        fps=eff_fps
+                        fps=eff_fps,
+                        start_frame=self.config.get("timeline_start", 1),
                     )
                     if exp_res.get("success"):
                         self.log_signal.emit(f"   ✔ Generated 1-Click Blender Script: import_to_blender.py", "#00d2ff")
@@ -417,14 +419,12 @@ class TrackerWorker(QThread):
         if self.is_cancelled:
             return False
         try:
-            self.process = subprocess.Popen(
+            self.process = popen_hidden(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                capture=True,
                 universal_newlines=True,
                 env=env,
                 bufsize=1,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
 
             for line in iter(self.process.stdout.readline, ''):
@@ -539,7 +539,9 @@ class FrameExtractorWorker(QThread):
             str(self.output_dir / "frame_%06d.jpg")
         ]
         try:
-            p = subprocess.Popen(cmd)
+            # Explicit handles: a windowed build has none to inherit, and the
+            # child silently fails to start without them.
+            p = popen_hidden(cmd)
             p.wait()
             jpgs = list(self.output_dir.glob("*.jpg"))
             self.finished_signal.emit(self.video_path.stem, len(jpgs))

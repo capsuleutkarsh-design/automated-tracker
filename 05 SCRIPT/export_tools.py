@@ -1099,22 +1099,9 @@ def auto_export_alembic_via_blender(scene_dir, blender_path=None, log_callback=N
         log_callback(f"▶ Auto-baking Alembic (.abc) & Blender (.blend) via {blender_exe.name}...", "#00d2ff")
 
     try:
-        startupinfo = None
-        creationflags = 0
-        if os.name == 'nt':
-            creationflags = 0x08000000  # CREATE_NO_WINDOW
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
         cmd = [str(blender_exe), "--background", "--python", str(blender_script)]
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=90,
-            startupinfo=startupinfo,
-            creationflags=creationflags
-        )
+        from core.proc import hidden_kwargs
+        proc = subprocess.run(cmd, text=True, timeout=90, **hidden_kwargs(capture=True))
         abc_path = scene_path / "camera_track.abc"
         if abc_path.exists():
             if log_callback:
@@ -1137,7 +1124,10 @@ def auto_export_alembic_via_blender(scene_dir, blender_path=None, log_callback=N
 def _probe_scene_fps(scene_path):
     """Best-effort frame rate for a 3D_CAMERA_TRACK folder, via its source clip."""
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        if not getattr(sys, 'frozen', False):
+            here = str(Path(__file__).resolve().parent)
+            if here not in sys.path:
+                sys.path.insert(0, here)
         from core.media_info import probe_fps
     except Exception:
         return None
@@ -1160,7 +1150,8 @@ def _probe_scene_fps(scene_path):
     return None
 
 
-def export_all_formats(scene_dir, blender_path=None, log_callback=None, fps=None):
+def export_all_formats(scene_dir, blender_path=None, log_callback=None, fps=None,
+                       start_frame=None):
     """
     Parses a COLMAP scene folder and automatically generates all export formats:
     - import_to_blender.py
@@ -1198,6 +1189,19 @@ def export_all_formats(scene_dir, blender_path=None, log_callback=None, fps=None
     cameras = parse_colmap_cameras(cameras_file)
     images = parse_colmap_images(images_file)
     points = parse_colmap_points3D(points3D_file)
+
+    # Frames are numbered from the extracted filenames, which the pipeline always
+    # renumbers from 1. Shift them onto the shot's real timeline so the camera
+    # lands on the same frames as the plate. Every exporter below reads
+    # img['frame'], so doing it once here covers all of them.
+    if start_frame and images:
+        offset = int(start_frame) - min(i["frame"] for i in images.values())
+        if offset:
+            for i in images.values():
+                i["frame"] += offset
+            if log_callback:
+                log_callback("   Timeline start %d - camera keys shifted by %+d frames."
+                             % (int(start_frame), offset), "#a0a0b0")
 
     exported_files = []
 

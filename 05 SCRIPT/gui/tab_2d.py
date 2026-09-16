@@ -62,6 +62,12 @@ def build_2d_tab(win, tab):
         "Extract every frame to disk so scrubbing is instant")
     win.btn_extract_frames.clicked.connect(win._extract_frames_for_current_video)
     mbody.addWidget(win.btn_extract_frames)
+
+    win.spin_start_frame_2d = QSpinBox()
+    win.spin_start_frame_2d.setRange(0, 9999999)
+    win.spin_start_frame_2d.setValue(1)
+    win.spin_start_frame_2d.setToolTip("Frame number the shot's first frame sits on in your timeline.\nLeave at 1 unless the plate is numbered from something else -\na 1001-1200 sequence needs 1001, or the exported keys land\noff the end of your comp and read as a single static value.")
+    form_row(mbody, "Timeline start", win.spin_start_frame_2d)
     ins.addWidget(media_card)
 
     # ---- Layers ---------------------------------------------------------
