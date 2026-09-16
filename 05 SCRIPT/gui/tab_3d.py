@@ -1,82 +1,76 @@
 """
-3D Camera Tracker Tab UI Builder
-Authentic desktop workstation layout (Foundry Nuke & 3DEqualizer style).
-Seamless flat property inspector and integrated action toolbar.
+3D Camera Tracking tab.
+
+Layout: a scrollable inspector on the left (preset -> solver -> options ->
+integration, in the order you actually touch them), and on the right the media
+pool over the console, with the run controls pinned to the bottom.
+
+Every widget is attached to `win` under the same name the main window uses, so
+the handlers in tracker_gui.py are unchanged.
 """
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
     QSpinBox, QDoubleSpinBox, QCheckBox, QPushButton, QTextEdit,
-    QProgressBar, QGroupBox, QTableWidget, QHeaderView, QSplitter,
-    QLineEdit, QFormLayout
+    QProgressBar, QTableWidget, QHeaderView, QSplitter,
+    QLineEdit, QAbstractItemView,
 )
 from PySide6.QtCore import Qt
 
+from gui.ui_kit import (
+    tame_combos,
+    card, form_row, button_row, checkbox_grid, inspector_scroll,
+    make_button, hint_label,
+)
+
 
 def build_3d_tab(win, tab, presets):
-    """
-    Constructs the 3D Camera Tracking Tab with seamless flat property inspector,
-    compact media pool, and integrated desktop action controls.
-    """
-    tab_layout = QVBoxLayout(tab)
-    tab_layout.setContentsMargins(4, 4, 4, 4)
-    tab_layout.setSpacing(4)
+    root = QVBoxLayout(tab)
+    root.setContentsMargins(8, 8, 8, 8)
+    root.setSpacing(8)
 
     splitter = QSplitter(Qt.Horizontal)
-    tab_layout.addWidget(splitter, 1)
+    splitter.setChildrenCollapsible(False)
+    root.addWidget(splitter, 1)
 
-    # ---------------- Left Panel (Flat Property Inspector) ----------------
-    left_widget = QWidget()
-    left_layout = QVBoxLayout(left_widget)
-    left_layout.setContentsMargins(4, 0, 4, 0)
-    left_layout.setSpacing(4)
+    # =====================================================================
+    # LEFT - inspector
+    # =====================================================================
+    inspector = QWidget()
+    ins = QVBoxLayout(inspector)
+    ins.setContentsMargins(0, 0, 6, 0)
+    ins.setSpacing(10)
 
-    # Section 1: Presets
-    preset_group = QGroupBox("SHOT PRESET")
-    preset_layout = QVBoxLayout(preset_group)
-    preset_layout.setSpacing(4)
-    preset_layout.setContentsMargins(2, 6, 2, 4)
-
+    # ---- Shot preset ----------------------------------------------------
+    preset_card, pbody = card("Shot Preset")
     win.preset_combo = QComboBox()
     for name in presets.keys():
         win.preset_combo.addItem(name)
+    win.preset_combo.setToolTip("Starting point tuned for a type of camera move.\n"
+                                "Every value below stays editable afterwards.")
     win.preset_combo.currentTextChanged.connect(win._on_preset_changed)
-    preset_layout.addWidget(win.preset_combo)
+    pbody.addWidget(win.preset_combo)
 
     win.preset_desc = QLabel()
+    win.preset_desc.setObjectName("hint")
     win.preset_desc.setWordWrap(True)
-    win.preset_desc.setStyleSheet("font-size: 11px; color: #8b929e; padding: 2px 0px; line-height: 1.35;")
-    preset_layout.addWidget(win.preset_desc)
-    left_layout.addWidget(preset_group)
+    pbody.addWidget(win.preset_desc)
+    ins.addWidget(preset_card)
 
-    # Section 2: Fine-Tuning Parameters
-    param_group = QGroupBox("CAMERA & SOLVER PARAMETERS")
-    form_lay = QFormLayout(param_group)
-    form_lay.setContentsMargins(2, 6, 2, 4)
-    form_lay.setSpacing(4)
-    form_lay.setLabelAlignment(Qt.AlignLeft)
+    # ---- Solver ---------------------------------------------------------
+    solver_card, sbody = card("Camera & Solver")
 
     win.combo_solver_engine = QComboBox()
     win.combo_solver_engine.addItems([
         "Incremental SfM (Standard / All GPUs)",
-        "Hierarchical Multi-Cluster Mapper (faster on long shots)"
+        "Hierarchical Multi-Cluster Mapper (faster on long shots)",
     ])
-    form_lay.addRow("Solver Engine:", win.combo_solver_engine)
-
-    win.spin_tri = QDoubleSpinBox()
-    win.spin_tri.setRange(1.0, 30.0)
-    win.spin_tri.setValue(2.5)
-    form_lay.addRow("Min Triangulation Angle (°):", win.spin_tri)
-
-    win.spin_overlap = QSpinBox()
-    win.spin_overlap.setRange(5, 100)
-    win.spin_overlap.setValue(35)
-    form_lay.addRow("Matching Overlap (Frames):", win.spin_overlap)
-
-    win.spin_inliers = QSpinBox()
-    win.spin_inliers.setRange(15, 500)
-    win.spin_inliers.setValue(40)
-    form_lay.addRow("Min Initial Inliers:", win.spin_inliers)
+    win.combo_solver_engine.setToolTip(
+        "Incremental registers frames one at a time - the most reliable choice.\n"
+        "Hierarchical splits a long shot into clusters and merges them, which is\n"
+        "faster on long takes but falls back to incremental if it fails."
+    )
+    form_row(sbody, "Solver engine", win.combo_solver_engine)
 
     win.combo_cam = QComboBox()
     win.combo_cam.addItems([
@@ -86,177 +80,207 @@ def build_3d_tab(win, tab, presets):
         "OPENCV_FISHEYE (Wide-Angle / Action Cam)",
         "PINHOLE (Zero Distortion)",
         "SPHERICAL (360° Panoramic VR / Insta360)",
-        "EUCM (Enhanced Unified Model / Drone Fisheye)"
+        "EUCM (Enhanced Unified Model / Drone Fisheye)",
     ])
-    form_lay.addRow("Camera Model:", win.combo_cam)
+    win.combo_cam.setToolTip("Lens distortion model COLMAP solves for.")
+    form_row(sbody, "Camera model", win.combo_cam)
+
+    win.spin_tri = QDoubleSpinBox()
+    win.spin_tri.setRange(0.5, 30.0)
+    win.spin_tri.setSingleStep(0.5)
+    win.spin_tri.setValue(2.5)
+    win.spin_tri.setSuffix("  °")
+    win.spin_tri.setToolTip(
+        "Parallax the first image pair must show before the solve starts.\n"
+        "Lower it for walking and dolly shots; raise it for orbits."
+    )
+    form_row(sbody, "Min triangulation", win.spin_tri)
+
+    win.spin_overlap = QSpinBox()
+    win.spin_overlap.setRange(5, 100)
+    win.spin_overlap.setValue(35)
+    win.spin_overlap.setSuffix("  frames")
+    win.spin_overlap.setToolTip("How many neighbouring frames each frame is matched against.")
+    form_row(sbody, "Matching overlap", win.spin_overlap)
+
+    win.spin_inliers = QSpinBox()
+    win.spin_inliers.setRange(15, 500)
+    win.spin_inliers.setValue(40)
+    win.spin_inliers.setToolTip("Minimum verified matches needed to accept the starting pair.")
+    form_row(sbody, "Min initial inliers", win.spin_inliers)
 
     win.spin_step = QSpinBox()
     win.spin_step.setRange(1, 10)
     win.spin_step.setValue(1)
-    form_lay.addRow("Frame Step (1=All, 2=Sub):", win.spin_step)
+    win.spin_step.setToolTip(
+        "1 uses every frame. 2 uses every second frame, which widens the baseline\n"
+        "on slow moves - exported frame numbers are adjusted to match."
+    )
+    form_row(sbody, "Frame step", win.spin_step)
+    ins.addWidget(solver_card)
 
-    win.chk_single_cam = QCheckBox("Single Camera (Fixed Focal Length)")
+    # ---- Options --------------------------------------------------------
+    opt_card, obody = card("Solve Options")
+
+    win.chk_single_cam = QCheckBox("Single camera")
     win.chk_single_cam.setChecked(True)
-    win.chk_ba_refine = QCheckBox("Auto-Refine Lens Distortion (BA)")
+    win.chk_single_cam.setToolTip("All frames share one fixed focal length. Turn off for a zoom.")
+
+    win.chk_ba_refine = QCheckBox("Refine distortion")
     win.chk_ba_refine.setChecked(True)
     win.chk_ba_refine.setToolTip(
         "Lets bundle adjustment solve focal length and distortion instead of\n"
         "trusting the initial guess. Turn off if you know the exact lens."
     )
-    win.chk_mesh_gen = QCheckBox("Auto-Generate 3D Environment Mesh (.ply)")
-    win.chk_mesh_gen.setChecked(True)
-    win.chk_gpu = QCheckBox("Use NVIDIA GPU Acceleration (CUDA)")
+
+    win.chk_gpu = QCheckBox("GPU features")
     win.chk_gpu.setChecked(True)
-    win.chk_caspar_ba = QCheckBox("GPU Bundle Adjustment (CUDA)")
+    win.chk_gpu.setToolTip("CUDA SIFT. Much faster than the CPU path.")
+
+    win.chk_caspar_ba = QCheckBox("GPU bundle adj.")
     win.chk_caspar_ba.setChecked(True)
     win.chk_caspar_ba.setToolTip(
         "Runs COLMAP bundle adjustment on the GPU (--Mapper.ba_use_gpu).\n"
         "Needs a CUDA GPU; turn off to solve on the CPU."
     )
 
-    form_lay.addRow(win.chk_single_cam)
-    form_lay.addRow(win.chk_ba_refine)
-    form_lay.addRow(win.chk_mesh_gen)
-    form_lay.addRow(win.chk_gpu)
-    form_lay.addRow(win.chk_caspar_ba)
+    win.chk_mesh_gen = QCheckBox("Environment mesh")
+    win.chk_mesh_gen.setChecked(True)
+    win.chk_mesh_gen.setToolTip("Meshes the sparse cloud for a rough collision surface.")
 
-    left_layout.addWidget(param_group)
+    checkbox_grid(obody, [
+        win.chk_single_cam, win.chk_gpu,
+        win.chk_ba_refine, win.chk_caspar_ba,
+        win.chk_mesh_gen,
+    ], columns=2)
+    ins.addWidget(opt_card)
 
-    # Section 3: Blender Integration
-    blender_group = QGroupBox("BLENDER EXECUTABLE (OPTIONAL)")
-    b_lay = QHBoxLayout(blender_group)
-    b_lay.setContentsMargins(2, 6, 2, 4)
-    b_lay.setSpacing(4)
+    # ---- Blender --------------------------------------------------------
+    blend_card, bbody = card("Blender Integration")
+    brow = QHBoxLayout()
+    brow.setSpacing(6)
     win.txt_blender_path = QLineEdit()
-    win.txt_blender_path.setPlaceholderText("Path to blender.exe...")
-    btn_browse_blender = QPushButton("Browse...")
+    win.txt_blender_path.setPlaceholderText("Auto-detected - or point at blender.exe")
+    win.txt_blender_path.setToolTip(
+        "Used to bake camera_track.abc and .blend automatically after a solve.\n"
+        "Leave empty to let the app find Blender itself."
+    )
+    btn_browse_blender = make_button("Browse", "Locate blender.exe")
+    btn_browse_blender.setFixedWidth(84)
     btn_browse_blender.clicked.connect(win._browse_blender_exe)
-    b_lay.addWidget(win.txt_blender_path, 1)
-    b_lay.addWidget(btn_browse_blender)
-    left_layout.addWidget(blender_group)
+    brow.addWidget(win.txt_blender_path, 1)
+    brow.addWidget(btn_browse_blender)
+    bbody.addLayout(brow)
+    bbody.addWidget(hint_label(
+        "Optional. Without it you still get the 1-click import script."))
+    ins.addWidget(blend_card)
 
-    left_layout.addStretch()
-    splitter.addWidget(left_widget)
+    ins.addStretch(1)
+    splitter.addWidget(inspector_scroll(inspector))
 
-    # ---------------- Right Panel (Media Pool & Diagnostics) ----------------
-    right_widget = QWidget()
-    right_layout = QVBoxLayout(right_widget)
-    right_layout.setContentsMargins(4, 0, 2, 0)
-    right_layout.setSpacing(4)
+    # =====================================================================
+    # RIGHT - media pool, console, actions
+    # =====================================================================
+    right = QWidget()
+    rl = QVBoxLayout(right)
+    rl.setContentsMargins(6, 0, 0, 0)
+    rl.setSpacing(10)
 
-    video_group = QGroupBox("MEDIA SEQUENCES")
-    video_layout = QVBoxLayout(video_group)
-    video_layout.setContentsMargins(2, 6, 2, 4)
-    video_layout.setSpacing(4)
+    # ---- Media pool -----------------------------------------------------
+    media_card, mbody = card("Media Pool")
 
-    btn_bar = QHBoxLayout()
-    btn_bar.setSpacing(4)
-    btn_add = QPushButton("+ Add Media...")
-    btn_add.setFixedHeight(24)
+    btn_add = make_button("+ Add Media", "Copy video files into 02 VIDEOS", "compact")
     btn_add.clicked.connect(win._add_videos)
-    btn_refresh = QPushButton("Refresh")
-    btn_refresh.setFixedHeight(24)
+    btn_refresh = make_button("Refresh", "Rescan the media folder", "compact")
     btn_refresh.clicked.connect(win._refresh_videos)
-    btn_open_videos = QPushButton("Open Media Folder")
-    btn_open_videos.setFixedHeight(24)
+    btn_open_videos = make_button("Open Folder", "Show 02 VIDEOS in Explorer", "compact")
     btn_open_videos.clicked.connect(win._open_videos_folder)
-    btn_bar.addWidget(btn_add)
-    btn_bar.addWidget(btn_refresh)
-    btn_bar.addWidget(btn_open_videos)
-    btn_bar.addStretch()
-    video_layout.addLayout(btn_bar)
+    for b in (btn_add, btn_refresh, btn_open_videos):
+        media_card.header_layout.addWidget(b)
 
     win.table = QTableWidget(0, 3)
     win.table.setHorizontalHeaderLabels(["Item Name", "Size / Frames", "Tracking Status"])
     win.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
     win.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
     win.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+    win.table.horizontalHeader().setHighlightSections(False)
     win.table.verticalHeader().setVisible(False)
-    win.table.setSelectionBehavior(QTableWidget.SelectRows)
+    win.table.setShowGrid(False)
+    win.table.setAlternatingRowColors(False)
+    win.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+    win.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+    win.table.setMinimumHeight(150)
+    win.table.setToolTip(
+        "Select the shots to solve. With nothing selected, every shot in the\n"
+        "folder is solved. Double-click a row to open its output."
+    )
     win.table.itemSelectionChanged.connect(win._on_table_row_selected)
     win.table.itemDoubleClicked.connect(win._on_table_row_double_clicked)
-    video_layout.addWidget(win.table)
-    right_layout.addWidget(video_group, 2)
+    mbody.addWidget(win.table)
+    mbody.addWidget(hint_label(
+        "Select rows to solve only those shots — select nothing to solve all."))
+    rl.addWidget(media_card, 3)
 
-    # Log & Actions
-    log_group = QGroupBox("3D SOLVER CONSOLE")
-    log_layout = QVBoxLayout(log_group)
-    log_layout.setContentsMargins(2, 6, 2, 4)
-    log_layout.setSpacing(4)
+    # ---- Console --------------------------------------------------------
+    log_card, lbody = card("Solver Console")
+    btn_clear_3d_log = make_button("Clear", "Empty the console", "compact")
+    btn_clear_3d_log.setFixedWidth(64)
+    log_card.header_layout.addWidget(btn_clear_3d_log)
 
     win.log_text = QTextEdit()
     win.log_text.setReadOnly(True)
-
-    log_top_bar = QHBoxLayout()
-    lbl_engine_log = QLabel("Engine Diagnostics Console")
-    lbl_engine_log.setStyleSheet("font-size: 10px; color: #6b7280; font-weight: 600;")
-    btn_clear_3d_log = QPushButton("Clear Log")
-    btn_clear_3d_log.setFixedHeight(20)
+    win.log_text.setMinimumHeight(120)
     btn_clear_3d_log.clicked.connect(win.log_text.clear)
-    log_top_bar.addWidget(lbl_engine_log)
-    log_top_bar.addStretch()
-    log_top_bar.addWidget(btn_clear_3d_log)
-    log_layout.addLayout(log_top_bar)
-
-    log_layout.addWidget(win.log_text)
+    lbody.addWidget(win.log_text, 1)
 
     win.progress_bar = QProgressBar()
     win.progress_bar.setValue(0)
     win.progress_bar.setFormat("Ready")
-    log_layout.addWidget(win.progress_bar)
+    lbody.addWidget(win.progress_bar)
+    rl.addWidget(log_card, 2)
 
-    # Integrated Action Toolbar (Desktop Proportions)
-    action_box = QVBoxLayout()
-    action_box.setSpacing(4)
+    # ---- Actions --------------------------------------------------------
+    act_card, abody = card(None)
+    abody.setSpacing(7)
 
-    # Row 1: Primary Execution & Cancel
-    row1 = QHBoxLayout()
-    row1.setSpacing(5)
-
-    win.btn_start_3d = QPushButton("▶ START 3D CAMERA TRACKING")
-    win.btn_start_3d.setObjectName("primaryBtn")
-    win.btn_start_3d.setFixedHeight(28)
+    run_row = QHBoxLayout()
+    run_row.setSpacing(7)
+    win.btn_start_3d = QPushButton("▶   Start 3D Camera Tracking")
+    win.btn_start_3d.setObjectName("primary")
+    win.btn_start_3d.setToolTip("Solve camera motion for the selected shots")
     win.btn_start_3d.clicked.connect(win._start_tracking_3d)
 
     win.btn_stop_3d = QPushButton("Cancel")
-    win.btn_stop_3d.setObjectName("stopBtn")
-    win.btn_stop_3d.setFixedHeight(28)
-    win.btn_stop_3d.setFixedWidth(80)
+    win.btn_stop_3d.setObjectName("danger")
+    win.btn_stop_3d.setToolTip("Stop the solve after the current COLMAP stage")
+    win.btn_stop_3d.setFixedWidth(100)
     win.btn_stop_3d.setEnabled(False)
     win.btn_stop_3d.clicked.connect(win._stop_tracking_3d)
 
-    row1.addWidget(win.btn_start_3d, 1)
-    row1.addWidget(win.btn_stop_3d)
-    action_box.addLayout(row1)
+    run_row.addWidget(win.btn_start_3d, 1)
+    run_row.addWidget(win.btn_stop_3d)
+    abody.addLayout(run_row)
 
-    # Row 2: Exports & Outputs
-    row2 = QHBoxLayout()
-    row2.setSpacing(4)
-
-    win.btn_export_3d_blender = QPushButton("Export for Blender (.abc)")
-    win.btn_export_3d_blender.setObjectName("blenderBtn")
-    win.btn_export_3d_blender.setFixedHeight(24)
-    win.btn_export_3d_blender.setToolTip("Bakes and reveals camera_track.abc & script for Blender")
+    win.btn_export_3d_blender = make_button(
+        "Blender  (.abc)", "Bake and reveal camera_track.abc and the import script", "export")
     win.btn_export_3d_blender.clicked.connect(win._export_3d_for_blender)
 
-    win.btn_export_3d_nuke = QPushButton("Export for Nuke (.abc / .nk)")
-    win.btn_export_3d_nuke.setObjectName("nukeBtn")
-    win.btn_export_3d_nuke.setFixedHeight(24)
-    win.btn_export_3d_nuke.setToolTip("Copies 3D Camera & Point Cloud script to clipboard for Ctrl+V in Nuke")
+    win.btn_export_3d_nuke = make_button(
+        "Nuke  (.nk / .chan)", "Copy the 3D camera and point cloud to the clipboard for Ctrl+V in Nuke", "export")
     win.btn_export_3d_nuke.clicked.connect(win._export_3d_for_nuke)
 
-    win.btn_open_3d_exports = QPushButton("Open Folder")
-    win.btn_open_3d_exports.setFixedHeight(24)
-    win.btn_open_3d_exports.setFixedWidth(95)
+    win.btn_open_3d_exports = make_button(
+        "Open Output", "Show the solved scene folder", "export")
     win.btn_open_3d_exports.clicked.connect(win._open_3d_output_folder)
 
-    row2.addWidget(win.btn_export_3d_blender, 1)
-    row2.addWidget(win.btn_export_3d_nuke, 1)
-    row2.addWidget(win.btn_open_3d_exports)
-    action_box.addLayout(row2)
+    button_row(abody, [win.btn_export_3d_blender,
+                       win.btn_export_3d_nuke,
+                       win.btn_open_3d_exports], compact=False)
+    rl.addWidget(act_card)
 
-    log_layout.addLayout(action_box)
-
-    right_layout.addWidget(log_group, 3)
-    splitter.addWidget(right_widget)
-    splitter.setSizes([340, 780])
+    splitter.addWidget(right)
+    splitter.setStretchFactor(0, 0)
+    splitter.setStretchFactor(1, 1)
+    # Combos on the right-hand side get the same treatment as the inspector.
+    tame_combos(right, shrink=False)
+    splitter.setSizes([430, 1000])

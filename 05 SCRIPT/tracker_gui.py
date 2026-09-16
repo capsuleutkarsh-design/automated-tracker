@@ -18,7 +18,9 @@ try:
         QGraphicsOpacityEffect
     )
     from PySide6.QtCore import Qt, QTimer
-    from PySide6.QtGui import QColor, QImage, QPixmap, QPainter, QDragEnterEvent, QDropEvent
+    from PySide6.QtGui import (
+        QColor, QImage, QPixmap, QPainter, QDragEnterEvent, QDropEvent, QPalette
+    )
 except ImportError:
     print("[ERROR] PySide6 is not installed. Please run launch_gui.bat or install it via: pip install PySide6")
     sys.exit(1)
@@ -54,7 +56,10 @@ else:
 COLMAP_BAT = COLMAP_DIR / "COLMAP.bat"
 
 # Import Modular GUI & Core Components
-from gui.theme import DARK_STUDIO_QSS
+from gui.theme import (
+    DARK_STUDIO_QSS, OK, ERR, TEXT, TEXT_MUTED,
+    BG_APP, BG_PANEL, BG_INPUT, BG_RAISED, ACCENT_DIM,
+)
 from gui.tab_3d import build_3d_tab
 from gui.tab_2d import build_2d_tab
 from core.tracking_layer import TrackingLayer
@@ -243,6 +248,15 @@ class TrackerMainWindow(QMainWindow):
         self._refresh_videos()
         self._update_hardware_monitor()
 
+    @staticmethod
+    def _set_chip_state(widget, state):
+        """Chips are styled by the theme; handlers only set the state."""
+        if widget.property("state") == state:
+            return
+        widget.setProperty("state", state)
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
     def _setup_style(self):
         self.setStyleSheet(DARK_STUDIO_QSS)
 
@@ -321,25 +335,27 @@ class TrackerMainWindow(QMainWindow):
 
         # --- Layer 0 (bottom): Background image at very low opacity ---
         self._bg_label = QLabel()
-        self._bg_label.setStyleSheet("background-color: #14151a;")
+        self._bg_label.setObjectName("bgPlate")
         self._bg_label.setScaledContents(True)
 
         bg_pixmap = self._pick_random_bg_image()
         if bg_pixmap:
             self._bg_label.setPixmap(bg_pixmap)
             opacity_fx = QGraphicsOpacityEffect(self._bg_label)
-            opacity_fx.setOpacity(0.25)
+            # Low enough to read as texture. At 0.25 it showed through only in the
+            # gaps between panels, which looked like a rendering fault.
+            opacity_fx.setOpacity(0.10)
             self._bg_label.setGraphicsEffect(opacity_fx)
 
         stacked.addWidget(self._bg_label)
 
         # --- Layer 1 (top): Actual workspace content ---
         content = QWidget()
-        content.setStyleSheet("background-color: transparent;")
+        content.setObjectName("workspaceRoot")
         content.setAttribute(Qt.WA_TransparentForMouseEvents, False)
         content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(6, 6, 6, 4)
-        content_layout.setSpacing(4)
+        content_layout.setContentsMargins(10, 4, 10, 4)
+        content_layout.setSpacing(0)
 
         # Main Workspace Tab Widget
         self.tabs = QTabWidget()
@@ -361,7 +377,8 @@ class TrackerMainWindow(QMainWindow):
         statusbar.setSizeGripEnabled(False)
 
         self.status_msg = QLabel("Ready")
-        self.status_msg.setStyleSheet("color: #9ca3af; padding-left: 4px; font-size: 11px;")
+        self.status_msg.setObjectName("hint")
+        self.status_msg.setStyleSheet("padding-left: 6px;")
         statusbar.addWidget(self.status_msg, 1)
 
         self.status_gpu = QLabel("GPU: Checking...")
@@ -441,33 +458,28 @@ class TrackerMainWindow(QMainWindow):
                 used_gb = used_mb / 1024.0
                 total_gb = total_mb / 1024.0
 
-                if load >= 50:
-                    text_col = "#38bdf8"
-                else:
-                    text_col = "#9ca3af"
-
                 self.status_gpu.setText(f"GPU: {name} ({load}%) | {used_gb:.1f}/{total_gb:.1f} GB")
-                self.status_gpu.setStyleSheet(f"color: {text_col};")
+                self._set_chip_state(self.status_gpu, "busy" if load >= 50 else "idle")
             else:
                 self.status_gpu.setText("Device: CPU Mode")
-                self.status_gpu.setStyleSheet("color: #9ca3af;")
+                self._set_chip_state(self.status_gpu, "idle")
         except Exception:
             self.status_gpu.setText("GPU: Ready")
 
         b_path = self.txt_blender_path.text().strip() if hasattr(self, 'txt_blender_path') else None
         if b_path:
             self.status_blender.setText("Blender: Linked")
-            self.status_blender.setStyleSheet("color: #38bdf8;")
+            self._set_chip_state(self.status_blender, "busy")
         else:
             self.status_blender.setText("Blender: Auto")
-            self.status_blender.setStyleSheet("color: #9ca3af;")
+            self._set_chip_state(self.status_blender, "idle")
 
         if COLMAP_EXE.exists():
             self.status_colmap.setText("COLMAP: Ready")
-            self.status_colmap.setStyleSheet("color: #9ca3af;")
+            self._set_chip_state(self.status_colmap, "idle")
         else:
             self.status_colmap.setText("COLMAP: Missing")
-            self.status_colmap.setStyleSheet("color: #fca5a5;")
+            self._set_chip_state(self.status_colmap, "bad")
 
     # =========================================================================
     # EVENT HANDLERS: 3D TAB
@@ -811,7 +823,10 @@ class TrackerMainWindow(QMainWindow):
     def _flash_button_feedback(self, btn, orig_text, success_text="✔ Copied to Clipboard!", duration_ms=1800):
         btn.setText(success_text)
         prev_style = btn.styleSheet()
-        btn.setStyleSheet("background-color: #0c2b1a; border: 1.5px solid #00ff88; color: #00ff88; font-weight: bold;")
+        btn.setStyleSheet(
+            "background-color: #11291f; border: 1px solid %s; color: %s; font-weight: 700;"
+            % (OK, OK)
+        )
         def restore():
             btn.setText(orig_text)
             btn.setStyleSheet(prev_style)
@@ -862,7 +877,7 @@ class TrackerMainWindow(QMainWindow):
 
         self.spin_grid_size.blockSignals(True)
         self.spin_grid_size.setValue(cur_l.grid_size)
-        self.lbl_total_pts.setText(f"({cur_l.grid_size ** 2} points)")
+        self.lbl_total_pts.setText(f"{cur_l.grid_size ** 2} pts")
         self.spin_grid_size.blockSignals(False)
 
         self.spin_min_conf.blockSignals(True)
@@ -925,7 +940,7 @@ class TrackerMainWindow(QMainWindow):
             self._refresh_layer_list()
 
     def _on_grid_size_changed(self, val):
-        self.lbl_total_pts.setText(f"({val*val} points)")
+        self.lbl_total_pts.setText(f"{val*val} pts")
         if self.canvas_2d.active_layer:
             self.canvas_2d.active_layer.grid_size = val
             self._refresh_layer_list()
@@ -1198,13 +1213,13 @@ class TrackerMainWindow(QMainWindow):
         is_kf = cur_f in all_keys
         if is_kf:
             self.lbl_key_status.setText(f"◆ f{cur_f+1}")
-            self.lbl_key_status.setStyleSheet("color: #00ff88; font-weight: bold; font-size: 10px; padding: 1px 6px; background-color: #11261d; border: 1px solid #00ff88; border-radius: 3px;")
+            self._set_chip_state(self.lbl_key_status, "key")
         elif all_keys:
             self.lbl_key_status.setText(f"~ f{cur_f+1}")
-            self.lbl_key_status.setStyleSheet("color: #38bdf8; font-weight: normal; font-size: 10px; padding: 1px 6px; background-color: #101a26; border: 1px dashed #0284c7; border-radius: 3px;")
+            self._set_chip_state(self.lbl_key_status, "interp")
         else:
-            self.lbl_key_status.setText("No Masks")
-            self.lbl_key_status.setStyleSheet("color: #64748b; font-size: 10px; padding: 1px 6px; background-color: #10141d; border-radius: 3px;")
+            self.lbl_key_status.setText("No masks")
+            self._set_chip_state(self.lbl_key_status, "idle")
 
     def _toggle_playback(self):
         if self.is_playing:
@@ -1265,19 +1280,22 @@ class TrackerMainWindow(QMainWindow):
     def _set_in_point(self, frame_idx):
         self.canvas_2d.in_point = int(frame_idx)
         out_p = self.canvas_2d.out_point if self.canvas_2d.out_point >= 0 else self.slider_2d_frame.maximum()
-        self.lbl_range_status.setText(f"Range: [{self.canvas_2d.in_point+1} - {out_p+1}]")
+        self.lbl_range_status.setText(f"{self.canvas_2d.in_point+1} – {out_p+1}")
+        self._set_chip_state(self.lbl_range_status, "key")
         self._append_log_2d(f"📍 Set Tracking In-Point to Frame {self.canvas_2d.in_point+1}.", "#00d2ff")
 
     def _set_out_point(self, frame_idx):
         self.canvas_2d.out_point = int(frame_idx)
         in_p = self.canvas_2d.in_point
-        self.lbl_range_status.setText(f"Range: [{in_p+1} - {self.canvas_2d.out_point+1}]")
+        self.lbl_range_status.setText(f"{in_p+1} – {self.canvas_2d.out_point+1}")
+        self._set_chip_state(self.lbl_range_status, "key")
         self._append_log_2d(f"📍 Set Tracking Out-Point to Frame {self.canvas_2d.out_point+1}.", "#00d2ff")
 
     def _reset_tracking_range(self):
         self.canvas_2d.in_point = 0
         self.canvas_2d.out_point = -1
-        self.lbl_range_status.setText("Range: Full")
+        self.lbl_range_status.setText("Full")
+        self._set_chip_state(self.lbl_range_status, "idle")
         self._append_log_2d("↺ Reset Tracking Range to full sequence.", "#00d2ff")
 
     def _toggle_canvas_matte_overlay(self, checked):
@@ -1526,8 +1544,38 @@ class TrackerMainWindow(QMainWindow):
                     stat_item.setForeground(QColor("#00d2ff"))
 
 
+def apply_dark_palette(app):
+    """
+    Some parts of a widget are drawn by the native style, not the stylesheet -
+    combo and spin arrows most visibly. They take their colour from the palette,
+    so it has to agree with the theme or they come out dark-on-dark.
+    """
+    pal = QPalette()
+    pal.setColor(QPalette.Window, QColor(BG_APP))
+    pal.setColor(QPalette.WindowText, QColor(TEXT))
+    pal.setColor(QPalette.Base, QColor(BG_INPUT))
+    pal.setColor(QPalette.AlternateBase, QColor(BG_PANEL))
+    pal.setColor(QPalette.Text, QColor(TEXT))
+    pal.setColor(QPalette.Button, QColor(BG_RAISED))
+    pal.setColor(QPalette.ButtonText, QColor(TEXT))
+    pal.setColor(QPalette.BrightText, QColor(ERR))
+    pal.setColor(QPalette.Highlight, QColor(ACCENT_DIM))
+    pal.setColor(QPalette.HighlightedText, QColor('#ffffff'))
+    pal.setColor(QPalette.ToolTipBase, QColor(BG_RAISED))
+    pal.setColor(QPalette.ToolTipText, QColor(TEXT))
+    pal.setColor(QPalette.PlaceholderText, QColor(TEXT_MUTED))
+    pal.setColor(QPalette.Disabled, QPalette.Text, QColor(TEXT_MUTED))
+    pal.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(TEXT_MUTED))
+    pal.setColor(QPalette.Disabled, QPalette.WindowText, QColor(TEXT_MUTED))
+    app.setPalette(pal)
+
+
 def main():
     app = QApplication(sys.argv)
+    # Fusion draws its sub-controls from the palette on every platform, which keeps
+    # arrows and spin buttons consistent instead of inheriting the Windows look.
+    app.setStyle("Fusion")
+    apply_dark_palette(app)
     window = TrackerMainWindow()
     window.show()
     sys.exit(app.exec())
