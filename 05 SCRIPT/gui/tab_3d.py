@@ -59,7 +59,7 @@ def build_3d_tab(win, tab, presets):
     win.combo_solver_engine = QComboBox()
     win.combo_solver_engine.addItems([
         "Incremental SfM (Standard / All GPUs)",
-        "GLOMAP / Global SfM (10x-30x Faster / RTX 30/40 & A-Series)"
+        "Hierarchical Multi-Cluster Mapper (faster on long shots)"
     ])
     form_lay.addRow("Solver Engine:", win.combo_solver_engine)
 
@@ -99,12 +99,20 @@ def build_3d_tab(win, tab, presets):
     win.chk_single_cam.setChecked(True)
     win.chk_ba_refine = QCheckBox("Auto-Refine Lens Distortion (BA)")
     win.chk_ba_refine.setChecked(True)
+    win.chk_ba_refine.setToolTip(
+        "Lets bundle adjustment solve focal length and distortion instead of\n"
+        "trusting the initial guess. Turn off if you know the exact lens."
+    )
     win.chk_mesh_gen = QCheckBox("Auto-Generate 3D Environment Mesh (.ply)")
     win.chk_mesh_gen.setChecked(True)
     win.chk_gpu = QCheckBox("Use NVIDIA GPU Acceleration (CUDA)")
     win.chk_gpu.setChecked(True)
-    win.chk_caspar_ba = QCheckBox("Enable Caspar GPU Bundle Adjuster (RTX GPUs)")
+    win.chk_caspar_ba = QCheckBox("GPU Bundle Adjustment (CUDA)")
     win.chk_caspar_ba.setChecked(True)
+    win.chk_caspar_ba.setToolTip(
+        "Runs COLMAP bundle adjustment on the GPU (--Mapper.ba_use_gpu).\n"
+        "Needs a CUDA GPU; turn off to solve on the CPU."
+    )
 
     form_lay.addRow(win.chk_single_cam)
     form_lay.addRow(win.chk_ba_refine)

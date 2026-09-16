@@ -220,7 +220,8 @@ def export_to_nuke_roto_script(animated_masks, width, height, total_frames, outp
     return True
 
 
-def rasterize_masks_to_png(animated_masks, width, height, out_masks_dir, total_frames, frame_filenames=None, progress_callback=None):
+def rasterize_masks_to_png(animated_masks, width, height, out_masks_dir, total_frames,
+                           frame_filenames=None, progress_callback=None, frame_step=1):
     """
     Renders binary PNG mask sequence for COLMAP 3D Feature Extractor.
     In COLMAP:
@@ -230,6 +231,9 @@ def rasterize_masks_to_png(animated_masks, width, height, out_masks_dir, total_f
     out_masks_dir: Path to output directory (e.g. 04 SCENES/<shot>/masks)
     total_frames: Total number of frames in video
     frame_filenames: Optional list of image filenames (e.g. ["frame_000001.jpg", ...])
+    frame_step: Frame-skip used when the images were extracted. Mask keyframes are set
+                against the full-rate timeline, so rendered frame t must be looked up at
+                source frame t * frame_step or the shapes slide off over time.
     """
     out_path = Path(out_masks_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -238,8 +242,11 @@ def rasterize_masks_to_png(animated_masks, width, height, out_masks_dir, total_f
         return []
 
     generated_files = []
+    step = max(1, int(frame_step))
 
     for t in range(total_frames):
+        # Map the rendered frame back onto the timeline the keyframes were set on.
+        src_t = t * step
         # 1. Default base: pure white (255)
         # Mode 'L' (8-bit grayscale)
         mask_img = Image.new('L', (width, height), color=255)
@@ -253,7 +260,7 @@ def rasterize_masks_to_png(animated_masks, width, height, out_masks_dir, total_f
         if inc_masks:
             draw.rectangle([0, 0, width, height], fill=0)
             for m in inc_masks:
-                geom = m.get_interpolated_geometry(t)
+                geom = m.get_interpolated_geometry(src_t)
                 if not geom or geom.get("type") != "poly":
                     continue
                 pts = geom.get("points", [])
@@ -262,7 +269,7 @@ def rasterize_masks_to_png(animated_masks, width, height, out_masks_dir, total_f
 
         # Exclusion masks: carved out as black (0)
         for m in exc_masks:
-            geom = m.get_interpolated_geometry(t)
+            geom = m.get_interpolated_geometry(src_t)
             if not geom or geom.get("type") != "poly":
                 continue
             pts = geom.get("points", [])

@@ -1,3 +1,4 @@
+@echo off
 :: ================================================================
 ::  AUTOMATED CAMERA TRACKER V001.1 - BATCH RECONSTRUCTION
 :: ================================================================
@@ -8,18 +9,17 @@
 ::
 ::  PURPOSE
 ::    Automated photogrammetry tracking engine for turning
-::    videos/sequences into camera tracks with GLOMAP Global SfM,
+::    videos/sequences into camera tracks with COLMAP SfM,
 ::    high-accuracy BA refinement, and multi-format exports.
 ::
 ::  FOLDER LAYOUT (all folders sit side-by-side):
 ::    00 PYTHON   – Embedded Python environment
-::    01 COLMAP   – COLMAP & GLOMAP binaries and DLLs
+::    01 COLMAP   – COLMAP binaries and DLLs
 ::    02 VIDEOS   – Place input video files (.mp4, .mov, etc.) here
 ::    03 FFMPEG   – FFmpeg binaries
 ::    04 SCENES   – Auto-generated output scene tracks
 ::    05 SCRIPT   – Scripts & tools
 :: ================================================================
-@echo off
 
 :: ---------- Resolve top-level folder (one up from this .bat) -----
 pushd "%~dp0\.." >nul
@@ -230,6 +230,8 @@ if not exist "!SPARSE_DIR!\0" (
         --Mapper.init_min_tri_angle 2.5 ^
         --Mapper.init_min_num_inliers 40 ^
         --Mapper.abs_pose_min_num_inliers 20 ^
+        --Mapper.init_max_forward_motion 1.0 ^
+        --Mapper.init_num_trials 500 ^
         --Mapper.ba_refine_focal_length 1 ^
         --Mapper.ba_refine_extra_params 1 ^
         --Mapper.ba_refine_principal_point 0 ^
@@ -244,9 +246,12 @@ if not exist "!SPARSE_DIR!\0" (
         --database_path "!DB_PATH!" ^
         --image_path    "!IMG_DIR!" ^
         --output_path   "!SPARSE_DIR!" ^
-        --Mapper.init_min_tri_angle 1.5 ^
-        --Mapper.init_min_num_inliers 20 ^
+        --Mapper.init_min_tri_angle 0.5 ^
+        --Mapper.init_min_num_inliers 15 ^
         --Mapper.abs_pose_min_num_inliers 10 ^
+        --Mapper.init_max_forward_motion 1.0 ^
+        --Mapper.init_num_trials 1000 ^
+        --Mapper.filter_min_tri_angle 0.5 ^
         --Mapper.ba_refine_focal_length 1 ^
         --Mapper.ba_refine_extra_params 1 ^
         --Mapper.ba_use_gpu 1 ^

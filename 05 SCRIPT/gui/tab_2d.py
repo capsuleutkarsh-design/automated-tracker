@@ -206,6 +206,11 @@ def build_2d_tab(win, tab):
     win.spin_min_conf.setRange(0.1, 0.99)
     win.spin_min_conf.setValue(0.70)
     win.spin_min_conf.setSingleStep(0.05)
+    win.spin_min_conf.setToolTip(
+        "Minimum tracking confidence a sample must reach to count as visible.\n"
+        "Higher = fewer but more reliable points."
+    )
+    win.spin_min_conf.valueChanged.connect(win._on_min_conf_changed)
     form_ai.addRow("Confidence:", win.spin_min_conf)
 
     win.combo_2d_model = QComboBox()
@@ -214,6 +219,10 @@ def build_2d_tab(win, tab):
 
     win.chk_vram_chunk = QCheckBox("Auto VRAM Chunking (Prevent OOM)")
     win.chk_vram_chunk.setChecked(True)
+    win.chk_vram_chunk.setToolTip(
+        "Sends the clip to the GPU a few frames at a time, sized to the free VRAM.\n"
+        "Turn off only if you have VRAM to spare - the whole clip then goes up at once."
+    )
     form_ai.addRow(win.chk_vram_chunk)
 
     left_layout.addWidget(ai_group)

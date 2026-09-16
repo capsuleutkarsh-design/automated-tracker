@@ -40,6 +40,10 @@ class VideoPointPickerCanvas(QLabel):
         """)
         self.setMinimumSize(480, 280)
         self.current_pixmap = None
+        # Cached result of scaling current_pixmap into the widget, keyed by
+        # (pixmap identity, widget width, widget height).
+        self._scaled_cache = None
+        self._scaled_key = None
         self.orig_w = 1920
         self.orig_h = 1080
         self.current_frame = 0
@@ -90,6 +94,8 @@ class VideoPointPickerCanvas(QLabel):
         self.total_frames = total_frames
         self.fps = fps
         self.current_pixmap = QPixmap.fromImage(qimage)
+        self._scaled_cache = None
+        self._scaled_key = None
         self.setStyleSheet("""
             background-color: #090b10;
             border: 1px solid #1c2436;
@@ -141,9 +147,23 @@ class VideoPointPickerCanvas(QLabel):
                     self.file_dropped.emit(filepath)
                     return
 
+    def _scaled_pixmap(self):
+        """Scaled copy of the current frame, reused until the frame or the widget size changes."""
+        if self.current_pixmap is None:
+            return None
+        key = (self.current_pixmap.cacheKey(), self.width(), self.height())
+        if key != self._scaled_key or self._scaled_cache is None:
+            self._scaled_cache = self.current_pixmap.scaled(
+                self.width(), self.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            self._scaled_key = key
+        return self._scaled_cache
+
     def _view_to_orig_coords(self, pos):
         lbl_w, lbl_h = self.width(), self.height()
-        scaled_pix = self.current_pixmap.scaled(lbl_w, lbl_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled_pix = self._scaled_pixmap()
+        if scaled_pix is None or scaled_pix.width() == 0 or scaled_pix.height() == 0:
+            return 0.0, 0.0
         pw, ph = scaled_pix.width(), scaled_pix.height()
         offset_x, offset_y = (lbl_w - pw) / 2.0, (lbl_h - ph) / 2.0
 
@@ -472,7 +492,9 @@ class VideoPointPickerCanvas(QLabel):
             return
 
         lbl_w, lbl_h = self.width(), self.height()
-        scaled_pix = self.current_pixmap.scaled(lbl_w, lbl_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled_pix = self._scaled_pixmap()
+        if scaled_pix is None or scaled_pix.width() == 0 or scaled_pix.height() == 0:
+            return
         pw, ph = scaled_pix.width(), scaled_pix.height()
         offset_x, offset_y = (lbl_w - pw) / 2.0, (lbl_h - ph) / 2.0
 

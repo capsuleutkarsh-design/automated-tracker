@@ -11,6 +11,7 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
 from mask_animator import AnimatedMask, rasterize_masks_to_png
+from core.media_info import probe_fps
 
 
 class TrackerWorker(QThread):
@@ -115,6 +116,14 @@ class TrackerWorker(QThread):
             # Step 1.5: Automatic Dynamic Mask Generation for COLMAP
             masks_dir = None
             animated_masks = self.config.get("animated_masks")
+            mask_shot = self.config.get("mask_shot")
+            if animated_masks and mask_shot and base_name != mask_shot:
+                # Roto was drawn against a different clip on the 2D tab; applying it here
+                # would mask out the wrong part of this shot.
+                self.log_signal.emit(
+                    f"   Skipping roto masks for '{base_name}' - they were drawn on '{mask_shot}'.",
+                    "#a0a0b0")
+                animated_masks = None
             if animated_masks and extracted_frames:
                 self.log_signal.emit("▶ [1.5/4] Rasterizing dynamic roto masks for 3D Camera Tracking...", "#00d2ff")
                 masks_dir = shot_dir / "masks"
@@ -136,7 +145,8 @@ class TrackerWorker(QThread):
                     len(extracted_frames), sorted_frame_names,
                     progress_callback=lambda cur, tot: self.progress_signal.emit(
                         int(30 + (cur / tot) * 5), f"Generating 3D Masks ({cur}/{tot})..."
-                    )
+                    ),
+                    frame_step=max(1, self.config.get("frame_step", 1)),
                 )
                 self.log_signal.emit(f"✔ Generated {len(extracted_frames)} binary masks in 04 SCENES/{video.stem}/masks/ (Excluding moving actors from 3D solve)!", "#00ff88")
 
@@ -193,7 +203,9 @@ class TrackerWorker(QThread):
 
             # Step 4: Mapper (GLOMAP Global Structure-from-Motion vs Incremental Mapper)
             solver_engine = self.config.get("solver_engine", "Incremental")
-            is_global_solver = ("GLOMAP" in solver_engine or "Global" in solver_engine)
+            is_global_solver = any(
+                key in solver_engine for key in ("Hierarchical", "GLOMAP", "Global")
+            )
             model_0 = sparse_dir / "0"
 
             if is_global_solver:
@@ -227,6 +239,16 @@ class TrackerWorker(QThread):
                 else:
                     self.log_signal.emit(f"✔ Fast Mapper successfully solved 3D camera trajectory!", "#00ff88")
 
+            # 'Auto-Refine Lens Distortion (BA)' on the 3D tab used to be ignored entirely.
+            refine_flag = "1" if self.config.get("ba_refine_distortion", True) else "0"
+
+            # COLMAP rejects an initial image pair whose motion is mostly forward
+            # (init_max_forward_motion, default 0.95). Walking, dolly and drive-by shots
+            # are exactly that, so the solve used to fail with 'No good initial image
+            # pair found' even with hundreds of thousands of verified matches.
+            fwd_motion = str(self.config.get("init_max_forward_motion", 1.0))
+            init_trials = str(self.config.get("init_num_trials", 500))
+
             if not (model_0.exists() and any(model_0.iterdir())):
                 self.progress_signal.emit(80, f"[{idx}/{total_videos}] [4/4] Sparse Reconstruction (Incremental Mapper)...")
                 self.log_signal.emit(f"▶ [4/4] Reconstructing 3D camera track with BA Lens Distortion Refinement...", "#ffffff")
@@ -238,8 +260,10 @@ class TrackerWorker(QThread):
                     "--Mapper.init_min_tri_angle", str(self.config.get("tri_angle", 2.5)),
                     "--Mapper.init_min_num_inliers", str(self.config.get("inliers", 40)),
                     "--Mapper.abs_pose_min_num_inliers", str(max(15, self.config.get("inliers", 40) // 2)),
-                    "--Mapper.ba_refine_focal_length", "1",
-                    "--Mapper.ba_refine_extra_params", "1",
+                    "--Mapper.init_max_forward_motion", fwd_motion,
+                    "--Mapper.init_num_trials", init_trials,
+                    "--Mapper.ba_refine_focal_length", refine_flag,
+                    "--Mapper.ba_refine_extra_params", refine_flag,
                     "--Mapper.ba_refine_principal_point", "0",
                     "--Mapper.ba_use_gpu", "1" if (self.config.get("enable_caspar_ba", True) and self.config.get("use_gpu", True)) else "0",
                     "--Mapper.num_threads", str(os.cpu_count() or 4)
@@ -248,17 +272,22 @@ class TrackerWorker(QThread):
 
             # Step 4.5: Smart Auto-Retry on Low Parallax
             if not (model_0.exists() and any(model_0.iterdir())):
-                self.log_signal.emit(f"↻ Initial 3D solve had low parallax – executing Smart Auto-Retry fallback with relaxed angles...", "#e0a000")
+                self.log_signal.emit(
+                    "↻ Initial 3D solve found no usable starting pair – retrying with fully "
+                    "relaxed parallax and forward-motion limits...", "#e0a000")
                 retry_mapper_cmd = [
                     str(self.colmap_exe), "mapper",
                     "--database_path", str(db_path),
                     "--image_path", str(img_dir),
                     "--output_path", str(sparse_dir),
-                    "--Mapper.init_min_tri_angle", "1.5",
-                    "--Mapper.init_min_num_inliers", "20",
+                    "--Mapper.init_min_tri_angle", "0.5",
+                    "--Mapper.init_min_num_inliers", "15",
                     "--Mapper.abs_pose_min_num_inliers", "10",
-                    "--Mapper.ba_refine_focal_length", "1",
-                    "--Mapper.ba_refine_extra_params", "1",
+                    "--Mapper.init_max_forward_motion", "1.0",
+                    "--Mapper.init_num_trials", "1000",
+                    "--Mapper.filter_min_tri_angle", "0.5",
+                    "--Mapper.ba_refine_focal_length", refine_flag,
+                    "--Mapper.ba_refine_extra_params", refine_flag,
                     "--Mapper.ba_use_gpu", "1" if (self.config.get("enable_caspar_ba", True) and self.config.get("use_gpu", True)) else "0",
                     "--Mapper.num_threads", str(os.cpu_count() or 4)
                 ]
@@ -290,23 +319,62 @@ class TrackerWorker(QThread):
                     if success_mesh and mesh_out.exists():
                         self.log_signal.emit("✔ Generated 3D Environment Mesh: environment_mesh.ply", "#00ff88")
                     else:
-                        poisson_cmd = [
-                            str(self.colmap_exe), "poisson_mesher",
+                        # poisson_mesher takes a PLY point cloud, not a sparse model folder;
+                        # the old fallback passed the folder and could never succeed.
+                        cloud_ply = track_dir / "sparse_points.ply"
+                        to_ply_cmd = [
+                            str(self.colmap_exe), "model_converter",
                             "--input_path", str(model_0),
-                            "--output_path", str(mesh_out)
+                            "--output_path", str(cloud_ply),
+                            "--output_type", "PLY"
                         ]
-                        self._run_command(poisson_cmd, env, "COLMAP Poisson Mesher")
+                        if self._run_command(to_ply_cmd, env, "COLMAP Model To PLY") and cloud_ply.exists():
+                            poisson_cmd = [
+                                str(self.colmap_exe), "poisson_mesher",
+                                "--input_path", str(cloud_ply),
+                                "--output_path", str(mesh_out)
+                            ]
+                            self._run_command(poisson_cmd, env, "COLMAP Poisson Mesher")
                         if mesh_out.exists():
                             self.log_signal.emit("✔ Generated 3D Environment Mesh: environment_mesh.ply", "#00ff88")
+                        else:
+                            self.log_signal.emit(
+                                "Notice: Could not build an environment mesh from this sparse solve "
+                                "(too few 3D points). Camera track is unaffected.", "#e0a000")
 
                 self.log_signal.emit(f"▶ Generating Blender 1-Click Script, USD (.usda), Point Cloud (.ply), Nuke (.chan & .nk), and Alembic (.abc)...", "#ffffff")
                 try:
                     from export_tools import export_all_formats
                     b_path = self.config.get("blender_path")
+                    # Frame rate comes from the source clip; the exporters used to assume 30.
+                    frame_step = max(1, self.config.get("frame_step", 1))
+                    if video.is_file():
+                        src_fps = probe_fps(video)
+                        fps_note = f"detected from {video.name}"
+                    else:
+                        # An image sequence folder carries no frame rate of its own; look for a
+                        # matching clip in 02 VIDEOS before falling back to a stated default.
+                        src_fps, fps_note = None, ""
+                        videos_dir = self.base_dir / "02 VIDEOS"
+                        for ext in (".mp4", ".mov", ".avi", ".mkv", ".m4v"):
+                            cand = videos_dir / (base_name + ext)
+                            if cand.exists():
+                                src_fps = probe_fps(cand)
+                                fps_note = f"detected from {cand.name}"
+                                break
+                        if src_fps is None:
+                            src_fps = 24.0
+                            fps_note = "image sequence has no frame rate - assuming 24"
+                    eff_fps = src_fps / frame_step
+                    self.log_signal.emit(
+                        f"   Frame rate for exports: {eff_fps:.3f} fps ({fps_note}"
+                        + (f", step {frame_step}" if frame_step > 1 else "") + ")",
+                        "#a0a0b0")
                     exp_res = export_all_formats(
                         track_dir,
                         blender_path=b_path,
-                        log_callback=lambda m, c: self.log_signal.emit(m, c)
+                        log_callback=lambda m, c: self.log_signal.emit(m, c),
+                        fps=eff_fps
                     )
                     if exp_res.get("success"):
                         self.log_signal.emit(f"   ✔ Generated 1-Click Blender Script: import_to_blender.py", "#00d2ff")

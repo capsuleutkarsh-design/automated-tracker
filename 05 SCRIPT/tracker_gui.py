@@ -60,12 +60,14 @@ from gui.tab_2d import build_2d_tab
 from core.tracking_layer import TrackingLayer
 from core.workers import TrackerWorker, CoTrackerWorker, FrameExtractorWorker
 from core.hardware import gpu_monitor
+from core.media_info import probe_fps, probe_frame_count
 
 PRESETS = {
     "Handheld / Walking (Recommended)": {
-        "description": "Optimized for moving camera shots (walking, crane, handheld). Uses low initial triangulation angle to lock onto video frames instantly.",
+        "description": "Optimized for moving camera shots (walking, crane, handheld). Uses a low initial triangulation angle and allows forward-dominant motion, which COLMAP otherwise rejects on walk-forward shots.",
         "solver_engine": "Incremental",
         "tri_angle": 2.5,
+        "init_max_forward_motion": 1.0,
         "overlap": 35,
         "inliers": 40,
         "camera_model": "SIMPLE_RADIAL",
@@ -74,10 +76,11 @@ PRESETS = {
         "max_image_size": 4096,
         "frame_step": 1
     },
-    "GLOMAP High-Speed (RTX 30/40 & A-Series)": {
-        "description": "Ultra-fast global Structure-from-Motion (10x-30x speedup). Solves all camera positions and rotations simultaneously with zero continuous drift.",
-        "solver_engine": "GLOMAP",
+    "Hierarchical Multi-Cluster (Long Shots)": {
+        "description": "Splits a long shot into overlapping clusters and solves them in parallel before merging, which is faster than a single incremental pass on long takes. Falls back to the incremental mapper automatically if the cluster solve fails.",
+        "solver_engine": "Hierarchical",
         "tri_angle": 2.5,
+        "init_max_forward_motion": 1.0,
         "overlap": 35,
         "inliers": 40,
         "camera_model": "SIMPLE_RADIAL",
@@ -90,6 +93,7 @@ PRESETS = {
         "description": "Native spherical equirectangular camera model for 360 VR cameras and panoramic video stitches.",
         "solver_engine": "Incremental",
         "tri_angle": 3.0,
+        "init_max_forward_motion": 1.0,
         "overlap": 25,
         "inliers": 50,
         "camera_model": "SPHERICAL",
@@ -102,6 +106,7 @@ PRESETS = {
         "description": "Optimized for outdoor and high-altitude shots with wide parallax and high keypoint count.",
         "solver_engine": "Incremental",
         "tri_angle": 12.0,
+        "init_max_forward_motion": 0.95,
         "overlap": 20,
         "inliers": 100,
         "camera_model": "OPENCV",
@@ -114,6 +119,7 @@ PRESETS = {
         "description": "Very forgiving on small camera movements. Subsamples frames to increase baseline and lowers initialization angle.",
         "solver_engine": "Incremental",
         "tri_angle": 3.0,
+        "init_max_forward_motion": 1.0,
         "overlap": 15,
         "inliers": 40,
         "camera_model": "SIMPLE_RADIAL",
@@ -126,6 +132,7 @@ PRESETS = {
         "description": "Increases matching overlap window (30 frames) to maintain tracking during rapid camera motion.",
         "solver_engine": "Incremental",
         "tri_angle": 8.0,
+        "init_max_forward_motion": 1.0,
         "overlap": 30,
         "inliers": 50,
         "camera_model": "SIMPLE_RADIAL",
@@ -138,6 +145,7 @@ PRESETS = {
         "description": "Uses Fisheye distortion model for wide-angle and action camera lenses.",
         "solver_engine": "Incremental",
         "tri_angle": 6.0,
+        "init_max_forward_motion": 1.0,
         "overlap": 20,
         "inliers": 60,
         "camera_model": "OPENCV_FISHEYE",
@@ -150,6 +158,7 @@ PRESETS = {
         "description": "Default COLMAP settings.",
         "solver_engine": "Incremental",
         "tri_angle": 16.0,
+        "init_max_forward_motion": 1.0,
         "overlap": 15,
         "inliers": 100,
         "camera_model": "SIMPLE_RADIAL",
@@ -162,6 +171,7 @@ PRESETS = {
         "description": "Unlock all parameters for full manual control.",
         "solver_engine": "Incremental",
         "tri_angle": 6.0,
+        "init_max_forward_motion": 1.0,
         "overlap": 20,
         "inliers": 60,
         "camera_model": "SIMPLE_RADIAL",
@@ -185,6 +195,9 @@ class TrackerMainWindow(QMainWindow):
         self.frame_extractor = None
 
         # Video Player State for 2D Tab
+        # Real frame rate of the selected clip. Used for playback speed, the timecode
+        # readout and every exported curve - it used to be hard-coded to 24.
+        self.current_fps = 24.0
         self.overlay_frames = None
         self.loaded_video_frames = None
         self.current_play_frame = 0
@@ -389,7 +402,7 @@ class TrackerMainWindow(QMainWindow):
             "About Automated Tracker",
             "AUTOMATED TRACKER V001.1\n\n"
             "VFX Studio Camera Tracking & 2D Motion Tracking System\n"
-            "Engines: COLMAP / GLOMAP (3D SfM) & Meta CoTracker3 (2D Point Tracking)\n"
+            "Engines: COLMAP (3D SfM) & Meta CoTracker3 (2D Point Tracking)\n"
             "Pipeline Integrations: Blender (.abc) & Foundry Nuke (.nk / .abc)"
         )
 
@@ -621,15 +634,41 @@ class TrackerMainWindow(QMainWindow):
             QMessageBox.warning(self, "No Videos Found", f"Please add at least one video or image sequence into:\n{VIDEOS_DIR}")
             return
 
+        # Only solve what is selected in the media table. Selecting nothing means
+        # 'all of them', which is what the button used to do unconditionally.
+        selected_names = set()
+        for item in self.table.selectedItems():
+            name_item = self.table.item(item.row(), 0)
+            if name_item and name_item.text().strip():
+                selected_names.add(name_item.text().strip())
+        if selected_names:
+            picked = [v for v in videos if v.name in selected_names]
+            if picked:
+                videos = picked
+                self._append_log_3d(
+                    f"Solving {len(videos)} selected shot(s): "
+                    f"{', '.join(v.name for v in videos)}", "#00d2ff")
+        else:
+            self._append_log_3d(
+                f"No row selected - solving all {len(videos)} shot(s) in 02 VIDEOS.", "#a0a0b0")
+
+        # Masks were drawn against whatever clip the 2D tab has loaded, so they must only
+        # be applied to that clip - not to every video in the batch.
         all_masks = []
         for l in self.canvas_2d.layers:
             for m in l.animated_masks:
                 all_masks.append(m)
+        mask_shot = Path(self.combo_2d_video.currentText()).stem if self.combo_2d_video.currentText() else None
+        if all_masks and mask_shot:
+            self._append_log_3d(
+                f"{len(all_masks)} roto mask(s) will be applied to '{mask_shot}' only.", "#00d2ff")
 
         cam_raw = self.combo_cam.currentText().split()[0].strip()
+        preset_data = PRESETS.get(self.preset_combo.currentText(), PRESETS["Custom (Manual Tuning)"])
         config = {
             "solver_engine": self.combo_solver_engine.currentText(),
             "tri_angle": self.spin_tri.value(),
+            "init_max_forward_motion": 1.0,
             "overlap": self.spin_overlap.value(),
             "inliers": self.spin_inliers.value(),
             "camera_model": cam_raw,
@@ -638,9 +677,12 @@ class TrackerMainWindow(QMainWindow):
             "generate_mesh": self.chk_mesh_gen.isChecked(),
             "enable_caspar_ba": self.chk_caspar_ba.isChecked(),
             "max_image_size": 4096,
+            "init_max_forward_motion": preset_data.get("init_max_forward_motion", 1.0),
             "frame_step": self.spin_step.value(),
             "blender_path": self.txt_blender_path.text().strip() or None,
-            "animated_masks": all_masks if all_masks else None
+            "animated_masks": all_masks if all_masks else None,
+            "mask_shot": mask_shot,
+            "ba_refine_distortion": self.chk_ba_refine.isChecked(),
         }
 
         self._pause_playback()
@@ -876,6 +918,12 @@ class TrackerMainWindow(QMainWindow):
             self.canvas_2d.update()
             self._append_log_2d(f"🎨 Updated layer color for [{cur_l.name}] to {cur_l.color}.", cur_l.color)
 
+    def _on_min_conf_changed(self, val):
+        lay = self.canvas_2d.active_layer
+        if lay:
+            lay.min_confidence = float(val)
+            self._refresh_layer_list()
+
     def _on_grid_size_changed(self, val):
         self.lbl_total_pts.setText(f"({val*val} points)")
         if self.canvas_2d.active_layer:
@@ -962,6 +1010,13 @@ class TrackerMainWindow(QMainWindow):
         self.overlay_frames = None
         self.loaded_video_frames = None
 
+        # Probe the real frame rate once, for both the extracted-frames path and the
+        # raw-video path below.
+        self.current_fps = probe_fps(video_path)
+        self._append_log_2d(
+            f"Frame rate detected: {self.current_fps:.3f} fps (used for playback, timecode "
+            f"and all exports).", "#a0a0b0")
+
         scene_images_dir = SCENES_DIR / video_path.stem / "images"
         if scene_images_dir.exists() and list(scene_images_dir.glob("*.jpg")):
             jpgs = sorted(list(scene_images_dir.glob("*.jpg")))
@@ -972,17 +1027,7 @@ class TrackerMainWindow(QMainWindow):
 
         import tempfile
         tmp_img = Path(tempfile.gettempdir()) / f"thumb_{video_path.stem}_0.jpg"
-        total_frames = 100
-        fps = 24.0
-        try:
-            import imageio.v3 as iio
-            meta = iio.immeta(str(video_path), plugin="FFMPEG")
-            fps = float(meta.get("fps", 24.0)) or 24.0
-            dur = float(meta.get("duration", 0.0))
-            if dur > 0:
-                total_frames = max(1, int(dur * fps))
-        except Exception:
-            pass
+        total_frames = probe_frame_count(video_path, self.current_fps, default=100) or 100
 
         if not tmp_img.exists():
             cmd = [str(FFMPEG_EXE), "-y", "-loglevel", "error", "-ss", "0.0", "-i", str(video_path), "-vframes", "1", "-q:v", "2", str(tmp_img)]
@@ -1038,13 +1083,15 @@ class TrackerMainWindow(QMainWindow):
                 im = Image.fromarray(img_path_or_array).convert("RGB")
             w, h = im.size
             qim = QImage(im.tobytes(), w, h, w * 3, QImage.Format_RGB888)
-            self.canvas_2d.set_frame_image(qim, frame_idx, total_frames, w, h, fps=24.0)
+            fps = self.current_fps if self.current_fps and self.current_fps > 0 else 24.0
+            self.canvas_2d.set_frame_image(qim, frame_idx, total_frames, w, h, fps=fps)
 
-            total_sec = frame_idx / 24.0
+            fps_int = max(1, int(round(fps)))
+            total_sec = frame_idx / fps
             hrs = int(total_sec // 3600)
             mins = int((total_sec % 3600) // 60)
             secs = int(total_sec % 60)
-            fr = int(frame_idx % 24)
+            fr = int(frame_idx % fps_int)
             self.lbl_frame_idx.setText(f"{hrs:02d}:{mins:02d}:{secs:02d}:{fr:02d} ({frame_idx+1}/{total_frames})")
         except Exception:
             pass
@@ -1168,7 +1215,8 @@ class TrackerMainWindow(QMainWindow):
     def _start_playback(self):
         self.is_playing = True
         self.btn_play_pause.setText("⏸ Pause")
-        self.play_timer.start(40)
+        fps = self.current_fps if self.current_fps and self.current_fps > 0 else 24.0
+        self.play_timer.start(max(10, int(round(1000.0 / fps))))
 
     def _pause_playback(self):
         self.is_playing = False
@@ -1415,7 +1463,8 @@ class TrackerMainWindow(QMainWindow):
             "layers": layers_config,
             "max_dimension": max_dim,
             "offline": offline,
-            "fps": 24.0,
+            "fps": self.current_fps if self.current_fps and self.current_fps > 0 else 24.0,
+            "auto_chunk": self.chk_vram_chunk.isChecked(),
             "in_point": self.canvas_2d.in_point,
             "out_point": self.canvas_2d.out_point
         }

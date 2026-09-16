@@ -228,7 +228,7 @@ def detect_ground_plane_ransac(points, max_iters=300, dist_thresh=0.08):
 # =============================================================================
 # EXPORTERS
 # =============================================================================
-def export_blender_script(scene_dir, cameras, images, points, output_script_path=None):
+def export_blender_script(scene_dir, cameras, images, points, output_script_path=None, fps=None):
     """
     Generates a 1-Click Python script for Blender that sets up camera,
     animation, background image sequence, Geometry Nodes point cloud (EEVEE & Cycles renderable),
@@ -245,7 +245,13 @@ def export_blender_script(scene_dir, cameras, images, points, output_script_path
     first_cam = next(iter(cameras.values()))
     width = first_cam["width"]
     height = first_cam["height"]
-    fps = int(first_cam.get("fps", 30))
+    # Frame rate comes from the caller (probed off the source clip). The old code read a
+    # "fps" key that parse_colmap_cameras never sets, so every export was silently 30.
+    fps_val = float(fps) if fps else float(first_cam.get("fps", 0) or 0) or 24.0
+    # Blender stores the rate as fps / fps_base, which is how NTSC rates such as
+    # 29.97 (30000/1001) are represented exactly rather than rounded to 30.
+    fps = int(round(fps_val))
+    fps_base = round(fps / fps_val, 6) if fps_val > 0 else 1.0
     focal_x = first_cam["focal_x"]
     focal_y = first_cam.get("focal_y", focal_x)
     cx = first_cam.get("cx", width / 2.0)
@@ -446,6 +452,7 @@ def setup_tracked_scene():
     scene.render.resolution_x = {width}
     scene.render.resolution_y = {height}
     scene.render.fps = {fps}
+    scene.render.fps_base = {fps_base}
     scene.frame_start = {start_frame}
     scene.frame_end = {end_frame}
 
@@ -631,7 +638,7 @@ if __name__ == "__main__":
     return True
 
 
-def export_usd_scene(scene_dir, cameras, images, points, output_usd_path=None):
+def export_usd_scene(scene_dir, cameras, images, points, output_usd_path=None, fps=None):
     if not HAS_USD:
         return False
 
@@ -657,8 +664,9 @@ def export_usd_scene(scene_dir, cameras, images, points, output_usd_path=None):
     UsdGeom.SetStageMetersPerUnit(stage, 1.0)
     stage.SetStartTimeCode(start_frame)
     stage.SetEndTimeCode(end_frame)
-    stage.SetTimeCodesPerSecond(24.0)
-    stage.SetFramesPerSecond(24.0)
+    usd_fps = float(fps) if fps else 24.0
+    stage.SetTimeCodesPerSecond(usd_fps)
+    stage.SetFramesPerSecond(usd_fps)
 
     # 1. Create Camera
     cam_prim_path = Sdf.Path("/World/Tracked_Camera")
@@ -765,7 +773,7 @@ def export_nuke_chan(scene_dir, cameras, images, output_chan_path=None):
     return True
 
 
-def export_nuke_camera_script(scene_dir, cameras, images, points, output_nk_path=None):
+def export_nuke_camera_script(scene_dir, cameras, images, points, output_nk_path=None, fps=None):
     """
     Generates a full 1-Click VFX Node Graph (.nk) for Foundry Nuke:
     - Read node (Footage Sequence)
@@ -909,6 +917,7 @@ ReadGeo2 {{
 '''
 
     scene_inputs = str(2 + extra_inputs)
+    nk_fps = float(fps) if fps else 24.0
 
     script = f'''set cut_paste_input [stack 0]
 version 14.0 v1
@@ -917,7 +926,7 @@ BackdropNode {{
  name Tracker_3D_Rig
  tile_color 0x243044ff
  gl_color 0x243044ff
- label "<b>Photogrammetry 3D Tracking Rig</b>\\n\\nCamera: {lens_mm:.2f}mm | Sensor: {sensor_width_mm:.1f}x{sensor_height_mm:.1f}mm | Shift: ({win_u:.4f}, {win_v:.4f})\\nDistortion: k1={k1:.6f}, k2={k2:.6f} | Points: {len(points):,} | Frames: {start_frame}-{end_frame}"
+ label "<b>Photogrammetry 3D Tracking Rig</b>\\n\\nCamera: {lens_mm:.2f}mm | Sensor: {sensor_width_mm:.1f}x{sensor_height_mm:.1f}mm | Shift: ({win_u:.4f}, {win_v:.4f})\\nDistortion: k1={k1:.6f}, k2={k2:.6f} | Points: {len(points):,} | Frames: {start_frame}-{end_frame} @ {nk_fps:.3f} fps"
  note_font_size 14
  xpos -220
  ypos -120
@@ -934,6 +943,7 @@ Read {{
  last {end_frame}
  origfirst {start_frame}
  origlast {end_frame}
+ frame_rate {nk_fps:.4f}
  name Plate_Footage
  selected false
  xpos -180
@@ -1122,7 +1132,33 @@ def auto_export_alembic_via_blender(scene_dir, blender_path=None, log_callback=N
     return False
 
 
-def export_all_formats(scene_dir, blender_path=None, log_callback=None):
+def _probe_scene_fps(scene_path):
+    """Best-effort frame rate for a 3D_CAMERA_TRACK folder, via its source clip."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from core.media_info import probe_fps
+    except Exception:
+        return None
+
+    shot_dir = None
+    for parent in scene_path.parents:
+        if parent.name == "3D_CAMERA_TRACK":
+            shot_dir = parent.parent
+            break
+    if shot_dir is None:
+        return None
+
+    videos_dir = shot_dir.parent.parent / "02 VIDEOS"
+    if not videos_dir.is_dir():
+        return None
+    for ext in (".mp4", ".mov", ".avi", ".mkv", ".m4v"):
+        candidate = videos_dir / (shot_dir.name + ext)
+        if candidate.exists():
+            return probe_fps(candidate)
+    return None
+
+
+def export_all_formats(scene_dir, blender_path=None, log_callback=None, fps=None):
     """
     Parses a COLMAP scene folder and automatically generates all export formats:
     - import_to_blender.py
@@ -1136,6 +1172,11 @@ def export_all_formats(scene_dir, blender_path=None, log_callback=None):
     """
     scene_path = Path(scene_dir).resolve()
     sparse_dir = scene_path / "sparse"
+
+    # When no rate is supplied (batch_reconstruct.bat / direct CLI use), work the shot
+    # name back out of 04 SCENES/<shot>/3D_CAMERA_TRACK/<stamp> and probe its source clip.
+    if not fps:
+        fps = _probe_scene_fps(scene_path)
 
     cameras_file = sparse_dir / "cameras.txt"
     images_file = sparse_dir / "images.txt"
@@ -1160,23 +1201,24 @@ def export_all_formats(scene_dir, blender_path=None, log_callback=None):
 
     # 1. Blender 1-Click Script
     blender_script = scene_path / "import_to_blender.py"
-    if export_blender_script(scene_path, cameras, images, points, blender_script):
+    if export_blender_script(scene_path, cameras, images, points, blender_script, fps=fps):
         exported_files.append(str(blender_script))
 
     # 2. Nuke 1-Click Script (.nk)
     nuke_nk_file = scene_path / "camera_track_nuke.nk"
-    if export_nuke_camera_script(scene_path, cameras, images, points, nuke_nk_file):
+    if export_nuke_camera_script(scene_path, cameras, images, points, nuke_nk_file, fps=fps):
         exported_files.append(str(nuke_nk_file))
 
     # 3. Nuke .chan Camera File
     chan_file = scene_path / "camera_track.chan"
+    # .chan carries no frame-rate field, so fps is not passed here.
     if export_nuke_chan(scene_path, cameras, images, chan_file):
         exported_files.append(str(chan_file))
 
     # 4. Universal Scene Description (.usda)
     if HAS_USD:
         usd_file = scene_path / "camera_track.usda"
-        if export_usd_scene(scene_path, cameras, images, points, usd_file):
+        if export_usd_scene(scene_path, cameras, images, points, usd_file, fps=fps):
             exported_files.append(str(usd_file))
 
     # 5. PLY Point Cloud
@@ -1188,6 +1230,7 @@ def export_all_formats(scene_dir, blender_path=None, log_callback=None):
     json_file = scene_path / "camera_track.json"
     with open(json_file, 'w', encoding='utf-8') as f:
         json.dump({
+            "fps": float(fps) if fps else None,
             "cameras": cameras,
             "images": images,
             "points_count": len(points)
@@ -1216,7 +1259,8 @@ def export_all_formats(scene_dir, blender_path=None, log_callback=None):
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         target_scene = sys.argv[1]
-        res = export_all_formats(target_scene)
+        cli_fps = float(sys.argv[2]) if len(sys.argv) > 2 else None
+        res = export_all_formats(target_scene, fps=cli_fps)
         print(json.dumps(res, indent=2))
     else:
         print("Usage: python export_tools.py <path_to_scene_directory>")

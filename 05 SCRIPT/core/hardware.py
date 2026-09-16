@@ -3,6 +3,8 @@ Real-time Hardware Monitoring for NVIDIA GPUs (NVML Ctypes and nvidia-smi fallba
 """
 
 import os
+import time
+import threading
 import subprocess
 import ctypes
 from typing import Dict
@@ -35,6 +37,10 @@ class GPUInfoProvider:
         self._gpu_name = None
         self._total_mb = 0
         self._has_nvml = False
+        self._offline_cache = self._unavailable()
+        self._offline_lock = threading.Lock()
+        self._offline_thread = None
+        self._offline_stop = threading.Event()
         self._init_nvml()
 
     def _init_nvml(self):
@@ -55,6 +61,38 @@ class GPUInfoProvider:
                     self._has_nvml = True
         except Exception:
             self._has_nvml = False
+
+    @staticmethod
+    def _unavailable():
+        return {
+            'available': False,
+            'name': 'CPU Only',
+            'load_pct': 0,
+            'used_mb': 0,
+            'total_mb': 0,
+            'vram_pct': 0
+        }
+
+    def _start_offline_worker(self):
+        """Refreshes the slow fallbacks off the caller's thread."""
+        if self._offline_thread is not None:
+            return
+
+        def _loop():
+            while not self._offline_stop.wait(0.0):
+                reading = self._query_slow_fallbacks()
+                with self._offline_lock:
+                    self._offline_cache = reading
+                if self._offline_stop.wait(2.0):
+                    break
+
+        self._offline_thread = threading.Thread(
+            target=_loop, name='GPUInfoProvider-fallback', daemon=True
+        )
+        self._offline_thread.start()
+
+    def stop(self):
+        self._offline_stop.set()
 
     def query(self) -> Dict[str, any]:
         """
@@ -94,7 +132,13 @@ class GPUInfoProvider:
             except Exception:
                 pass
 
-        # 2. nvidia-smi fallback (silent, no window)
+        # 2 & 3. Slow fallbacks run on a background thread; return the latest reading.
+        self._start_offline_worker()
+        with self._offline_lock:
+            return dict(self._offline_cache)
+
+    def _query_slow_fallbacks(self) -> Dict[str, any]:
+        # nvidia-smi fallback (silent, no window)
         try:
             startupinfo = None
             creationflags = 0
@@ -124,7 +168,7 @@ class GPUInfoProvider:
         except Exception:
             pass
 
-        # 3. PyTorch fallback
+        # PyTorch fallback
         try:
             import torch
             if torch.cuda.is_available():
@@ -142,14 +186,7 @@ class GPUInfoProvider:
         except Exception:
             pass
 
-        return {
-            'available': False,
-            'name': 'CPU Only',
-            'load_pct': 0,
-            'used_mb': 0,
-            'total_mb': 0,
-            'vram_pct': 0
-        }
+        return self._unavailable()
 
 
 # Global singleton instance & alias

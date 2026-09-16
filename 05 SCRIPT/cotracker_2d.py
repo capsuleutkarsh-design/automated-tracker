@@ -12,6 +12,7 @@ import os
 import sys
 import json
 import math
+import shutil
 import subprocess
 import colorsys
 from pathlib import Path
@@ -305,83 +306,249 @@ def is_fp16_supported():
         return False
 
 
-def run_cotracker_chunked(model, video_tensor, queries_tensor, chunk_size=120, overlap=30, device=None):
+class _RawVisibilityCapture:
+    """
+    CoTrackerPredictor hard-codes `visibilities = visibilities > 0.9` before returning,
+    which throws away the raw probabilities the Confidence control needs.
+
+    A forward hook cannot see them: the predictor calls `self.model.forward(...)`
+    directly, and nn.Module only dispatches hooks through __call__. So wrap the bound
+    forward method instead, and restore it afterwards.
+    """
+
+    def __init__(self, predictor):
+        self.raw = None
+        self._inner = getattr(predictor, "model", None)
+        self._orig = None
+        if self._inner is None:
+            return
+        try:
+            orig = self._inner.forward
+
+            def _wrapped(*args, **kwargs):
+                out = orig(*args, **kwargs)
+                try:
+                    if isinstance(out, (tuple, list)) and len(out) >= 2 and out[1] is not None:
+                        self.raw = out[1].detach()
+                    else:
+                        self.raw = None
+                except Exception:
+                    self.raw = None
+                return out
+
+            self._inner.forward = _wrapped
+            self._orig = orig
+        except Exception:
+            self._orig = None
+
+    def remove(self):
+        if self._orig is not None:
+            try:
+                self._inner.forward = self._orig
+            except Exception:
+                pass
+            self._orig = None
+
+
+# Measured ratio of peak VRAM to raw frame bytes for CoTracker3 offline.
+ACTIVATION_OVERHEAD = 24
+# Smallest window worth running; below this the tracker has too little temporal context.
+MIN_CHUNK = 8
+
+
+def auto_chunk_size(T, C, H, W, device, requested=120, enabled=True, log=None):
+    """
+    Picks how many frames may sit on the GPU at once.
+
+    The raw frames alone cost C*H*W*4 bytes each once converted to float32, and the
+    model needs several times that again for its own activations, so only a slice of
+    free VRAM is budgeted for the frames themselves.
+    """
+    if not enabled:
+        return T
+    if device != "cuda":
+        return min(requested, T)
+    try:
+        free_b, _total_b = torch.cuda.mem_get_info()
+    except Exception:
+        return min(requested, T)
+
+    # The frames themselves are the small part: CoTracker's activations measured about
+    # 24x the raw frame bytes (120 frames at 720x400 peaked near 10 GB against 0.41 GB of
+    # frames). Budget against that, and leave 30% of free VRAM as headroom.
+    bytes_per_frame = C * H * W * 4 * ACTIVATION_OVERHEAD
+    budget = free_b * 0.70
+    n = int(budget // max(1, bytes_per_frame))
+    n = max(MIN_CHUNK, min(requested, n, T))
+    if log and n < min(requested, T):
+        log(f"   Auto VRAM Chunking: {free_b / 1024**3:.1f} GB free - "
+            f"processing {n} frames at a time (instead of {min(requested, T)}).", "#e0a000")
+        if n <= MIN_CHUNK:
+            log(f"   ! {W}x{H} is large for this GPU. Tracking will still run, but a lower "
+                f"Resolution setting gives better results.", "#e0a000")
+    return n
+
+
+def run_cotracker_chunked(model, video_tensor, queries_tensor, chunk_size=120, overlap=30,
+                          device=None, auto_chunk=True, log=None):
     """
     Memory-safe chunked inference for long videos.
-    video_tensor: [1, T, 3, H, W]
-    queries_tensor: [1, N, 3] (t, x, y)
+
+    video_tensor: [1, T, 3, H, W] uint8 **on the CPU** - only one chunk at a time is
+                  uploaded to the GPU and converted to float32.
+    queries_tensor: [1, N, 3] (t, x, y) on the CPU.
+
+    Returns (tracks [1,T,N,2], visible [1,T,N] bool, confidence [1,T,N] float).
     """
     if device is None:
         device = get_default_device()
 
     T = video_tensor.shape[1]
+    C, H, W = video_tensor.shape[2], video_tensor.shape[3], video_tensor.shape[4]
     N = queries_tensor.shape[1]
     use_fp16 = (device == "cuda") and is_fp16_supported()
 
-    def _infer_single(v_chunk, q_chunk):
+    chunk = auto_chunk_size(T, C, H, W, device, requested=chunk_size, enabled=auto_chunk, log=log)
+    overlap = max(0, min(overlap, chunk // 2))
+
+    capture = _RawVisibilityCapture(model)
+
+    def _is_oom(exc):
+        return isinstance(exc, torch.cuda.OutOfMemoryError) or "out of memory" in str(exc).lower()
+
+    def _infer_single(v_chunk_u8, q_chunk):
+        v_gpu = v_chunk_u8.to(device).float()
+        q_gpu = q_chunk.to(device)
+        capture.raw = None
         with torch.no_grad():
             if use_fp16:
                 try:
                     with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-                        return model(v_chunk, queries=q_chunk)
+                        tracks, vis = model(v_gpu, queries=q_gpu)
                 except Exception:
-                    return model(v_chunk, queries=q_chunk)
+                    tracks, vis = model(v_gpu, queries=q_gpu)
             else:
-                return model(v_chunk, queries=q_chunk)
+                tracks, vis = model(v_gpu, queries=q_gpu)
 
-    # If video fits comfortably in a single pass (<= chunk_size), run directly
-    if T <= chunk_size:
-        tracks, vis = _infer_single(video_tensor, queries_tensor)
-        return tracks.cpu().numpy(), vis.cpu().numpy()
+        n_out = tracks.shape[2]
+        raw = capture.raw
+        if raw is not None and raw.ndim == 3 and raw.shape[2] >= n_out:
+            conf = raw[:, :, :n_out].float().cpu().numpy()
+        else:
+            # Fall back to the thresholded boolean if the hook could not fire.
+            conf = vis.float().cpu().numpy()
 
-    # Otherwise, execute sliding-window chunking
-    full_tracks = np.zeros((1, T, N, 2), dtype=np.float32)
-    full_vis = np.zeros((1, T, N), dtype=bool)
-
-    current_queries = queries_tensor
-    start_idx = 0
-
-    while start_idx < T:
-        end_idx = min(start_idx + chunk_size, T)
-        chunk_video = video_tensor[:, start_idx:end_idx]
-
-        chunk_tracks, chunk_vis = _infer_single(chunk_video, current_queries)
-
-        c_tracks_np = chunk_tracks.cpu().numpy()
-        c_vis_np = chunk_vis.cpu().numpy()
-
-        chunk_len = end_idx - start_idx
-        full_tracks[:, start_idx:end_idx] = c_tracks_np[:, :chunk_len]
-        full_vis[:, start_idx:end_idx] = c_vis_np[:, :chunk_len]
-
+        t_np = tracks.cpu().numpy()
+        v_np = vis.cpu().numpy().astype(bool)
+        del v_gpu, q_gpu, tracks, vis
         if device == "cuda":
             torch.cuda.empty_cache()
+        return t_np, v_np, conf
 
-        if end_idx >= T:
-            break
+    try:
+        # Single pass when the whole clip is allowed on the GPU at once.
+        if T <= chunk:
+            try:
+                return _infer_single(video_tensor, queries_tensor)
+            except Exception as exc:
+                if not _is_oom(exc):
+                    raise
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+                chunk = max(MIN_CHUNK, T // 2)
+                overlap = min(overlap, chunk // 2)
+                if log:
+                    log(f"   ! GPU ran out of memory on a single pass - switching to "
+                        f"{chunk}-frame blocks.", "#e0a000")
 
-        # Prepare queries for the next chunk using the last tracked positions
-        next_start = end_idx - overlap
-        last_pos = c_tracks_np[0, -1] # [N, 2]
-        new_q = np.zeros((1, N, 3), dtype=np.float32)
-        new_q[0, :, 0] = 0.0 # relative to new chunk start
-        new_q[0, :, 1:] = last_pos
-        current_queries = torch.tensor(new_q, dtype=torch.float32, device=device)
+        max_qt = float(queries_tensor[0, :, 0].max().item()) if N else 0.0
+        if max_qt > 0:
+            if log:
+                log(f"   ! Manual points sit as late as frame {int(max_qt) + 1}, but this clip is "
+                    f"processed in {chunk}-frame blocks, so they are re-anchored to the start of "
+                    f"the tracking range. Place manual points on the first frame of the range "
+                    f"for exact results.", "#e0a000")
+            queries_tensor = queries_tensor.clone()
+            queries_tensor[0, :, 0] = queries_tensor[0, :, 0].clamp(0, chunk - 1)
 
-        start_idx = end_idx
+        full_tracks = np.zeros((1, T, N, 2), dtype=np.float32)
+        full_vis = np.zeros((1, T, N), dtype=bool)
+        full_conf = np.zeros((1, T, N), dtype=np.float32)
 
-    return full_tracks, full_vis
+        current_queries = queries_tensor
+        start_idx = 0
+        prev_end = 0
+
+        while start_idx < T:
+            # If the GPU cannot hold this window, halve it and try the same frames again
+            # rather than aborting the whole job.
+            while True:
+                end_idx = min(start_idx + chunk, T)
+                try:
+                    c_tracks, c_vis, c_conf = _infer_single(
+                        video_tensor[:, start_idx:end_idx], current_queries
+                    )
+                    break
+                except Exception as exc:
+                    if not _is_oom(exc) or chunk <= MIN_CHUNK:
+                        raise
+                    if device == "cuda":
+                        torch.cuda.empty_cache()
+                    chunk = max(MIN_CHUNK, chunk // 2)
+                    overlap = min(overlap, chunk // 2)
+                    if log:
+                        log(f"   ! GPU ran out of memory - retrying with {chunk} frames "
+                            f"per block.", "#e0a000")
+
+            # Frames [start_idx, prev_end) were already written by the previous chunk and
+            # only served as run-up context for the model, so skip them here.
+            w_from = max(prev_end - start_idx, 0)
+            abs_from = start_idx + w_from
+            full_tracks[:, abs_from:end_idx] = c_tracks[:, w_from:end_idx - start_idx]
+            full_vis[:, abs_from:end_idx] = c_vis[:, w_from:end_idx - start_idx]
+            full_conf[:, abs_from:end_idx] = c_conf[:, w_from:end_idx - start_idx]
+
+            prev_end = end_idx
+            if end_idx >= T:
+                break
+
+            # Re-seed the next window `overlap` frames back, so the model has real context
+            # before it reaches frames it has not seen yet.
+            next_start = max(end_idx - overlap, start_idx + 1)
+            seed_idx = next_start - start_idx
+            seed_pos = c_tracks[0, seed_idx]  # [N, 2]
+            new_q = np.zeros((1, N, 3), dtype=np.float32)
+            new_q[0, :, 0] = 0.0  # relative to the new chunk start
+            new_q[0, :, 1:] = seed_pos
+            current_queries = torch.from_numpy(new_q)
+
+            start_idx = next_start
+
+        return full_tracks, full_vis, full_conf
+    finally:
+        capture.remove()
 
 
-def filter_tracks_confidence(tracks, vis, min_confidence=0.7, max_jump_distance=150.0):
+def filter_tracks_confidence(tracks, vis, conf=None, min_confidence=0.7, max_jump_distance=150.0):
     """
-    Cleans up tracks: drops outlier points and suppresses jumping coordinates when lost.
+    Cleans up tracks: drops low-confidence samples, then suppresses jumping coordinates
+    when a point is lost.
+
     tracks: [T, N, 2]
-    vis: [T, N] (boolean or float confidence)
+    vis:    [T, N] boolean visibility from the model
+    conf:   [T, N] raw visibility probability in 0..1 (optional)
     """
     T, N, _ = tracks.shape
     cleaned_tracks = tracks.copy()
-    cleaned_vis = vis.copy()
+    cleaned_vis = np.asarray(vis).astype(bool).copy()
+
+    # Apply the user's confidence threshold to the raw probabilities. Note this REPLACES
+    # the model's own 0.9 cut rather than narrowing it, so lowering the setting really
+    # does keep more samples and raising it keeps fewer.
+    if conf is not None:
+        conf_arr = np.asarray(conf, dtype=np.float32)
+        if conf_arr.shape == cleaned_vis.shape and conf_arr.dtype.kind == "f":
+            cleaned_vis = conf_arr >= float(min_confidence)
 
     for n in range(N):
         last_valid_x = cleaned_tracks[0, n, 0]
@@ -396,7 +563,7 @@ def filter_tracks_confidence(tracks, vis, min_confidence=0.7, max_jump_distance=
 
             dx = cleaned_tracks[t, n, 0] - last_valid_x
             dy = cleaned_tracks[t, n, 1] - last_valid_y
-            dist = math.sqrt(dx*dx + dy*dy)
+            dist = math.sqrt(dx * dx + dy * dy)
 
             # Detect impossible sudden velocity jumps
             if dist > max_jump_distance:
@@ -413,7 +580,19 @@ def filter_tracks_confidence(tracks, vis, min_confidence=0.7, max_jump_distance=
 # =============================================================================
 # EXPORTERS: JSON, CSV, NUKE TRACKER, AFTER EFFECTS, BLENDER
 # =============================================================================
-def export_2d_json(tracks_rescaled, vis, orig_w, orig_h, out_path):
+def frame_number(t, start_frame=1, frame_step=1):
+    """
+    Maps a tracked sample index to the real timeline frame number.
+
+    `start_frame` is the 1-based source frame the tracking range began on (the In
+    point), and `frame_step` is the frame-skip used while loading. Without this the
+    exports always claimed to start at frame 1, which shifted every track when an
+    In point or a frame step was in use.
+    """
+    return int(start_frame) + int(t) * max(1, int(frame_step))
+
+
+def export_2d_json(tracks_rescaled, vis, orig_w, orig_h, out_path, start_frame=1, frame_step=1):
     T, N, _ = tracks_rescaled.shape
     tracks_data = []
 
@@ -428,7 +607,7 @@ def export_2d_json(tracks_rescaled, vis, orig_w, orig_h, out_path):
             y = float(tracks_rescaled[t, n, 1])
             v = bool(vis[t, n])
             pt_track["frames"].append({
-                "frame": t + 1,
+                "frame": frame_number(t, start_frame, frame_step),
                 "x": round(x, 2),
                 "y": round(y, 2),
                 "norm_x": round(x / orig_w, 5),
@@ -439,6 +618,8 @@ def export_2d_json(tracks_rescaled, vis, orig_w, orig_h, out_path):
 
     output = {
         "resolution": {"width": orig_w, "height": orig_h},
+        "start_frame": int(start_frame),
+        "frame_step": max(1, int(frame_step)),
         "frame_count": T,
         "track_count": N,
         "tracks": tracks_data
@@ -448,7 +629,7 @@ def export_2d_json(tracks_rescaled, vis, orig_w, orig_h, out_path):
         json.dump(output, f, indent=2)
 
 
-def export_2d_csv(tracks_rescaled, vis, orig_w, orig_h, out_path):
+def export_2d_csv(tracks_rescaled, vis, orig_w, orig_h, out_path, start_frame=1, frame_step=1):
     T, N, _ = tracks_rescaled.shape
     lines = ["frame,track_id,x,y,norm_x,norm_y,visible\n"]
     for t in range(T):
@@ -456,13 +637,13 @@ def export_2d_csv(tracks_rescaled, vis, orig_w, orig_h, out_path):
             x = float(tracks_rescaled[t, n, 0])
             y = float(tracks_rescaled[t, n, 1])
             v = 1 if vis[t, n] else 0
-            lines.append(f"{t+1},{n+1},{x:.2f},{y:.2f},{x/orig_w:.5f},{y/orig_h:.5f},{v}\n")
+            lines.append(f"{frame_number(t, start_frame, frame_step)},{n+1},{x:.2f},{y:.2f},{x/orig_w:.5f},{y/orig_h:.5f},{v}\n")
 
     with open(out_path, 'w', encoding='utf-8') as f:
         f.writelines(lines)
 
 
-def export_2d_nuke_tracker(tracks_rescaled, vis, orig_w, orig_h, fps, out_path, node_name="CoTracker2D_Tracker", xpos=0, ypos=0):
+def export_2d_nuke_tracker(tracks_rescaled, vis, orig_w, orig_h, fps, out_path, node_name="CoTracker2D_Tracker", xpos=0, ypos=0, start_frame=1, frame_step=1):
     """
     Generates a native Nuke Tracker4 node with all tracks keyframed.
     
@@ -484,7 +665,7 @@ def export_2d_nuke_tracker(tracks_rescaled, vis, orig_w, orig_h, fps, out_path, 
       Col 20-30: reserved  — {} {} {} {} {} {} {} {} {} {} {}  (11 empty)
     """
     T, N, _ = tracks_rescaled.shape
-    start_frame = 1
+    start_frame = int(start_frame)
 
     header = f'''set cut_paste_input [stack 0]
 version 14.0 v1
@@ -501,8 +682,9 @@ Tracker4 {{
         for t in range(T):
             x = tracks_rescaled[t, n, 0]
             y = orig_h - tracks_rescaled[t, n, 1]  # Nuke Y is bottom-up
-            x_curve_parts.append(f"x{t+start_frame} {x:.2f}")
-            y_curve_parts.append(f"x{t+start_frame} {y:.2f}")
+            fno = frame_number(t, start_frame, frame_step)
+            x_curve_parts.append(f"x{fno} {x:.2f}")
+            y_curve_parts.append(f"x{fno} {y:.2f}")
 
         x_curve = " ".join(x_curve_parts)
         y_curve = " ".join(y_curve_parts)
@@ -538,7 +720,7 @@ Tracker4 {{
     return True
 
 
-def export_multi_layer_nuke_tracker(layers_data, orig_w, orig_h, fps, out_path):
+def export_multi_layer_nuke_tracker(layers_data, orig_w, orig_h, fps, out_path, start_frame=1, frame_step=1):
     """
     Generates a master Nuke script containing individual Tracker4 nodes for each layer.
     layers_data: list of dicts {"name": str, "tracks": np.ndarray, "vis": np.ndarray}
@@ -547,7 +729,7 @@ def export_multi_layer_nuke_tracker(layers_data, orig_w, orig_h, fps, out_path):
 version 14.0 v1
 '''
     x_offset = 0
-    start_frame = 1
+    start_frame = int(start_frame)
     for idx, ldata in enumerate(layers_data):
         l_name = ldata.get("name", f"Layer_{idx+1}").replace(" ", "_")
         tracks = ldata["tracks"]
@@ -564,8 +746,9 @@ Tracker4 {{
             for t in range(T):
                 x = tracks[t, n, 0]
                 y = orig_h - tracks[t, n, 1]
-                x_curve_parts.append(f"x{t+start_frame} {x:.2f}")
-                y_curve_parts.append(f"x{t+start_frame} {y:.2f}")
+                fno = frame_number(t, start_frame, frame_step)
+                x_curve_parts.append(f"x{fno} {x:.2f}")
+                y_curve_parts.append(f"x{fno} {y:.2f}")
             x_curve = " ".join(x_curve_parts)
             y_curve = " ".join(y_curve_parts)
             empty_slots = " ".join(["{}"] * 11)
@@ -604,7 +787,7 @@ Tracker4 {{
 # =============================================================================
 # 4-POINT CORNERPIN SOLVERS: NUKE, AFTER EFFECTS, BLENDER
 # =============================================================================
-def export_2d_cornerpin_nuke(tracks_rescaled, orig_w, orig_h, fps, out_path):
+def export_2d_cornerpin_nuke(tracks_rescaled, orig_w, orig_h, fps, out_path, start_frame=1, frame_step=1):
     """
     Generates a 1-click Nuke CornerPin2D node.
     Corners: 1=Top-Left, 2=Top-Right, 3=Bottom-Right, 4=Bottom-Left
@@ -619,8 +802,9 @@ def export_2d_cornerpin_nuke(tracks_rescaled, orig_w, orig_h, fps, out_path):
         for t in range(T):
             x = tracks_rescaled[t, corner_idx, 0]
             y = orig_h - tracks_rescaled[t, corner_idx, 1]
-            x_parts.append(f"x{t+1} {x:.2f}")
-            y_parts.append(f"x{t+1} {y:.2f}")
+            fno = frame_number(t, start_frame, frame_step)
+            x_parts.append(f"x{fno} {x:.2f}")
+            y_parts.append(f"x{fno} {y:.2f}")
         return " ".join(x_parts), " ".join(y_parts)
 
     # Standard Nuke CornerPin2D pin layout:
@@ -653,7 +837,7 @@ CornerPin2D {{
     return True
 
 
-def export_2d_cornerpin_ae(tracks_rescaled, orig_w, orig_h, fps, out_path):
+def export_2d_cornerpin_ae(tracks_rescaled, orig_w, orig_h, fps, out_path, start_frame=1, frame_step=1):
     """Generates an After Effects ExtendScript applying Corner Pin to an insert layer."""
     T, N, _ = tracks_rescaled.shape
     if N < 4:
@@ -677,7 +861,7 @@ def export_2d_cornerpin_ae(tracks_rescaled, orig_w, orig_h, fps, out_path):
 
 '''
     for t in range(T):
-        time_sec = t / fps
+        time_sec = (frame_number(t, start_frame, frame_step) - 1) / fps
         x1, y1 = tracks_rescaled[t, 0, 0], tracks_rescaled[t, 0, 1]
         x2, y2 = tracks_rescaled[t, 1, 0], tracks_rescaled[t, 1, 1]
         x3, y3 = tracks_rescaled[t, 2, 0], tracks_rescaled[t, 2, 1]
@@ -697,7 +881,7 @@ def export_2d_cornerpin_ae(tracks_rescaled, orig_w, orig_h, fps, out_path):
     return True
 
 
-def export_2d_cornerpin_blender(tracks_rescaled, orig_w, orig_h, fps, out_path):
+def export_2d_cornerpin_blender(tracks_rescaled, orig_w, orig_h, fps, out_path, start_frame=1, frame_step=1):
     """Generates a Blender script creating an animated 4-point Quad mesh."""
     T, N, _ = tracks_rescaled.shape
     if N < 4:
@@ -711,9 +895,10 @@ import bpy
 
 def setup_cornerpin_mesh():
     scene = bpy.context.scene
-    scene.frame_start = 1
-    scene.frame_end = {T}
-    scene.render.fps = {int(fps)}
+    scene.frame_start = {frame_number(0, start_frame, frame_step)}
+    scene.frame_end = {frame_number(T - 1, start_frame, frame_step)}
+    scene.render.fps = {int(round(fps))}
+    scene.render.fps_base = {round(int(round(fps)) / fps, 6) if fps else 1.0}
 
     mesh_name = "Tracked_Screen_Mesh"
     obj_name = "Tracked_Screen_Surface"
@@ -733,8 +918,9 @@ def setup_cornerpin_mesh():
     # Animate 4 vertices as shape keys per frame
     sk_basis = obj.shape_key_add(name="Basis")
 '''
+    step_n = max(1, int(frame_step))
     for t in range(T):
-        f = t + 1
+        f = frame_number(t, start_frame, frame_step)
         coords = []
         for idx in range(4):
             x_norm = (tracks_rescaled[t, idx, 0] / orig_w - 0.5) * 2.0
@@ -747,12 +933,12 @@ def setup_cornerpin_mesh():
         sk_{f}.data[v_i].co = pt
     sk_{f}.value = 1.0
     sk_{f}.keyframe_insert(data_path="value", frame={f})
-    if {f} > 1:
+    if {t} > 0:
         sk_{f}.value = 0.0
-        sk_{f}.keyframe_insert(data_path="value", frame={f-1})
-    if {f} < {T}:
+        sk_{f}.keyframe_insert(data_path="value", frame={f - step_n})
+    if {t} < {T - 1}:
         sk_{f}.value = 0.0
-        sk_{f}.keyframe_insert(data_path="value", frame={f+1})
+        sk_{f}.keyframe_insert(data_path="value", frame={f + step_n})
 '''
 
     script += '''
@@ -766,7 +952,7 @@ if __name__ == "__main__":
     return True
 
 
-def export_2d_after_effects_jsx(tracks_rescaled, vis, orig_w, orig_h, fps, out_path):
+def export_2d_after_effects_jsx(tracks_rescaled, vis, orig_w, orig_h, fps, out_path, start_frame=1, frame_step=1):
     T, N, _ = tracks_rescaled.shape
     script = f'''// Adobe After Effects ExtendScript - CoTracker 2D Tracks Importer
 (function() {{
@@ -790,7 +976,7 @@ def export_2d_after_effects_jsx(tracks_rescaled, vis, orig_w, orig_h, fps, out_p
         for t in range(T):
             x = float(tracks_rescaled[t, n, 0])
             y = float(tracks_rescaled[t, n, 1])
-            script += f'    posProp_{n}.setValueAtTime({t}/fps, [{x:.2f}, {y:.2f}, 0]);\n'
+            script += f'    posProp_{n}.setValueAtTime({frame_number(t, start_frame, frame_step) - 1}/fps, [{x:.2f}, {y:.2f}, 0]);\n'
 
     script += '''
     app.endUndoGroup();
@@ -801,7 +987,7 @@ def export_2d_after_effects_jsx(tracks_rescaled, vis, orig_w, orig_h, fps, out_p
         f.write(script)
 
 
-def export_2d_blender_empties(tracks_rescaled, vis, orig_w, orig_h, fps, out_path, images_dir=None, collection_name="CoTracker_2D_Tracks"):
+def export_2d_blender_empties(tracks_rescaled, vis, orig_w, orig_h, fps, out_path, images_dir=None, collection_name="CoTracker_2D_Tracks", start_frame=1, frame_step=1):
     T, N, _ = tracks_rescaled.shape
     images_dir_str = str(images_dir).replace('\\', '/') if images_dir else ""
 
@@ -823,9 +1009,10 @@ def import_2d_tracks():
     scene = bpy.context.scene
     scene.render.resolution_x = {orig_w}
     scene.render.resolution_y = {orig_h}
-    scene.frame_start = 1
-    scene.frame_end = {T}
-    scene.render.fps = {int(fps)}
+    scene.frame_start = {frame_number(0, start_frame, frame_step)}
+    scene.frame_end = {frame_number(T - 1, start_frame, frame_step)}
+    scene.render.fps = {int(round(fps))}
+    scene.render.fps_base = {round(int(round(fps)) / fps, 6) if fps else 1.0}
 
     col_name = "{collection_name}"
     col = bpy.data.collections.get(col_name) or bpy.data.collections.new(col_name)
@@ -885,7 +1072,7 @@ def import_2d_tracks():
             x_norm = (tracks_rescaled[t, n, 0] / orig_w - 0.5) * 2.0
             y_norm = -(tracks_rescaled[t, n, 1] / orig_h - 0.5) * 2.0 * (orig_h / orig_w)
             script += f'''            empty_obj.location = ({x_norm:.4f}, {y_norm:.4f}, 0.0)
-            empty_obj.keyframe_insert(data_path="location", frame={t+1})
+            empty_obj.keyframe_insert(data_path="location", frame={frame_number(t, start_frame, frame_step)})
 '''
 
     script += '''
@@ -899,7 +1086,7 @@ if __name__ == "__main__":
     return True
 
 
-def export_multi_layer_blender(layers_data, orig_w, orig_h, fps, out_path, images_dir=None):
+def export_multi_layer_blender(layers_data, orig_w, orig_h, fps, out_path, images_dir=None, start_frame=1, frame_step=1):
     """
     Generates a master Blender script creating separate collections for each tracking layer.
     """
@@ -924,9 +1111,10 @@ def import_multi_layer_tracks():
     scene = bpy.context.scene
     scene.render.resolution_x = {orig_w}
     scene.render.resolution_y = {orig_h}
-    scene.frame_start = 1
-    scene.frame_end = {T_max}
-    scene.render.fps = {int(fps)}
+    scene.frame_start = {frame_number(0, start_frame, frame_step)}
+    scene.frame_end = {frame_number(T_max - 1, start_frame, frame_step)}
+    scene.render.fps = {int(round(fps))}
+    scene.render.fps_base = {round(int(round(fps)) / fps, 6) if fps else 1.0}
 
     # 1. Setup Reference Camera
     cam_name = "Camera_2D_Viewer"
@@ -987,7 +1175,7 @@ def import_multi_layer_tracks():
                 x_norm = (tracks[t, n, 0] / orig_w - 0.5) * 2.0
                 y_norm = -(tracks[t, n, 1] / orig_h - 0.5) * 2.0 * (orig_h / orig_w)
                 script += f'''    empty_{l_idx}_{n}.location = ({x_norm:.4f}, {y_norm:.4f}, 0.0)
-    empty_{l_idx}_{n}.keyframe_insert(data_path="location", frame={t+1})
+    empty_{l_idx}_{n}.keyframe_insert(data_path="location", frame={frame_number(t, start_frame, frame_step)})
 '''
 
     script += '''
@@ -1136,6 +1324,11 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
     step = config.get("frame_step", 1)
     in_pt = config.get("in_point", 0)
     out_pt = config.get("out_point", -1)
+    step = max(1, int(step))
+    in_pt = max(0, int(in_pt))
+    # 1-based source frame this tracking range starts on, used by every exporter so the
+    # curves land on the right frames in Nuke / AE / Blender.
+    export_start_frame = in_pt + 1
     frames_np, (orig_w, orig_h) = load_video_frames(video_path, max_dimension=max_dim, frame_step=step, in_point=in_pt, out_point=out_pt)
 
     T, proc_h, proc_w, _ = frames_np.shape
@@ -1150,7 +1343,18 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
     if device == "cuda":
         log(f"⚡ GPU: {gpu_name} (VRAM: {alloc_mb:.0f}/{total_mb:.0f} MB, {fp_mode})", "#00d2ff")
 
-    video_tensor = torch.from_numpy(frames_np).permute(0, 3, 1, 2)[None].float().to(device)
+    # The clip stays on the CPU as uint8. run_cotracker_chunked() uploads one chunk at a
+    # time and converts it to float32 there. Uploading the whole clip as float32 (the old
+    # behaviour) needed ~7.3 GB of VRAM for a 708-frame 720p shot and blew up on 'Original'.
+    video_tensor = torch.from_numpy(frames_np).permute(0, 3, 1, 2)[None].contiguous()
+    auto_chunk = bool(config.get("auto_chunk", True))
+    est_gb = (T * 3 * proc_h * proc_w * 4) / (1024 ** 3)
+    if device == "cuda":
+        if auto_chunk:
+            log(f"   Auto VRAM Chunking ON (full clip would need {est_gb:.1f} GB of VRAM in one pass).", "#a0a0b0")
+        else:
+            log(f"   ! Auto VRAM Chunking is OFF - the whole clip ({est_gb:.1f} GB) is sent to the "
+                f"GPU at once and may run out of memory.", "#e0a000")
 
     mode = config.get("mode", "grid")
     offline = config.get("offline", True)
@@ -1186,6 +1390,9 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
         window_len=60 if offline else 16
     ).to(device)
 
+    # Frame-numbering bundle handed to every exporter.
+    fr = {"start_frame": export_start_frame, "frame_step": step}
+
     layers_results = []
     total_points = 0
 
@@ -1195,18 +1402,36 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
         l_min_conf = lconf.get("min_confidence", 0.7)
         l_col = lconf.get("color", "#00d2ff")
 
+        # Read once, for every mode. This used to live inside the grid branch only, so a
+        # 'points' or 'cornerpin' layer hit an unbound local further down and the run died.
+        anim_masks = lconf.get("animated_masks")
+
         # Build queries for this layer
         if (l_mode == "points" or l_mode == "cornerpin") and lconf.get("query_points"):
             raw_queries = lconf["query_points"]
             proc_queries = []
+            dropped = 0
             for q in raw_queries:
                 t, x, y = q
-                proc_queries.append([t, x / scale_x, y / scale_y])
+                # Points carry the absolute timeline frame they were clicked on, but the
+                # loaded clip starts at the In point and may skip frames - rebase them.
+                t_local = (int(t) - in_pt) / float(step)
+                if t_local < 0 or t_local > (T - 1):
+                    dropped += 1
+                    continue
+                proc_queries.append([int(round(t_local)), x / scale_x, y / scale_y])
+            if dropped:
+                log(f"   ! [{l_name}] {dropped} manual point(s) sit outside the In/Out range "
+                    f"and were skipped.", "#e0a000")
+            if not proc_queries:
+                raise ValueError(
+                    f"Layer '{l_name}' has no manual points inside the tracking range "
+                    f"(In point frame {in_pt + 1}). Move the In point or place points inside it."
+                )
             queries_list = proc_queries
         else:
             g_size = lconf.get("grid_size", 10)
-            anim_masks = lconf.get("animated_masks")
-            
+
             if anim_masks:
                 from mask_animator import AnimatedMask
                 inc_f0 = []
@@ -1245,18 +1470,26 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
                     exclusion_box=p_exc_box
                 )
 
-        q_tensor = torch.tensor(queries_list, dtype=torch.float32, device=device)[None]
+        q_tensor = torch.tensor(queries_list, dtype=torch.float32)[None]
         N_layer = q_tensor.shape[1]
         total_points += N_layer
 
         log(f"   ▶ Tracking Layer [{l_name}] ({N_layer} points, mode: {l_mode})...", "#00d2ff")
         prog(35 + int((l_idx / len(raw_layers)) * 35), f"Tracking Layer {l_name} ({N_layer} pts)...")
 
-        pred_tracks, pred_vis = run_cotracker_chunked(model, video_tensor, q_tensor, chunk_size=120, overlap=30, device=device)
+        pred_tracks, pred_vis, pred_conf = run_cotracker_chunked(
+            model, video_tensor, q_tensor, chunk_size=120, overlap=30,
+            device=device, auto_chunk=auto_chunk, log=log
+        )
         l_tracks_proc = pred_tracks[0]
         l_vis = pred_vis[0]
+        l_conf = pred_conf[0]
 
-        l_tracks_proc, l_vis = filter_tracks_confidence(l_tracks_proc, l_vis, min_confidence=l_min_conf)
+        l_tracks_proc, l_vis = filter_tracks_confidence(
+            l_tracks_proc, l_vis, conf=l_conf, min_confidence=l_min_conf
+        )
+        log(f"   [{l_name}] Confidence >= {l_min_conf:.2f}: "
+            f"{int(l_vis.sum())}/{l_vis.size} samples kept.", "#a0a0b0")
 
         l_tracks_rescaled = l_tracks_proc.copy()
         l_tracks_rescaled[:, :, 0] *= scale_x
@@ -1270,16 +1503,16 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
         if is_multi_layer:
             layer_dir = out_dir / l_name
             layer_dir.mkdir(parents=True, exist_ok=True)
-            export_2d_json(l_tracks_rescaled, l_vis, orig_w, orig_h, layer_dir / "tracks_2d.json")
-            export_2d_csv(l_tracks_rescaled, l_vis, orig_w, orig_h, layer_dir / "tracks_2d_csv.csv")
-            export_2d_nuke_tracker(l_tracks_rescaled, l_vis, orig_w, orig_h, fps, layer_dir / "tracks_2d_nuke.nk", node_name=f"Tracker_{l_name}")
-            export_2d_after_effects_jsx(l_tracks_rescaled, l_vis, orig_w, orig_h, fps, layer_dir / "tracks_2d_ae.jsx")
-            export_2d_blender_empties(l_tracks_rescaled, l_vis, orig_w, orig_h, fps, layer_dir / "tracks_2d_blender.py", images_dir=scene_dir / "images", collection_name=f"Layer_{l_name}")
+            export_2d_json(l_tracks_rescaled, l_vis, orig_w, orig_h, layer_dir / "tracks_2d.json", **fr)
+            export_2d_csv(l_tracks_rescaled, l_vis, orig_w, orig_h, layer_dir / "tracks_2d_csv.csv", **fr)
+            export_2d_nuke_tracker(l_tracks_rescaled, l_vis, orig_w, orig_h, fps, layer_dir / "tracks_2d_nuke.nk", node_name=f"Tracker_{l_name}", **fr)
+            export_2d_after_effects_jsx(l_tracks_rescaled, l_vis, orig_w, orig_h, fps, layer_dir / "tracks_2d_ae.jsx", **fr)
+            export_2d_blender_empties(l_tracks_rescaled, l_vis, orig_w, orig_h, fps, layer_dir / "tracks_2d_blender.py", images_dir=scene_dir / "images", collection_name=f"Layer_{l_name}", **fr)
 
             if N_layer == 4 or lconf.get("export_cornerpin", False):
-                export_2d_cornerpin_nuke(l_tracks_rescaled, orig_w, orig_h, fps, layer_dir / "tracks_2d_cornerpin_nuke.nk")
-                export_2d_cornerpin_ae(l_tracks_rescaled, orig_w, orig_h, fps, layer_dir / "tracks_2d_cornerpin_ae.jsx")
-                export_2d_cornerpin_blender(l_tracks_rescaled, orig_w, orig_h, fps, layer_dir / "tracks_2d_cornerpin_blender.py")
+                export_2d_cornerpin_nuke(l_tracks_rescaled, orig_w, orig_h, fps, layer_dir / "tracks_2d_cornerpin_nuke.nk", **fr)
+                export_2d_cornerpin_ae(l_tracks_rescaled, orig_w, orig_h, fps, layer_dir / "tracks_2d_cornerpin_ae.jsx", **fr)
+                export_2d_cornerpin_blender(l_tracks_rescaled, orig_w, orig_h, fps, layer_dir / "tracks_2d_cornerpin_blender.py", **fr)
 
         layers_results.append({
             "name": l_name,
@@ -1307,15 +1540,15 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
 
     if is_multi_layer:
         # Multi-layer combined files
-        export_multi_layer_nuke_tracker(layers_results, orig_w, orig_h, fps, nuke_path)
+        export_multi_layer_nuke_tracker(layers_results, orig_w, orig_h, fps, nuke_path, **fr)
         log(f"   ✔ Generated Multi-Layer Nuke Tracker: {nuke_path.name}", "#00ff88")
 
-        export_multi_layer_blender(layers_results, orig_w, orig_h, fps, blender_path, images_dir=scene_dir / "images")
+        export_multi_layer_blender(layers_results, orig_w, orig_h, fps, blender_path, images_dir=scene_dir / "images", **fr)
         log(f"   ✔ Generated Multi-Layer Blender Script: {blender_path.name}", "#00ff88")
 
         # Master combined JSON
         all_tracks_dict = {
-            "metadata": {"video": video_path.name, "width": orig_w, "height": orig_h, "frames": T, "fps": fps, "layers": len(layers_results)},
+            "metadata": {"video": video_path.name, "width": orig_w, "height": orig_h, "frames": T, "fps": fps, "start_frame": export_start_frame, "frame_step": step, "layers": len(layers_results)},
             "layers": {}
         }
         for ldata in layers_results:
@@ -1326,7 +1559,7 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
                 "point_count": ldata["point_count"],
                 "points": {
                     f"track_{n+1:03d}": [
-                        {"frame": t + 1, "x": round(float(tr[t, n, 0]), 2), "y": round(float(tr[t, n, 1]), 2), "visible": bool(vi[t, n])}
+                        {"frame": frame_number(t, export_start_frame, step), "x": round(float(tr[t, n, 0]), 2), "y": round(float(tr[t, n, 1]), 2), "visible": bool(vi[t, n])}
                         for t in range(T)
                     ]
                     for n in range(ldata["point_count"])
@@ -1339,32 +1572,32 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
     else:
         # Single layer flat files
         single_l = layers_results[0]
-        export_2d_json(single_l["tracks"], single_l["vis"], orig_w, orig_h, json_path)
+        export_2d_json(single_l["tracks"], single_l["vis"], orig_w, orig_h, json_path, **fr)
         log(f"   ✔ Generated JSON: {json_path.name}", "#00ff88")
 
-        export_2d_csv(single_l["tracks"], single_l["vis"], orig_w, orig_h, csv_path)
+        export_2d_csv(single_l["tracks"], single_l["vis"], orig_w, orig_h, csv_path, **fr)
         log(f"   ✔ Generated CSV: {csv_path.name}", "#00ff88")
 
-        export_2d_nuke_tracker(single_l["tracks"], single_l["vis"], orig_w, orig_h, fps, nuke_path)
+        export_2d_nuke_tracker(single_l["tracks"], single_l["vis"], orig_w, orig_h, fps, nuke_path, **fr)
         log(f"   ✔ Generated Nuke Tracker Node: {nuke_path.name}", "#00ff88")
 
-        export_2d_after_effects_jsx(single_l["tracks"], single_l["vis"], orig_w, orig_h, fps, ae_path)
+        export_2d_after_effects_jsx(single_l["tracks"], single_l["vis"], orig_w, orig_h, fps, ae_path, **fr)
         log(f"   ✔ Generated After Effects Script: {ae_path.name}", "#00ff88")
 
-        export_2d_blender_empties(single_l["tracks"], single_l["vis"], orig_w, orig_h, fps, blender_path, images_dir=scene_dir / "images")
+        export_2d_blender_empties(single_l["tracks"], single_l["vis"], orig_w, orig_h, fps, blender_path, images_dir=scene_dir / "images", **fr)
         log(f"   ✔ Generated Blender 2D Script: {blender_path.name}", "#00ff88")
 
         if single_l["export_cornerpin"]:
             cornerpin_nuke_path = out_dir / "tracks_2d_cornerpin_nuke.nk"
-            export_2d_cornerpin_nuke(single_l["tracks"], orig_w, orig_h, fps, cornerpin_nuke_path)
+            export_2d_cornerpin_nuke(single_l["tracks"], orig_w, orig_h, fps, cornerpin_nuke_path, **fr)
             log(f"   ✔ Generated Nuke CornerPin2D Node: {cornerpin_nuke_path.name}", "#00d2ff")
 
             cornerpin_ae_path = out_dir / "tracks_2d_cornerpin_ae.jsx"
-            export_2d_cornerpin_ae(single_l["tracks"], orig_w, orig_h, fps, cornerpin_ae_path)
+            export_2d_cornerpin_ae(single_l["tracks"], orig_w, orig_h, fps, cornerpin_ae_path, **fr)
             log(f"   ✔ Generated After Effects Corner Pin Script: {cornerpin_ae_path.name}", "#00d2ff")
 
             cornerpin_blender_path = out_dir / "tracks_2d_cornerpin_blender.py"
-            export_2d_cornerpin_blender(single_l["tracks"], orig_w, orig_h, fps, cornerpin_blender_path)
+            export_2d_cornerpin_blender(single_l["tracks"], orig_w, orig_h, fps, cornerpin_blender_path, **fr)
             log(f"   ✔ Generated Blender Corner Pin Quad Surface: {cornerpin_blender_path.name}", "#00d2ff")
 
     # Render Overlay Video
@@ -1403,6 +1636,8 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
         "out_dir": str(out_dir),
         "track_count": total_points,
         "frame_count": T,
+        "start_frame": export_start_frame,
+        "frame_step": step,
         "layers_count": len(layers_results),
         "json_path": str(json_path),
         "nuke_path": str(nuke_path),
