@@ -13,6 +13,7 @@ from PySide6.QtCore import QThread, Signal
 from mask_animator import AnimatedMask, rasterize_masks_to_png
 from core.media_info import probe_fps
 from core.proc import popen_hidden, hidden_kwargs
+from core.colmap_model import find_best_model
 
 
 class TrackerWorker(QThread):
@@ -203,6 +204,20 @@ class TrackerWorker(QThread):
                 continue
 
             # Step 4: Mapper (GLOMAP Global Structure-from-Motion vs Incremental Mapper)
+            def solved_model():
+                """
+                The best reconstruction in sparse/, not blindly sparse/0.
+
+                COLMAP writes one folder per reconstruction. When its first
+                initialisation produces a degenerate pair and it starts again, the
+                good solve lands in sparse/1 while sparse/0 keeps a two-image
+                model - and exporting sparse/0 gives a two-camera track from a run
+                that actually registered every frame.
+                """
+                return find_best_model(
+                    sparse_dir,
+                    log=lambda m: self.log_signal.emit(m, "#e0a000"))
+
             solver_engine = self.config.get("solver_engine", "Incremental")
             is_global_solver = any(
                 key in solver_engine for key in ("Hierarchical", "GLOMAP", "Global")
@@ -225,7 +240,7 @@ class TrackerWorker(QThread):
 
                 # If fast mapper wrote model files directly into sparse_dir (cameras.bin/txt, etc.), move them into sparse_dir/0
                 direct_cameras = list(sparse_dir.glob("cameras.*"))
-                if direct_cameras and not (model_0.exists() and any(model_0.iterdir())):
+                if direct_cameras and solved_model() is None:
                     model_0.mkdir(parents=True, exist_ok=True)
                     for pattern in ["cameras.*", "images.*", "points3D.*", "*.bin", "*.txt"]:
                         for f in sparse_dir.glob(pattern):
@@ -235,7 +250,7 @@ class TrackerWorker(QThread):
                                 except Exception:
                                     pass
 
-                if not (model_0.exists() and any(model_0.iterdir())):
+                if solved_model() is None:
                     self.log_signal.emit(f"↻ Notice: Fast Hierarchical solve not produced – falling back seamlessly to Incremental Mapper...", "#e0a000")
                 else:
                     self.log_signal.emit(f"✔ Fast Mapper successfully solved 3D camera trajectory!", "#00ff88")
@@ -250,7 +265,7 @@ class TrackerWorker(QThread):
             fwd_motion = str(self.config.get("init_max_forward_motion", 1.0))
             init_trials = str(self.config.get("init_num_trials", 500))
 
-            if not (model_0.exists() and any(model_0.iterdir())):
+            if solved_model() is None:
                 self.progress_signal.emit(80, f"[{idx}/{total_videos}] [4/4] Sparse Reconstruction (Incremental Mapper)...")
                 self.log_signal.emit(f"▶ [4/4] Reconstructing 3D camera track with BA Lens Distortion Refinement...", "#ffffff")
                 mapper_cmd = [
@@ -272,7 +287,7 @@ class TrackerWorker(QThread):
                 self._run_command(mapper_cmd, env, "COLMAP Mapper")
 
             # Step 4.5: Smart Auto-Retry on Low Parallax
-            if not (model_0.exists() and any(model_0.iterdir())):
+            if solved_model() is None:
                 self.log_signal.emit(
                     "↻ Initial 3D solve found no usable starting pair – retrying with fully "
                     "relaxed parallax and forward-motion limits...", "#e0a000")
@@ -295,12 +310,13 @@ class TrackerWorker(QThread):
                 self._run_command(retry_mapper_cmd, env, "COLMAP Mapper Smart Retry")
 
             # Step 5: Convert Best Model to TXT & Multi-Format Exports
-            has_model = model_0.exists() and any(model_0.iterdir())
+            best_model = solved_model()
+            has_model = best_model is not None
             if has_model:
                 self.log_signal.emit(f"▶ Exporting best model to TXT format...", "#ffffff")
                 conv_cmd = [
                     str(self.colmap_exe), "model_converter",
-                    "--input_path", str(model_0),
+                    "--input_path", str(best_model),
                     "--output_path", str(sparse_dir),
                     "--output_type", "TXT"
                 ]
@@ -313,7 +329,7 @@ class TrackerWorker(QThread):
                     mesher_cmd = [
                         str(self.colmap_exe), "delaunay_mesher",
                         "--input_type", "sparse",
-                        "--input_path", str(model_0),
+                        "--input_path", str(best_model),
                         "--output_path", str(mesh_out)
                     ]
                     success_mesh = self._run_command(mesher_cmd, env, "COLMAP 3D Delaunay Mesher")
@@ -325,7 +341,7 @@ class TrackerWorker(QThread):
                         cloud_ply = track_dir / "sparse_points.ply"
                         to_ply_cmd = [
                             str(self.colmap_exe), "model_converter",
-                            "--input_path", str(model_0),
+                            "--input_path", str(best_model),
                             "--output_path", str(cloud_ply),
                             "--output_type", "PLY"
                         ]

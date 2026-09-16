@@ -1175,10 +1175,23 @@ def export_all_formats(scene_dir, blender_path=None, log_callback=None, fps=None
     images_file = sparse_dir / "images.txt"
     points3D_file = sparse_dir / "points3D.txt"
 
-    if not cameras_file.exists() and (sparse_dir / "0" / "cameras.txt").exists():
-        cameras_file = sparse_dir / "0" / "cameras.txt"
-        images_file = sparse_dir / "0" / "images.txt"
-        points3D_file = sparse_dir / "0" / "points3D.txt"
+    if not cameras_file.exists() or not images_file.exists():
+        # Fall back to whichever sparse/<n> model actually holds a solve, rather
+        # than assuming sparse/0 - COLMAP numbers them in the order it tried, not
+        # by quality.
+        try:
+            if not getattr(sys, 'frozen', False):
+                here = str(Path(__file__).resolve().parent)
+                if here not in sys.path:
+                    sys.path.insert(0, here)
+            from core.colmap_model import find_best_model
+            best = find_best_model(sparse_dir)
+        except Exception:
+            best = None
+        if best is not None:
+            cameras_file = best / "cameras.txt"
+            images_file = best / "images.txt"
+            points3D_file = best / "points3D.txt"
 
     if not cameras_file.exists() or not images_file.exists():
         return {
