@@ -1,0 +1,20 @@
+# Bundled third-party runtimes and binaries (huge, restorable from vendor)
+00 PYTHON/
+01 COLMAP/
+03 FFMPEG/
+06 COTRACKER/
+
+# Media and generated output
+02 VIDEOS/
+04 SCENES/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Stale duplicate of the UI (kept on disk, not tracked)
+05 SCRIPT/gui_backup_v1/
+05 SCRIPT/test_extract/
+
+# Large UI background images
+05 SCRIPT/gui/assets/
