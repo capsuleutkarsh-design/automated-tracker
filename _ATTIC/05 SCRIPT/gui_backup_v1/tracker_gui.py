@@ -7,20 +7,16 @@ import sys
 import os
 import shutil
 import subprocess
-import random
 from pathlib import Path
 
 try:
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QLabel, QTabWidget, QMessageBox, QFileDialog, QTableWidgetItem,
-        QInputDialog, QColorDialog, QListWidgetItem, QStackedLayout,
-        QGraphicsOpacityEffect
+        QInputDialog, QColorDialog, QListWidgetItem
     )
     from PySide6.QtCore import Qt, QTimer
-    from PySide6.QtGui import (
-        QColor, QImage, QPixmap, QPainter, QDragEnterEvent, QDropEvent, QPalette
-    )
+    from PySide6.QtGui import QColor, QImage, QDragEnterEvent, QDropEvent
 except ImportError:
     print("[ERROR] PySide6 is not installed. Please run launch_gui.bat or install it via: pip install PySide6")
     sys.exit(1)
@@ -56,23 +52,18 @@ else:
 COLMAP_BAT = COLMAP_DIR / "COLMAP.bat"
 
 # Import Modular GUI & Core Components
-from gui.theme import (
-    DARK_STUDIO_QSS, OK, ERR, TEXT, TEXT_MUTED,
-    BG_APP, BG_PANEL, BG_INPUT, BG_RAISED, ACCENT_DIM,
-)
+from gui.theme import DARK_STUDIO_QSS
 from gui.tab_3d import build_3d_tab
 from gui.tab_2d import build_2d_tab
 from core.tracking_layer import TrackingLayer
 from core.workers import TrackerWorker, CoTrackerWorker, FrameExtractorWorker
 from core.hardware import gpu_monitor
-from core.media_info import probe_fps, probe_frame_count
 
 PRESETS = {
     "Handheld / Walking (Recommended)": {
-        "description": "Optimized for moving camera shots (walking, crane, handheld). Uses a low initial triangulation angle and allows forward-dominant motion, which COLMAP otherwise rejects on walk-forward shots.",
+        "description": "Optimized for moving camera shots (walking, crane, handheld). Uses low initial triangulation angle to lock onto video frames instantly.",
         "solver_engine": "Incremental",
         "tri_angle": 2.5,
-        "init_max_forward_motion": 1.0,
         "overlap": 35,
         "inliers": 40,
         "camera_model": "SIMPLE_RADIAL",
@@ -81,11 +72,10 @@ PRESETS = {
         "max_image_size": 4096,
         "frame_step": 1
     },
-    "Hierarchical Multi-Cluster (Long Shots)": {
-        "description": "Splits a long shot into overlapping clusters and solves them in parallel before merging, which is faster than a single incremental pass on long takes. Falls back to the incremental mapper automatically if the cluster solve fails.",
-        "solver_engine": "Hierarchical",
+    "GLOMAP High-Speed (RTX 30/40 & A-Series)": {
+        "description": "Ultra-fast global Structure-from-Motion (10x-30x speedup). Solves all camera positions and rotations simultaneously with zero continuous drift.",
+        "solver_engine": "GLOMAP",
         "tri_angle": 2.5,
-        "init_max_forward_motion": 1.0,
         "overlap": 35,
         "inliers": 40,
         "camera_model": "SIMPLE_RADIAL",
@@ -98,7 +88,6 @@ PRESETS = {
         "description": "Native spherical equirectangular camera model for 360 VR cameras and panoramic video stitches.",
         "solver_engine": "Incremental",
         "tri_angle": 3.0,
-        "init_max_forward_motion": 1.0,
         "overlap": 25,
         "inliers": 50,
         "camera_model": "SPHERICAL",
@@ -111,7 +100,6 @@ PRESETS = {
         "description": "Optimized for outdoor and high-altitude shots with wide parallax and high keypoint count.",
         "solver_engine": "Incremental",
         "tri_angle": 12.0,
-        "init_max_forward_motion": 0.95,
         "overlap": 20,
         "inliers": 100,
         "camera_model": "OPENCV",
@@ -124,7 +112,6 @@ PRESETS = {
         "description": "Very forgiving on small camera movements. Subsamples frames to increase baseline and lowers initialization angle.",
         "solver_engine": "Incremental",
         "tri_angle": 3.0,
-        "init_max_forward_motion": 1.0,
         "overlap": 15,
         "inliers": 40,
         "camera_model": "SIMPLE_RADIAL",
@@ -137,7 +124,6 @@ PRESETS = {
         "description": "Increases matching overlap window (30 frames) to maintain tracking during rapid camera motion.",
         "solver_engine": "Incremental",
         "tri_angle": 8.0,
-        "init_max_forward_motion": 1.0,
         "overlap": 30,
         "inliers": 50,
         "camera_model": "SIMPLE_RADIAL",
@@ -150,7 +136,6 @@ PRESETS = {
         "description": "Uses Fisheye distortion model for wide-angle and action camera lenses.",
         "solver_engine": "Incremental",
         "tri_angle": 6.0,
-        "init_max_forward_motion": 1.0,
         "overlap": 20,
         "inliers": 60,
         "camera_model": "OPENCV_FISHEYE",
@@ -163,7 +148,6 @@ PRESETS = {
         "description": "Default COLMAP settings.",
         "solver_engine": "Incremental",
         "tri_angle": 16.0,
-        "init_max_forward_motion": 1.0,
         "overlap": 15,
         "inliers": 100,
         "camera_model": "SIMPLE_RADIAL",
@@ -176,7 +160,6 @@ PRESETS = {
         "description": "Unlock all parameters for full manual control.",
         "solver_engine": "Incremental",
         "tri_angle": 6.0,
-        "init_max_forward_motion": 1.0,
         "overlap": 20,
         "inliers": 60,
         "camera_model": "SIMPLE_RADIAL",
@@ -197,12 +180,8 @@ class TrackerMainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self.worker_3d = None
         self.worker_2d = None
-        self.frame_extractor = None
 
         # Video Player State for 2D Tab
-        # Real frame rate of the selected clip. Used for playback speed, the timecode
-        # readout and every exported curve - it used to be hard-coded to 24.
-        self.current_fps = 24.0
         self.overlay_frames = None
         self.loaded_video_frames = None
         self.current_play_frame = 0
@@ -222,20 +201,6 @@ class TrackerMainWindow(QMainWindow):
         # Deferred init for fast UI display
         QTimer.singleShot(20, self._deferred_init)
 
-    @staticmethod
-    def _pick_random_bg_image():
-        """Pick a random .jpg/.png from gui/assets/ for atmospheric background."""
-        assets_dir = Path(__file__).parent / "gui" / "assets"
-        if not assets_dir.is_dir():
-            return None
-        images = [f for f in assets_dir.iterdir()
-                  if f.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp')]
-        if not images:
-            return None
-        chosen = random.choice(images)
-        px = QPixmap(str(chosen))
-        return px if not px.isNull() else None
-
     def _deferred_init(self):
         try:
             from export_tools import find_blender_executable
@@ -248,116 +213,102 @@ class TrackerMainWindow(QMainWindow):
         self._refresh_videos()
         self._update_hardware_monitor()
 
-    @staticmethod
-    def _set_chip_state(widget, state):
-        """Chips are styled by the theme; handlers only set the state."""
-        if widget.property("state") == state:
-            return
-        widget.setProperty("state", state)
-        widget.style().unpolish(widget)
-        widget.style().polish(widget)
-
     def _setup_style(self):
         self.setStyleSheet(DARK_STUDIO_QSS)
 
     def _init_ui(self):
-        # ---------------- Native Desktop Menu Bar ----------------
-        menubar = self.menuBar()
-
-        # File Menu
-        file_menu = menubar.addMenu("&File")
-        act_add_media = file_menu.addAction("Import Media / Video...")
-        act_add_media.triggered.connect(self._add_videos)
-        act_open_media = file_menu.addAction("Open Media Folder")
-        act_open_media.triggered.connect(self._open_videos_folder)
-        act_open_scenes = file_menu.addAction("Open Output Scenes Folder")
-        act_open_scenes.triggered.connect(self._open_3d_output_folder)
-        file_menu.addSeparator()
-        act_exit = file_menu.addAction("Exit")
-        act_exit.triggered.connect(self.close)
-
-        # 3D Solver Menu
-        solver_menu = menubar.addMenu("&3D Solver")
-        act_start_3d = solver_menu.addAction("Start 3D Camera Tracking")
-        act_start_3d.triggered.connect(self._start_tracking_3d)
-        act_stop_3d = solver_menu.addAction("Cancel 3D Solver")
-        act_stop_3d.triggered.connect(self._stop_tracking_3d)
-        solver_menu.addSeparator()
-        act_clear_3d_log = solver_menu.addAction("Clear Diagnostics Log")
-        act_clear_3d_log.triggered.connect(lambda: self.log_text.clear() if hasattr(self, 'log_text') else None)
-
-        # 2D Tracker Menu
-        tracker_menu = menubar.addMenu("&2D Tracker")
-        act_start_2d = tracker_menu.addAction("Run 2D Point Tracking")
-        act_start_2d.triggered.connect(self._start_tracking_2d)
-        act_stop_2d = tracker_menu.addAction("Cancel 2D Tracker")
-        act_stop_2d.triggered.connect(self._stop_tracking_2d)
-        tracker_menu.addSeparator()
-        act_unpack = tracker_menu.addAction("Unpack Frame Cache")
-        act_unpack.triggered.connect(self._extract_frames_for_current_video)
-        act_clear_masks = tracker_menu.addAction("Clear Active Layer Masks")
-        act_clear_masks.triggered.connect(self._clear_active_layer_masks)
-        act_clear_pts = tracker_menu.addAction("Clear Active Layer Points")
-        act_clear_pts.triggered.connect(self._clear_manual_points)
-
-        # Export Menu
-        export_menu = menubar.addMenu("&Export")
-        act_exp_blender = export_menu.addAction("Export 3D Camera for Blender (.abc)")
-        act_exp_blender.triggered.connect(self._export_3d_for_blender)
-        act_exp_nuke_3d = export_menu.addAction("Export 3D Camera for Nuke (.nk / .abc)")
-        act_exp_nuke_3d.triggered.connect(self._export_3d_for_nuke)
-        export_menu.addSeparator()
-        act_exp_nuke_2d = export_menu.addAction("Export 2D Tracker Node for Nuke (.nk)")
-        act_exp_nuke_2d.triggered.connect(self._export_2d_for_nuke)
-        act_exp_nuke_roto = export_menu.addAction("Export Animated Roto Masks for Nuke (.nk)")
-        act_exp_nuke_roto.triggered.connect(self._export_active_masks_to_nuke_roto)
-
-        # View Menu
-        view_menu = menubar.addMenu("&View")
-        act_colmap_gui = view_menu.addAction("Open COLMAP 3D Viewport")
-        act_colmap_gui.triggered.connect(self._open_colmap_gui)
-
-        # Help Menu
-        help_menu = menubar.addMenu("&Help")
-        act_about = help_menu.addAction("About Automated Tracker")
-        act_about.triggered.connect(self._show_about_dialog)
-
-        # ================================================================
-        # ATMOSPHERIC BACKGROUND via QStackedLayout(StackAll)
-        # This is the ONLY reliable way in Qt to composite a low-opacity
-        # image behind child widgets (QSS rgba doesn't actually alpha-blend).
-        # ================================================================
         central = QWidget()
         self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(12, 10, 12, 10)
+        main_layout.setSpacing(8)
 
-        stacked = QStackedLayout(central)
-        stacked.setStackingMode(QStackedLayout.StackAll)
+        # ---------------- Modern Studio Header Bar ----------------
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        header.setContentsMargins(2, 2, 2, 4)
 
-        # --- Layer 0 (bottom): Background image at very low opacity ---
-        self._bg_label = QLabel()
-        self._bg_label.setObjectName("bgPlate")
-        self._bg_label.setScaledContents(True)
+        title_box = QVBoxLayout()
+        title_box.setSpacing(3)
 
-        bg_pixmap = self._pick_random_bg_image()
-        if bg_pixmap:
-            self._bg_label.setPixmap(bg_pixmap)
-            opacity_fx = QGraphicsOpacityEffect(self._bg_label)
-            # Low enough to read as texture. At 0.25 it showed through only in the
-            # gaps between panels, which looked like a rendering fault.
-            opacity_fx.setOpacity(0.10)
-            self._bg_label.setGraphicsEffect(opacity_fx)
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
 
-        stacked.addWidget(self._bg_label)
+        title = QLabel("🎬 AUTOMATED TRACKER")
+        title.setStyleSheet("""
+            font-size: 16px;
+            font-weight: 800;
+            color: #ffffff;
+            letter-spacing: 0.8px;
+        """)
 
-        # --- Layer 1 (top): Actual workspace content ---
-        content = QWidget()
-        content.setObjectName("workspaceRoot")
-        content.setAttribute(Qt.WA_TransparentForMouseEvents, False)
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(10, 4, 10, 4)
-        content_layout.setSpacing(0)
+        ver_tag = QLabel("V001.1")
+        ver_tag.setStyleSheet("""
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0284c7, stop:1 #2563eb);
+            color: #ffffff;
+            font-size: 10px;
+            font-weight: 800;
+            padding: 2px 7px;
+            border-radius: 5px;
+            border: 1px solid #38bdf8;
+            letter-spacing: 0.5px;
+        """)
 
-        # Main Workspace Tab Widget
+        title_row.addWidget(title)
+        title_row.addWidget(ver_tag)
+        title_row.addStretch()
+
+        subtitle = QLabel("COLMAP / GLOMAP 3D Camera Solver  •  Meta CoTracker3 2D AI Tracker  •  Blender & Nuke Pipeline")
+        subtitle.setStyleSheet("font-size: 11px; color: #64748b; font-weight: 500;")
+
+        title_box.addLayout(title_row)
+        title_box.addWidget(subtitle)
+        header.addLayout(title_box, 1)
+
+        # Hardware Badge Pills Container
+        hw_box = QHBoxLayout()
+        hw_box.setSpacing(6)
+
+        self.badge_gpu = QLabel("⚡ GPU: Checking...")
+        self.badge_gpu.setStyleSheet("""
+            background-color: #111624;
+            border: 1px solid #1f2a3f;
+            border-radius: 6px;
+            padding: 4px 10px;
+            font-size: 11px;
+            font-weight: 600;
+            color: #38bdf8;
+        """)
+
+        self.badge_blender = QLabel("🎬 Blender: Auto")
+        self.badge_blender.setStyleSheet("""
+            background-color: #1a140d;
+            border: 1px solid #3d2817;
+            border-radius: 6px;
+            padding: 4px 10px;
+            font-size: 11px;
+            font-weight: 600;
+            color: #fb923c;
+        """)
+
+        self.badge_colmap = QLabel("🌐 COLMAP: Ready")
+        self.badge_colmap.setStyleSheet("""
+            background-color: #111724;
+            border: 1px solid #1f293d;
+            border-radius: 6px;
+            padding: 4px 10px;
+            font-size: 11px;
+            font-weight: 600;
+            color: #38bdf8;
+        """)
+
+        hw_box.addWidget(self.badge_gpu)
+        hw_box.addWidget(self.badge_blender)
+        hw_box.addWidget(self.badge_colmap)
+        header.addLayout(hw_box)
+        main_layout.addLayout(header)
+
+        # Main Tab Widget
         self.tabs = QTabWidget()
         self.tab_3d = QWidget()
         self.tab_2d = QWidget()
@@ -365,63 +316,9 @@ class TrackerMainWindow(QMainWindow):
         build_3d_tab(self, self.tab_3d, PRESETS)
         build_2d_tab(self, self.tab_2d)
 
-        self.tabs.addTab(self.tab_3d, "3D Camera Tracking (COLMAP)")
-        self.tabs.addTab(self.tab_2d, "2D Point Tracking (CoTracker3)")
-        content_layout.addWidget(self.tabs, 1)
-
-        stacked.addWidget(content)
-        stacked.setCurrentWidget(content)
-
-        # ---------------- Bottom Status Bar ----------------
-        statusbar = self.statusBar()
-        statusbar.setSizeGripEnabled(False)
-
-        self.status_msg = QLabel("Ready")
-        self.status_msg.setObjectName("hint")
-        self.status_msg.setStyleSheet("padding-left: 6px;")
-        statusbar.addWidget(self.status_msg, 1)
-
-        self.status_gpu = QLabel("GPU: Checking...")
-        self.status_gpu.setObjectName("statusChip")
-
-        self.status_blender = QLabel("Blender: Auto")
-        self.status_blender.setObjectName("statusChip")
-
-        self.status_colmap = QLabel("COLMAP: Ready")
-        self.status_colmap.setObjectName("statusChip")
-
-        self.status_ver = QLabel("v001.1")
-        self.status_ver.setObjectName("statusChip")
-
-        statusbar.addPermanentWidget(self.status_gpu)
-        statusbar.addPermanentWidget(self.status_blender)
-        statusbar.addPermanentWidget(self.status_colmap)
-        statusbar.addPermanentWidget(self.status_ver)
-
-    def _open_colmap_gui(self):
-        colmap_bat = COLMAP_EXE.parent.parent / "COLMAP.bat"
-        if colmap_bat.exists():
-            # Use the .bat wrapper which sets up Qt plugin paths
-            subprocess.Popen([str(colmap_bat), "gui"])
-        elif COLMAP_EXE.exists():
-            # Set QT_PLUGIN_PATH for COLMAP's own Qt libraries
-            env = os.environ.copy()
-            plugins_dir = COLMAP_EXE.parent.parent / "plugins"
-            if plugins_dir.exists():
-                env["QT_PLUGIN_PATH"] = str(plugins_dir)
-            subprocess.Popen([str(COLMAP_EXE), "gui"], env=env)
-        else:
-            QMessageBox.warning(self, "COLMAP Missing", f"COLMAP executable not found at:\n{COLMAP_EXE}")
-
-    def _show_about_dialog(self):
-        QMessageBox.information(
-            self,
-            "About Automated Tracker",
-            "AUTOMATED TRACKER V001.1\n\n"
-            "VFX Studio Camera Tracking & 2D Motion Tracking System\n"
-            "Engines: COLMAP (3D SfM) & Meta CoTracker3 (2D Point Tracking)\n"
-            "Pipeline Integrations: Blender (.abc) & Foundry Nuke (.nk / .abc)"
-        )
+        self.tabs.addTab(self.tab_3d, "🎥 3D Camera Tracking (COLMAP)")
+        self.tabs.addTab(self.tab_2d, "🎯 2D AI Point Tracking (CoTracker3)")
+        main_layout.addWidget(self.tabs, 1)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -442,10 +339,14 @@ class TrackerMainWindow(QMainWindow):
     def _import_dropped_video(self, filepath):
         VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
         src = Path(filepath)
-        dst = VIDEOS_DIR / src.name
-        if src.resolve() != dst.resolve():
-            shutil.copy2(src, dst)
+        dest = VIDEOS_DIR / src.name
+        if src.resolve() != dest.resolve():
+            shutil.copy2(src, dest)
         self._refresh_videos()
+        idx = self.combo_2d_video.findText(src.name)
+        if idx >= 0:
+            self.combo_2d_video.setCurrentIndex(idx)
+        self._append_log_2d(f"✔ Dropped video imported: {src.name}", "#00ff88")
 
     def _update_hardware_monitor(self):
         try:
@@ -458,28 +359,87 @@ class TrackerMainWindow(QMainWindow):
                 used_gb = used_mb / 1024.0
                 total_gb = total_mb / 1024.0
 
-                self.status_gpu.setText(f"GPU: {name} ({load}%) | {used_gb:.1f}/{total_gb:.1f} GB")
-                self._set_chip_state(self.status_gpu, "busy" if load >= 50 else "idle")
+                if load >= 40:
+                    bg_col = "#0f2319"
+                    border_col = "#10b981"
+                    text_col = "#34d399"
+                    icon = "⚡"
+                else:
+                    bg_col = "#111624"
+                    border_col = "#1f2a3f"
+                    text_col = "#38bdf8"
+                    icon = "⚡"
+
+                self.badge_gpu.setText(f"{icon} {name}  •  {load}% GPU  •  {used_gb:.1f}/{total_gb:.1f} GB")
+                self.badge_gpu.setStyleSheet(f"""
+                    background-color: {bg_col};
+                    border: 1px solid {border_col};
+                    border-radius: 6px;
+                    padding: 4px 10px;
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: {text_col};
+                """)
             else:
-                self.status_gpu.setText("Device: CPU Mode")
-                self._set_chip_state(self.status_gpu, "idle")
+                self.badge_gpu.setText("🖥️ CPU Mode")
+                self.badge_gpu.setStyleSheet("""
+                    background-color: #171a24;
+                    border: 1px solid #283042;
+                    border-radius: 6px;
+                    padding: 4px 10px;
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: #94a3b8;
+                """)
         except Exception:
-            self.status_gpu.setText("GPU: Ready")
+            self.badge_gpu.setText("⚡ GPU: Ready")
 
         b_path = self.txt_blender_path.text().strip() if hasattr(self, 'txt_blender_path') else None
         if b_path:
-            self.status_blender.setText("Blender: Linked")
-            self._set_chip_state(self.status_blender, "busy")
+            self.badge_blender.setText("🎬 Blender: Linked")
+            self.badge_blender.setStyleSheet("""
+                background-color: #0f2319;
+                border: 1px solid #10b981;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 11px;
+                font-weight: 600;
+                color: #34d399;
+            """)
         else:
-            self.status_blender.setText("Blender: Auto")
-            self._set_chip_state(self.status_blender, "idle")
+            self.badge_blender.setText("🎬 Blender: Auto")
+            self.badge_blender.setStyleSheet("""
+                background-color: #1a140d;
+                border: 1px solid #3d2817;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 11px;
+                font-weight: 600;
+                color: #fb923c;
+            """)
 
         if COLMAP_EXE.exists():
-            self.status_colmap.setText("COLMAP: Ready")
-            self._set_chip_state(self.status_colmap, "idle")
+            self.badge_colmap.setText("🌐 COLMAP: Ready")
+            self.badge_colmap.setStyleSheet("""
+                background-color: #111724;
+                border: 1px solid #1f293d;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 11px;
+                font-weight: 600;
+                color: #38bdf8;
+            """)
         else:
-            self.status_colmap.setText("COLMAP: Missing")
-            self._set_chip_state(self.status_colmap, "bad")
+            self.badge_colmap.setText("🌐 COLMAP: Missing")
+            self.badge_colmap.setStyleSheet("""
+                background-color: #261114;
+                border: 1px solid #881337;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 11px;
+                font-weight: 600;
+                color: #f43f5e;
+            """)
 
     # =========================================================================
     # EVENT HANDLERS: 3D TAB
@@ -646,41 +606,15 @@ class TrackerMainWindow(QMainWindow):
             QMessageBox.warning(self, "No Videos Found", f"Please add at least one video or image sequence into:\n{VIDEOS_DIR}")
             return
 
-        # Only solve what is selected in the media table. Selecting nothing means
-        # 'all of them', which is what the button used to do unconditionally.
-        selected_names = set()
-        for item in self.table.selectedItems():
-            name_item = self.table.item(item.row(), 0)
-            if name_item and name_item.text().strip():
-                selected_names.add(name_item.text().strip())
-        if selected_names:
-            picked = [v for v in videos if v.name in selected_names]
-            if picked:
-                videos = picked
-                self._append_log_3d(
-                    f"Solving {len(videos)} selected shot(s): "
-                    f"{', '.join(v.name for v in videos)}", "#00d2ff")
-        else:
-            self._append_log_3d(
-                f"No row selected - solving all {len(videos)} shot(s) in 02 VIDEOS.", "#a0a0b0")
-
-        # Masks were drawn against whatever clip the 2D tab has loaded, so they must only
-        # be applied to that clip - not to every video in the batch.
         all_masks = []
         for l in self.canvas_2d.layers:
             for m in l.animated_masks:
                 all_masks.append(m)
-        mask_shot = Path(self.combo_2d_video.currentText()).stem if self.combo_2d_video.currentText() else None
-        if all_masks and mask_shot:
-            self._append_log_3d(
-                f"{len(all_masks)} roto mask(s) will be applied to '{mask_shot}' only.", "#00d2ff")
 
         cam_raw = self.combo_cam.currentText().split()[0].strip()
-        preset_data = PRESETS.get(self.preset_combo.currentText(), PRESETS["Custom (Manual Tuning)"])
         config = {
             "solver_engine": self.combo_solver_engine.currentText(),
             "tri_angle": self.spin_tri.value(),
-            "init_max_forward_motion": 1.0,
             "overlap": self.spin_overlap.value(),
             "inliers": self.spin_inliers.value(),
             "camera_model": cam_raw,
@@ -689,12 +623,9 @@ class TrackerMainWindow(QMainWindow):
             "generate_mesh": self.chk_mesh_gen.isChecked(),
             "enable_caspar_ba": self.chk_caspar_ba.isChecked(),
             "max_image_size": 4096,
-            "init_max_forward_motion": preset_data.get("init_max_forward_motion", 1.0),
             "frame_step": self.spin_step.value(),
             "blender_path": self.txt_blender_path.text().strip() or None,
-            "animated_masks": all_masks if all_masks else None,
-            "mask_shot": mask_shot,
-            "ba_refine_distortion": self.chk_ba_refine.isChecked(),
+            "animated_masks": all_masks if all_masks else None
         }
 
         self._pause_playback()
@@ -823,10 +754,7 @@ class TrackerMainWindow(QMainWindow):
     def _flash_button_feedback(self, btn, orig_text, success_text="✔ Copied to Clipboard!", duration_ms=1800):
         btn.setText(success_text)
         prev_style = btn.styleSheet()
-        btn.setStyleSheet(
-            "background-color: #11291f; border: 1px solid %s; color: %s; font-weight: 700;"
-            % (OK, OK)
-        )
+        btn.setStyleSheet("background-color: #0c2b1a; border: 1.5px solid #00ff88; color: #00ff88; font-weight: bold;")
         def restore():
             btn.setText(orig_text)
             btn.setStyleSheet(prev_style)
@@ -877,7 +805,7 @@ class TrackerMainWindow(QMainWindow):
 
         self.spin_grid_size.blockSignals(True)
         self.spin_grid_size.setValue(cur_l.grid_size)
-        self.lbl_total_pts.setText(f"{cur_l.grid_size ** 2} pts")
+        self.lbl_total_pts.setText(f"({cur_l.grid_size ** 2} points)")
         self.spin_grid_size.blockSignals(False)
 
         self.spin_min_conf.blockSignals(True)
@@ -933,14 +861,8 @@ class TrackerMainWindow(QMainWindow):
             self.canvas_2d.update()
             self._append_log_2d(f"🎨 Updated layer color for [{cur_l.name}] to {cur_l.color}.", cur_l.color)
 
-    def _on_min_conf_changed(self, val):
-        lay = self.canvas_2d.active_layer
-        if lay:
-            lay.min_confidence = float(val)
-            self._refresh_layer_list()
-
     def _on_grid_size_changed(self, val):
-        self.lbl_total_pts.setText(f"{val*val} pts")
+        self.lbl_total_pts.setText(f"({val*val} points)")
         if self.canvas_2d.active_layer:
             self.canvas_2d.active_layer.grid_size = val
             self._refresh_layer_list()
@@ -1025,13 +947,6 @@ class TrackerMainWindow(QMainWindow):
         self.overlay_frames = None
         self.loaded_video_frames = None
 
-        # Probe the real frame rate once, for both the extracted-frames path and the
-        # raw-video path below.
-        self.current_fps = probe_fps(video_path)
-        self._append_log_2d(
-            f"Frame rate detected: {self.current_fps:.3f} fps (used for playback, timecode "
-            f"and all exports).", "#a0a0b0")
-
         scene_images_dir = SCENES_DIR / video_path.stem / "images"
         if scene_images_dir.exists() and list(scene_images_dir.glob("*.jpg")):
             jpgs = sorted(list(scene_images_dir.glob("*.jpg")))
@@ -1042,7 +957,17 @@ class TrackerMainWindow(QMainWindow):
 
         import tempfile
         tmp_img = Path(tempfile.gettempdir()) / f"thumb_{video_path.stem}_0.jpg"
-        total_frames = probe_frame_count(video_path, self.current_fps, default=100) or 100
+        total_frames = 100
+        fps = 24.0
+        try:
+            import imageio.v3 as iio
+            meta = iio.immeta(str(video_path), plugin="FFMPEG")
+            fps = float(meta.get("fps", 24.0)) or 24.0
+            dur = float(meta.get("duration", 0.0))
+            if dur > 0:
+                total_frames = max(1, int(dur * fps))
+        except Exception:
+            pass
 
         if not tmp_img.exists():
             cmd = [str(FFMPEG_EXE), "-y", "-loglevel", "error", "-ss", "0.0", "-i", str(video_path), "-vframes", "1", "-q:v", "2", str(tmp_img)]
@@ -1098,15 +1023,13 @@ class TrackerMainWindow(QMainWindow):
                 im = Image.fromarray(img_path_or_array).convert("RGB")
             w, h = im.size
             qim = QImage(im.tobytes(), w, h, w * 3, QImage.Format_RGB888)
-            fps = self.current_fps if self.current_fps and self.current_fps > 0 else 24.0
-            self.canvas_2d.set_frame_image(qim, frame_idx, total_frames, w, h, fps=fps)
+            self.canvas_2d.set_frame_image(qim, frame_idx, total_frames, w, h, fps=24.0)
 
-            fps_int = max(1, int(round(fps)))
-            total_sec = frame_idx / fps
+            total_sec = frame_idx / 24.0
             hrs = int(total_sec // 3600)
             mins = int((total_sec % 3600) // 60)
             secs = int(total_sec % 60)
-            fr = int(frame_idx % fps_int)
+            fr = int(frame_idx % 24)
             self.lbl_frame_idx.setText(f"{hrs:02d}:{mins:02d}:{secs:02d}:{fr:02d} ({frame_idx+1}/{total_frames})")
         except Exception:
             pass
@@ -1213,13 +1136,13 @@ class TrackerMainWindow(QMainWindow):
         is_kf = cur_f in all_keys
         if is_kf:
             self.lbl_key_status.setText(f"◆ f{cur_f+1}")
-            self._set_chip_state(self.lbl_key_status, "key")
+            self.lbl_key_status.setStyleSheet("color: #00ff88; font-weight: bold; font-size: 10px; padding: 1px 6px; background-color: #11261d; border: 1px solid #00ff88; border-radius: 3px;")
         elif all_keys:
             self.lbl_key_status.setText(f"~ f{cur_f+1}")
-            self._set_chip_state(self.lbl_key_status, "interp")
+            self.lbl_key_status.setStyleSheet("color: #38bdf8; font-weight: normal; font-size: 10px; padding: 1px 6px; background-color: #101a26; border: 1px dashed #0284c7; border-radius: 3px;")
         else:
-            self.lbl_key_status.setText("No masks")
-            self._set_chip_state(self.lbl_key_status, "idle")
+            self.lbl_key_status.setText("No Masks")
+            self.lbl_key_status.setStyleSheet("color: #64748b; font-size: 10px; padding: 1px 6px; background-color: #10141d; border-radius: 3px;")
 
     def _toggle_playback(self):
         if self.is_playing:
@@ -1230,8 +1153,7 @@ class TrackerMainWindow(QMainWindow):
     def _start_playback(self):
         self.is_playing = True
         self.btn_play_pause.setText("⏸ Pause")
-        fps = self.current_fps if self.current_fps and self.current_fps > 0 else 24.0
-        self.play_timer.start(max(10, int(round(1000.0 / fps))))
+        self.play_timer.start(40)
 
     def _pause_playback(self):
         self.is_playing = False
@@ -1280,22 +1202,19 @@ class TrackerMainWindow(QMainWindow):
     def _set_in_point(self, frame_idx):
         self.canvas_2d.in_point = int(frame_idx)
         out_p = self.canvas_2d.out_point if self.canvas_2d.out_point >= 0 else self.slider_2d_frame.maximum()
-        self.lbl_range_status.setText(f"{self.canvas_2d.in_point+1} – {out_p+1}")
-        self._set_chip_state(self.lbl_range_status, "key")
+        self.lbl_range_status.setText(f"Range: [{self.canvas_2d.in_point+1} - {out_p+1}]")
         self._append_log_2d(f"📍 Set Tracking In-Point to Frame {self.canvas_2d.in_point+1}.", "#00d2ff")
 
     def _set_out_point(self, frame_idx):
         self.canvas_2d.out_point = int(frame_idx)
         in_p = self.canvas_2d.in_point
-        self.lbl_range_status.setText(f"{in_p+1} – {self.canvas_2d.out_point+1}")
-        self._set_chip_state(self.lbl_range_status, "key")
+        self.lbl_range_status.setText(f"Range: [{in_p+1} - {self.canvas_2d.out_point+1}]")
         self._append_log_2d(f"📍 Set Tracking Out-Point to Frame {self.canvas_2d.out_point+1}.", "#00d2ff")
 
     def _reset_tracking_range(self):
         self.canvas_2d.in_point = 0
         self.canvas_2d.out_point = -1
-        self.lbl_range_status.setText("Full")
-        self._set_chip_state(self.lbl_range_status, "idle")
+        self.lbl_range_status.setText("Range: Full")
         self._append_log_2d("↺ Reset Tracking Range to full sequence.", "#00d2ff")
 
     def _toggle_canvas_matte_overlay(self, checked):
@@ -1475,39 +1394,13 @@ class TrackerMainWindow(QMainWindow):
                     f"Layer [{l.name}] is set to Manual Points mode, but has no points placed!\nClick anywhere on the preview frame to add tracking points, or switch to Grid mode."
                 )
                 return
-
-            # Manual points carry the frame they were clicked on. If the tracking range
-            # was trimmed afterwards they can fall outside it, so say so here rather than
-            # letting the engine raise half way through the run.
-            if l.mode in ("points", "cornerpin") and l.points:
-                in_pt = max(0, self.canvas_2d.in_point)
-                out_pt = self.canvas_2d.out_point
-                last = out_pt if out_pt >= 0 else (self.canvas_2d.total_frames - 1)
-                outside = [int(p[0]) for p in l.points if not (in_pt <= int(p[0]) <= last)]
-                if len(outside) == len(l.points):
-                    QMessageBox.warning(
-                        self, f"Points Outside the Tracking Range on [{l.name}]",
-                        f"Every point on layer [{l.name}] sits outside the current range "
-                        f"(frames {in_pt + 1}–{last + 1}).\n\n"
-                        f"Points were placed on frame(s): "
-                        f"{', '.join(str(f + 1) for f in sorted(set(outside))[:8])}\n\n"
-                        f"Either press Reset to track the whole clip, or re-place the points "
-                        f"inside the range."
-                    )
-                    return
-                if outside:
-                    self._append_log_2d(
-                        f"! [{l.name}] {len(outside)} of {len(l.points)} points sit outside "
-                        f"frames {in_pt + 1}–{last + 1} and will be skipped.", "#e0a000")
-
             layers_config.append(l.to_config_dict())
 
         config = {
             "layers": layers_config,
             "max_dimension": max_dim,
             "offline": offline,
-            "fps": self.current_fps if self.current_fps and self.current_fps > 0 else 24.0,
-            "auto_chunk": self.chk_vram_chunk.isChecked(),
+            "fps": 24.0,
             "in_point": self.canvas_2d.in_point,
             "out_point": self.canvas_2d.out_point
         }
@@ -1569,38 +1462,8 @@ class TrackerMainWindow(QMainWindow):
                     stat_item.setForeground(QColor("#00d2ff"))
 
 
-def apply_dark_palette(app):
-    """
-    Some parts of a widget are drawn by the native style, not the stylesheet -
-    combo and spin arrows most visibly. They take their colour from the palette,
-    so it has to agree with the theme or they come out dark-on-dark.
-    """
-    pal = QPalette()
-    pal.setColor(QPalette.Window, QColor(BG_APP))
-    pal.setColor(QPalette.WindowText, QColor(TEXT))
-    pal.setColor(QPalette.Base, QColor(BG_INPUT))
-    pal.setColor(QPalette.AlternateBase, QColor(BG_PANEL))
-    pal.setColor(QPalette.Text, QColor(TEXT))
-    pal.setColor(QPalette.Button, QColor(BG_RAISED))
-    pal.setColor(QPalette.ButtonText, QColor(TEXT))
-    pal.setColor(QPalette.BrightText, QColor(ERR))
-    pal.setColor(QPalette.Highlight, QColor(ACCENT_DIM))
-    pal.setColor(QPalette.HighlightedText, QColor('#ffffff'))
-    pal.setColor(QPalette.ToolTipBase, QColor(BG_RAISED))
-    pal.setColor(QPalette.ToolTipText, QColor(TEXT))
-    pal.setColor(QPalette.PlaceholderText, QColor(TEXT_MUTED))
-    pal.setColor(QPalette.Disabled, QPalette.Text, QColor(TEXT_MUTED))
-    pal.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(TEXT_MUTED))
-    pal.setColor(QPalette.Disabled, QPalette.WindowText, QColor(TEXT_MUTED))
-    app.setPalette(pal)
-
-
 def main():
     app = QApplication(sys.argv)
-    # Fusion draws its sub-controls from the palette on every platform, which keeps
-    # arrows and spin buttons consistent instead of inheriting the Windows look.
-    app.setStyle("Fusion")
-    apply_dark_palette(app)
     window = TrackerMainWindow()
     window.show()
     sys.exit(app.exec())

@@ -37,9 +37,14 @@ if %errorlevel% equ 0 (
     goto :eof
 )
 
-echo [INFO] Launching Native Windows Standalone GUI...
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%TOP%\05 SCRIPT\tracker_ui.ps1"
-if %errorlevel% neq 0 (
-    echo [ERROR] Failed to start GUI.
-    pause
-)
+echo.
+echo [ERROR] No Python runtime found.
+echo.
+echo   The bundled interpreter is missing:
+echo     the "00 PYTHON" folder inside this tracker directory
+echo.
+echo   Either restore the "00 PYTHON" folder, or install Python 3.11+
+echo   and make sure it is on your PATH, then run this again.
+echo.
+pause
+goto :eof

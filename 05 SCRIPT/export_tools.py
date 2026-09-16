@@ -1016,7 +1016,9 @@ property uchar green
 property uchar blue
 end_header
 """
-    with open(output_ply_path, 'w', encoding='utf-8') as f:
+    # newline='\n' matters: opened in default text mode on Windows, Python turns every
+    # \n into \r\n, and strict PLY readers reject carriage returns in the header.
+    with open(output_ply_path, 'w', encoding='utf-8', newline='\n') as f:
         f.write(header)
         for p in points:
             x, y, z = p["xyz"][0], p["xyz"][2], -p["xyz"][1]
