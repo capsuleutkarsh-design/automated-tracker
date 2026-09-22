@@ -1,12 +1,23 @@
-# Bundled third-party runtimes and binaries (huge, restorable from vendor)
-00 PYTHON/
-01 COLMAP/
-03 FFMPEG/
-06 COTRACKER/
+# Bundled third-party runtimes and binaries. Far too big for GitHub, so only
+# a README is tracked in each; SETUP.bat restores the contents from the
+# runtime bundle attached to the GitHub release (built by tools/pack_runtime.py).
+/00 PYTHON/*
+/01 COLMAP/*
+/03 FFMPEG/*
+/06 COTRACKER/*
+!/00 PYTHON/README.md
+!/01 COLMAP/README.md
+!/03 FFMPEG/README.md
+!/06 COTRACKER/README.md
 
 # Media and generated output
-02 VIDEOS/
-04 SCENES/
+/02 VIDEOS/*
+/04 SCENES/*
+!/02 VIDEOS/README.md
+!/04 SCENES/README.md
+
+# Downloads in progress from SETUP.bat
+_runtime_download/
 
 # Python caches
 __pycache__/
@@ -18,3 +29,6 @@ __pycache__/
 
 # Large UI background images
 05 SCRIPT/gui/assets/
+
+# Stashed torch headers, never needed by the app
+/_ATTIC/00 PYTHON/

@@ -43,13 +43,35 @@ it; the exe alone installs nothing.
 
 ## Run from source
 
+The repository holds the source only. The bundled runtime (Python with PyTorch,
+COLMAP, FFmpeg, the CoTracker3 weights) is about 5 GB and lives on the GitHub
+release as zip parts. After cloning, run once:
+
+```
+SETUP.bat
+```
+
+It downloads the parts, verifies their checksums and unpacks them into place,
+using only tools that ship with Windows (curl, certutil, tar). Then start the
+app with:
+
 ```
 LAUNCH_UI.bat
 ```
 
-The repository is a portable layout: `00 PYTHON` (bundled interpreter),
+The folder is a portable layout: `00 PYTHON` (bundled interpreter),
 `01 COLMAP`, `02 VIDEOS` (drop clips here), `03 FFMPEG`, `04 SCENES` (output),
-`05 SCRIPT` (the app), `06 COTRACKER` (model and weights).
+`05 SCRIPT` (the app), `06 COTRACKER` (model and weights). Each of the big
+folders is tracked as a README only; `SETUP.bat` fills them in.
+
+To rebuild the runtime bundle after changing anything in those folders:
+
+```
+"00 PYTHON\python.exe" tools\pack_runtime.py
+```
+
+That writes `build/Runtime/runtime_<version>_partNN.zip` plus
+`runtime.parts.txt`. Upload all of them to the release alongside the installer.
 
 ## Build the installer
 
