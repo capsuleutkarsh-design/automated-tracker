@@ -9,7 +9,14 @@ Double-click **`BUILD.bat`**. It runs two steps:
 1. **Python** — freezes `05 SCRIPT/tracker_gui.py` with PyInstaller into
    `build/dist/Automated_Tracker/`
 2. **Inno Setup** — packages that, plus COLMAP, FFmpeg and the CoTracker
-   weights, into `build/Output/AutomatedTracker_Setup_<version>.exe`
+   weights, into `build/Output/AutomatedTracker_Setup_<version>.exe` **and**
+   `AutomatedTracker_Setup_<version>-1.bin`, `-2.bin`, ...
+
+The installer is the exe *plus* every `.bin` beside it. The payload (PyTorch,
+the CoTracker model, COLMAP, FFmpeg) compresses to more than 2 GB, and Inno
+Setup cannot write a single setup exe that large, so it splits the data into
+`.bin` slices and leaves a small exe that reads them. Ship the whole `Output`
+folder together — the exe on its own installs nothing.
 
 ```
 BUILD.bat              full build (exe + installer)
@@ -29,7 +36,7 @@ at once instead of failing part way through.
 | Python | the bundled `00 PYTHON` (used automatically), or any 3.11+ on PATH |
 | PyInstaller | installed automatically on first build |
 | Inno Setup | 5 or 6, from <https://jrsoftware.org/isdl.php> |
-| Disk | ~12 GB free during the build; the installer itself is several GB |
+| Disk | ~12 GB free during the build; the installer (exe + `.bin` slices) is several GB |
 | Time | 10–25 minutes for a clean build (PyTorch is ~3.6 GB) |
 
 ## Files here
@@ -99,6 +106,14 @@ Set `APP_VERSION` near the top of `build_app.py`. It is written to
 
 **"Inno Setup compiler (ISCC.exe) not found"** — install Inno Setup, or compile
 `installer.iss` by hand. The exe from step 1 is still usable.
+
+**Inno fails at the very end with a size error, or `Output` holds only a
+2 GB exe and no `.bin` files** — disk spanning got switched off. Inno Setup's
+hard limit for a single setup exe is 2,097,152,000 bytes and this payload is
+above it. `installer.iss` must keep `DiskSpanning=yes`.
+
+**Running the installer says a `.bin` file is missing** — the setup exe and its
+`.bin` slices were separated. They have to sit in the same folder.
 
 **The built exe starts and immediately exits** — run it from a terminal to see
 the error. The most common cause is a missing module that PyInstaller could not

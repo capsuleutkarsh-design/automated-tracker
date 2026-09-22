@@ -68,7 +68,19 @@ def ensure_pyinstaller():
 
 
 def make_icon():
-    """A simple crosshair-on-dark mark, drawn so the build needs no art assets."""
+    """
+    Use the branded icon from branding/ when it is there (rendered from mark.svg
+    by branding/render_assets.py); otherwise draw a plain crosshair so the build
+    never depends on art assets.
+    """
+    branded = ROOT / "branding" / "app_icon.ico"
+    if branded.exists():
+        if not ICON.exists() or branded.stat().st_mtime > ICON.stat().st_mtime:
+            shutil.copy2(branded, ICON)
+            log("icon <- branding/app_icon.ico")
+        else:
+            log("icon already present (branding)")
+        return
     if ICON.exists():
         log("icon already present")
         return
@@ -300,6 +312,7 @@ def main():
     log("")
     log("done. executable: %s" % exe)
     log("next: Inno Setup compiles build/installer.iss into build/Output/")
+    log("      (a setup exe plus numbered .bin slices - ship them together)")
 
 
 if __name__ == "__main__":

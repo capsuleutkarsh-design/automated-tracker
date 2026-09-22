@@ -9,6 +9,8 @@
 ;
 ;  Compiled by BUILD.bat, or manually:
 ;     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" build\installer.iss
+;
+;  Output is a setup exe plus numbered .bin slices (see DiskSpanning below).
 ; ==========================================================================
 
 #define AppName        "Automated Tracker"
@@ -40,8 +42,15 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-; The payload is several GB - warn rather than fail late
-DiskSpanning=no
+; The payload is several GB and compresses to well over 2 GB. Inno Setup
+; refuses to write a single setup exe above 2,097,152,000 bytes, so the data is
+; split into slices: a small AutomatedTracker_Setup_<version>.exe next to
+; AutomatedTracker_Setup_<version>-1.bin, -2.bin, ... The .bin files must be
+; shipped together with the exe - the exe alone cannot install anything.
+; Slices are kept under 2 GB because that is GitHub's limit per release asset.
+DiskSpanning=yes
+DiskSliceSize=1900000000
+SlicesPerDisk=1
 SetupIconFile=app_icon.ico
 UninstallDisplayIcon={app}\{#AppExeName}
 ; Installing into Program Files needs elevation

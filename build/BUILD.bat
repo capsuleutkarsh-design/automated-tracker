@@ -6,6 +6,9 @@ setlocal EnableDelayedExpansion
 ::    step 1  Python  : freeze 05 SCRIPT\tracker_gui.py into dist\Automated_Tracker
 ::    step 2  Inno    : package that plus COLMAP / FFmpeg / CoTracker weights
 ::                      into build\Output\AutomatedTracker_Setup_<version>.exe
+::                      plus AutomatedTracker_Setup_<version>-1.bin, -2.bin ...
+::                      (the payload is over 2 GB compressed, so Inno has to
+::                      split it; ship the exe and every .bin together)
 ::
 ::  Usage:
 ::    BUILD.bat              full build
@@ -120,11 +123,27 @@ if not exist "%BUILD_DIR%\dist\Automated_Tracker\Automated_Tracker.exe" (
     exit /b 1
 )
 
+if exist "%BUILD_DIR%\Output\AutomatedTracker_Setup_*" (
+    echo [build] clearing previous installer output
+    del /q "%BUILD_DIR%\Output\AutomatedTracker_Setup_*" >nul 2>&1
+)
 echo [build] using %ISCC%
 "%ISCC%" /Q "%BUILD_DIR%\installer.iss"
 if errorlevel 1 (
     echo.
     echo [build] ERROR: Inno Setup failed.
+    echo.
+    pause
+    exit /b 1
+)
+
+:: Inno splits the payload into slices. Make sure they actually exist - a
+:: compile that "succeeds" but leaves only the exe would install nothing.
+dir /b "%BUILD_DIR%\Output\*.bin" >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo [build] ERROR: Inno Setup wrote no .bin slices next to the installer.
+    echo         Check that DiskSpanning=yes is still set in installer.iss.
     echo.
     pause
     exit /b 1
@@ -136,9 +155,12 @@ echo   BUILD COMPLETE
 echo.
 echo   Executable : %BUILD_DIR%\dist\Automated_Tracker\Automated_Tracker.exe
 echo   Installer  : %BUILD_DIR%\Output\
+echo.
+echo   The installer is the setup exe PLUS its .bin slices. Ship them
+echo   together in the same folder - the exe alone will not install.
 echo ================================================================
 echo.
-dir /b "%BUILD_DIR%\Output\*.exe" 2>nul
+dir /b "%BUILD_DIR%\Output\*.exe" "%BUILD_DIR%\Output\*.bin" 2>nul
 echo.
 pause
 exit /b 0

@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Automated Tracker</title>
+<meta name="description" content="Automated Tracker is a Windows desktop tool for VFX: CoTracker3 2D point tracking and COLMAP 3D camera solves, exported straight to Nuke, After Effects, Blender and USD.">
+<meta property="og:title" content="Automated Tracker">
+<meta property="og:description" content="2D point tracking and 3D camera solves for VFX, on your own machine.">
+<meta property="og:type" content="website">
+<meta property="og:image" content="assets/banner.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/svg+xml" href="assets/mark.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/mark_32.png">
+<link rel="apple-touch-icon" href="assets/mark_256.png">
+<style>
+  :root {
+    --bg: #0d0f13; --panel: #14171d; --raised: #1a1e25; --input: #0f1217;
+    --border: #242a33; --border-soft: #1c2129;
+    --text: #e3e7ee; --dim: #98a1b0; --muted: #646d7c;
+    --accent: #38bdf8; --accent-dim: #1e7fb0; --accent-wash: #132735;
+    --ok: #3ddc84; --warn: #f2b544;
+    --radius: 6px; --max: 1120px;
+    --font: "Segoe UI", Inter, system-ui, -apple-system, sans-serif;
+    --mono: "Cascadia Code", Consolas, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: var(--font); font-size: 16px; line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { font-family: var(--mono); font-size: 0.9em; color: var(--accent);
+         background: var(--accent-wash); padding: 1px 6px; border-radius: 4px; }
+  pre { font-family: var(--mono); font-size: 13px; background: var(--input);
+        border: 1px solid var(--border); border-radius: var(--radius);
+        padding: 14px 16px; overflow-x: auto; color: var(--text); margin: 0; }
+  pre code { background: none; padding: 0; color: inherit; }
+  .wrap { max-width: var(--max); margin: 0 auto; padding: 0 24px; }
+  h1, h2, h3 { line-height: 1.2; margin: 0; }
+  h2 { font-size: 30px; font-weight: 700; margin-bottom: 8px; }
+  h3 { font-size: 18px; font-weight: 600; }
+  .lead { color: var(--dim); font-size: 18px; max-width: 720px; margin: 0 0 32px; }
+  .eyebrow { font-size: 12px; font-weight: 700; letter-spacing: 0.12em;
+             text-transform: uppercase; color: var(--accent); margin-bottom: 12px; }
+  section { padding: 72px 0; border-top: 1px solid var(--border-soft); }
+
+  /* nav */
+  nav { position: sticky; top: 0; z-index: 10; background: rgba(13,15,19,0.88);
+        backdrop-filter: blur(10px); border-bottom: 1px solid var(--border-soft); }
+  nav .wrap { display: flex; align-items: center; gap: 28px; height: 60px; }
+  nav .brand { display: flex; align-items: center; gap: 10px; font-weight: 700;
+               color: var(--text); margin-right: auto; }
+  nav .brand img { width: 28px; height: 28px; }
+  nav a.link { color: var(--dim); font-size: 14px; font-weight: 500; }
+  nav a.link:hover { color: var(--text); text-decoration: none; }
+  @media (max-width: 720px) { nav a.link { display: none; } }
+
+  /* buttons */
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 11px 20px;
+         border-radius: var(--radius); font-weight: 700; font-size: 15px;
+         border: 1px solid var(--border); color: var(--text); background: var(--raised);
+         transition: background .15s, border-color .15s; }
+  .btn:hover { text-decoration: none; background: var(--panel); border-color: var(--muted); }
+  .btn.primary { background: var(--accent); color: #06121c; border-color: var(--accent); }
+  .btn.primary:hover { background: #55caff; border-color: #55caff; }
+  .btn svg { width: 18px; height: 18px; }
+
+  /* hero */
+  header.hero { position: relative; overflow: hidden; padding: 88px 0 64px; }
+  header.hero::before {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background:
+      radial-gradient(ellipse 60% 50% at 82% 10%, rgba(56,189,248,0.18), transparent 70%),
+      radial-gradient(circle, rgba(152,161,176,0.16) 1.2px, transparent 1.6px) 0 0 / 40px 40px;
+  }
+  header.hero .wrap { position: relative; display: grid; grid-template-columns: 1.15fr 1fr;
+                      gap: 48px; align-items: center; }
+  @media (max-width: 860px) { header.hero .wrap { grid-template-columns: 1fr; } }
+  .hero h1 { font-size: clamp(40px, 6vw, 68px); font-weight: 700; letter-spacing: -0.02em; }
+  .hero h1 span { color: var(--dim); font-weight: 300; }
+  .hero .rule { width: 96px; height: 4px; background: var(--accent); border-radius: 2px; margin: 18px 0 20px; }
+  .hero p { font-size: 20px; color: var(--dim); max-width: 560px; margin: 0 0 28px; }
+  .hero .cta { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  .hero .meta { margin-top: 18px; font-size: 13px; color: var(--muted); }
+  .hero .meta b { color: var(--dim); font-weight: 600; }
+  .hero .art { display: flex; justify-content: center; }
+  .hero .art img { width: min(100%, 380px); height: auto; display: block;
+                   filter: drop-shadow(0 30px 60px rgba(0,0,0,0.6)) drop-shadow(0 0 40px rgba(56,189,248,0.18)); }
+  @media (max-width: 860px) { .hero .art img { width: 200px; } }
+
+  /* chips */
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
+  .chip { font-size: 13px; font-weight: 600; color: var(--accent); background: var(--accent-wash);
+          border: 1px solid var(--accent-dim); border-radius: 999px; padding: 4px 12px; }
+
+  /* cards */
+  .grid { display: grid; gap: 18px; }
+  .grid.two { grid-template-columns: repeat(2, 1fr); }
+  .grid.three { grid-template-columns: repeat(3, 1fr); }
+  .grid.four { grid-template-columns: repeat(4, 1fr); }
+  @media (max-width: 900px) { .grid.three, .grid.four { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 600px) { .grid.two, .grid.three, .grid.four { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 24px; }
+  .card h3 { margin-bottom: 10px; display: flex; align-items: center; gap: 10px; }
+  .card h3 .ico { width: 34px; height: 34px; border-radius: 8px; background: var(--accent-wash);
+                  display: inline-flex; align-items: center; justify-content: center; flex: none; }
+  .card h3 .ico svg { width: 18px; height: 18px; stroke: var(--accent); fill: none;
+                      stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .card p { color: var(--dim); margin: 0 0 12px; font-size: 15px; }
+  .card ul { margin: 0; padding-left: 18px; color: var(--dim); font-size: 15px; }
+  .card li { margin: 4px 0; }
+  .card li b { color: var(--text); font-weight: 600; }
+
+  /* pipeline rows */
+  .flow { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 22px; }
+  @media (max-width: 900px) { .flow { grid-template-columns: repeat(2, 1fr); } }
+  .step { background: var(--input); border: 1px solid var(--border-soft); border-radius: 8px;
+          padding: 14px 16px; font-size: 14px; color: var(--dim); position: relative; }
+  .step b { display: block; color: var(--text); font-size: 13px; margin-bottom: 4px; }
+  .step .n { position: absolute; top: 10px; right: 12px; font-family: var(--mono);
+             font-size: 11px; color: var(--accent); }
+
+  /* exports table */
+  table { width: 100%; border-collapse: collapse; font-size: 15px; }
+  th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+  th { color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+  td:first-child { color: var(--text); font-weight: 600; white-space: nowrap; }
+  td { color: var(--dim); }
+  .tbl { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+
+  /* download */
+  .dl { display: grid; grid-template-columns: 1.2fr 1fr; gap: 24px; }
+  @media (max-width: 860px) { .dl { grid-template-columns: 1fr; } }
+  .notice { border-left: 3px solid var(--warn); background: rgba(242,181,68,0.06);
+            padding: 12px 16px; border-radius: 0 var(--radius) var(--radius) 0;
+            color: var(--dim); font-size: 15px; }
+  .notice b { color: var(--warn); }
+  .files { font-family: var(--mono); font-size: 13px; color: var(--dim); background: var(--input);
+           border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 16px; }
+  .files span { color: var(--text); }
+  ol.steps { margin: 0; padding-left: 20px; color: var(--dim); font-size: 15px; }
+  ol.steps li { margin: 8px 0; }
+  ol.steps b { color: var(--text); font-weight: 600; }
+
+  footer { padding: 40px 0 56px; border-top: 1px solid var(--border-soft); color: var(--muted); font-size: 14px; }
+  footer .wrap { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 16px; align-items: center; }
+  footer a { color: var(--dim); }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <a class="brand" href="#top"><img src="assets/mark.svg" alt=""> Automated Tracker</a>
+    <a class="link" href="#features">Features</a>
+    <a class="link" href="#exports">Exports</a>
+    <a class="link" href="#requirements">Requirements</a>
+    <a class="link" href="#download">Download</a>
+    <a class="btn" data-repo href="#">GitHub</a>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="wrap">
+    <div>
+      <div class="eyebrow">Windows desktop tool for VFX</div>
+      <h1>Automated <span>Tracker</span></h1>
+      <div class="rule"></div>
+      <p>2D point tracking and 3D camera solves for VFX, on your own machine. Drop in a clip, solve it, and send the result straight to Nuke, After Effects, Blender or USD.</p>
+      <div class="cta">
+        <a class="btn primary" data-releases href="#download">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+          Download for Windows
+        </a>
+        <a class="btn" href="#features">See what it does</a>
+      </div>
+      <div class="chips">
+        <span class="chip">CoTracker3</span><span class="chip">COLMAP</span><span class="chip">Nuke</span>
+        <span class="chip">After Effects</span><span class="chip">Blender</span><span class="chip">USD</span>
+      </div>
+      <div class="meta"><b>Version 1.1</b> · Windows 10 / 11, 64-bit · NVIDIA GPU recommended · Runs fully offline</div>
+    </div>
+    <div class="art">
+      <img src="assets/mark.svg" alt="Automated Tracker mark" width="512" height="512">
+    </div>
+  </div>
+</header>
+
+<section id="features">
+  <div class="wrap">
+    <div class="eyebrow">Two engines, one app</div>
+    <h2>Track in 2D. Solve in 3D.</h2>
+    <p class="lead">Each pipeline has its own tab, its own settings and its own export set. Both read from the same media pool and write into the same scene folder.</p>
+
+    <div class="grid two">
+      <div class="card">
+        <h3><span class="ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="6"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg></span>2D Point Tracking · CoTracker3</h3>
+        <p>Meta's CoTracker3 follows hundreds of points through a shot at once, with confidence and velocity filtering to throw out the ones that slip.</p>
+        <ul>
+          <li><b>Three modes:</b> automatic dense grid (up to 50×50), interactive point picker, and 4-point corner pin for screen replacements.</li>
+          <li><b>Offline or streaming model</b> at 512p, 720p, 1080p or original resolution.</li>
+          <li><b>Tracking layers:</b> multiple named, colour-coded layers, each solved and exported on its own.</li>
+          <li><b>Animated masks:</b> keyframed inclusion and exclusion boxes and polygons keep the tracker off actors and moving objects.</li>
+          <li><b>Viewer tools:</b> frame cache for instant scrubbing, sub-pixel loupe, matte and alpha views, motion-trail overlay, in/out range.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="ico"><svg viewBox="0 0 24 24"><path d="M3 7l9-4 9 4v10l-9 4-9-4z"/><path d="M3 7l9 4 9-4M12 11v10"/></svg></span>3D Camera Tracking · COLMAP</h3>
+        <p>A full structure-from-motion solve that recovers the camera path, lens, and a sparse point cloud of the set, with an optional environment mesh.</p>
+        <ul>
+          <li><b>Shot presets:</b> handheld, walking, drone orbit, 360° VR, slow/subtle, fast action, and hierarchical multi-cluster for long shots.</li>
+          <li><b>Lens models:</b> simple radial, radial, OpenCV, OpenCV fisheye, pinhole, spherical, EUCM, with optional distortion refinement.</li>
+          <li><b>Roto-aware:</b> 2D masks are rasterised and passed to COLMAP so moving people never end up in the solve.</li>
+          <li><b>Batch solving:</b> select several shots in the media pool, or none to solve everything.</li>
+          <li><b>Picks the best model</b> COLMAP produced rather than assuming the first one, then meshes it if asked.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="flow">
+      <div class="step"><span class="n">01</span><b>Drop a clip</b>Into 02 VIDEOS, or drag it onto the app.</div>
+      <div class="step"><span class="n">02</span><b>Unpack frames</b>FFmpeg extracts every frame for scrubbing and solving.</div>
+      <div class="step"><span class="n">03</span><b>Mask what moves</b>Draw and keyframe exclusion shapes over actors.</div>
+      <div class="step"><span class="n">04</span><b>Solve</b>Run the 2D tracker, the 3D solver, or both.</div>
+      <div class="step"><span class="n">05</span><b>Export</b>Every format is written at once, with the timeline start you set.</div>
+    </div>
+  </div>
+</section>
+
+<section id="exports">
+  <div class="wrap">
+    <div class="eyebrow">Straight into your comp</div>
+    <h2>Exports for the tools you already use</h2>
+    <p class="lead">One solve writes every format below into the scene folder. A Timeline Start control shifts all keys onto the shot's real frame range, and the Nuke tracker is copied to the clipboard so it pastes straight into a script.</p>
+
+    <div class="grid two">
+      <div class="tbl">
+        <table>
+          <thead><tr><th>2D tracks</th><th>What you get</th></tr></thead>
+          <tbody>
+            <tr><td>Nuke .nk</td><td>Native Tracker4 node, one per layer. Corner-pin mode adds a CornerPin2D. Masks export as a Roto node.</td></tr>
+            <tr><td>After Effects .jsx</td><td>ExtendScript that builds tracked null layers, or a corner-pinned layer.</td></tr>
+            <tr><td>Blender .py</td><td>Empties following each point, or a quad surface for corner pins.</td></tr>
+            <tr><td>CSV / JSON</td><td>Raw per-frame positions and confidence for anything else.</td></tr>
+            <tr><td>Overlay .mp4</td><td>Motion-trail preview for review.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="tbl">
+        <table>
+          <thead><tr><th>3D camera</th><th>What you get</th></tr></thead>
+          <tbody>
+            <tr><td>Nuke .nk / .chan</td><td>Camera script and animation channel file.</td></tr>
+            <tr><td>Blender .py / .blend</td><td>One-click import of camera, image sequence, point cloud and a RANSAC ground plane. A baked .blend is written when Blender is installed.</td></tr>
+            <tr><td>Alembic .abc</td><td>Baked through headless Blender when it is found.</td></tr>
+            <tr><td>USD .usda</td><td>Pixar USD camera and points.</td></tr>
+            <tr><td>PLY / JSON</td><td>Sparse point cloud, optional environment mesh, and the full solve as JSON.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="requirements">
+  <div class="wrap">
+    <div class="eyebrow">What it needs</div>
+    <h2>Requirements</h2>
+    <p class="lead">Everything is bundled: Python, PyTorch, COLMAP, FFmpeg and the CoTracker3 weights. Nothing is downloaded at run time.</p>
+    <div class="grid four">
+      <div class="card"><h3>OS</h3><p>Windows 10 or 11, 64-bit. Installs to Program Files, so setup asks for admin once.</p></div>
+      <div class="card"><h3>GPU</h3><p>An NVIDIA GPU with CUDA makes both engines fast. Without one, tracking and solving fall back to the CPU.</p></div>
+      <div class="card"><h3>VRAM</h3><p>Automatic VRAM chunking sizes the tracking window to free memory and halves it on an out-of-memory error.</p></div>
+      <div class="card"><h3>Disk</h3><p>About 9 GB for the install. Frame caches and solves are written next to your footage.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="download">
+  <div class="wrap">
+    <div class="eyebrow">Get it</div>
+    <h2>Download and install</h2>
+    <p class="lead">The installer is split into a small setup exe plus numbered <code>.bin</code> data files, because the bundled AI model and PyTorch runtime are larger than a single Windows installer can hold.</p>
+    <div class="dl">
+      <div>
+        <ol class="steps">
+          <li><b>Download every file</b> from the latest release: the setup exe and each <code>-1.bin</code>, <code>-2.bin</code>, … file.</li>
+          <li><b>Keep them in the same folder.</b> The exe reads the .bin files beside it. If one is missing, setup stops and tells you which.</li>
+          <li><b>Run the setup exe.</b> Choose a location, optionally add a desktop shortcut and the sample clip.</li>
+          <li><b>Launch Automated Tracker</b> and drop a clip into the media pool.</li>
+        </ol>
+        <p style="margin-top:22px"><a class="btn primary" data-releases href="#">Go to releases</a></p>
+      </div>
+      <div>
+        <div class="files" style="margin-bottom:14px">
+          <span>AutomatedTracker_Setup_1.1.0.exe</span><br>
+          <span>AutomatedTracker_Setup_1.1.0-1.bin</span><br>
+          <span>AutomatedTracker_Setup_1.1.0-2.bin</span><br>
+          …
+        </div>
+        <div class="notice"><b>Ship them together.</b> The exe on its own installs nothing. Zip the whole set, or download all of them into one folder before running setup.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="credits">
+  <div class="wrap">
+    <div class="eyebrow">Built on</div>
+    <h2>Open engines under the hood</h2>
+    <div class="grid three">
+      <div class="card"><h3>CoTracker3</h3><p>Meta AI's transformer point tracker drives the 2D tab. The bundled weights are released under the Creative Commons BY-NC 4.0 licence, which permits non-commercial use only.</p></div>
+      <div class="card"><h3>COLMAP</h3><p>The structure-from-motion and multi-view stereo pipeline behind the 3D solve, including its vocabulary tree for loop detection.</p></div>
+      <div class="card"><h3>FFmpeg · PyTorch · Qt</h3><p>Frame extraction, GPU inference and the interface. Blender, when installed, bakes Alembic and .blend exports.</p></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div>Automated Tracker · v1.1</div>
+    <div><a data-repo href="#">Source on GitHub</a> · <a data-issues href="#">Report a problem</a></div>
+  </div>
+</footer>
+
+<script>
+  // Set this once to the repository URL. Every GitHub / releases / issues link
+  // on the page is filled from it.
+  const REPO = "https://github.com/capsuleutkarsh-design/automated-tracker";
+  document.querySelectorAll("[data-repo]").forEach(a => a.href = REPO);
+  document.querySelectorAll("[data-releases]").forEach(a => a.href = REPO + "/releases/latest");
+  document.querySelectorAll("[data-issues]").forEach(a => a.href = REPO + "/issues");
+</script>
+</body>
+</html>
