@@ -136,7 +136,7 @@ def check_prereqs():
         p = ROOT / parent / sub
         log("  %s %s/%s" % ("ok      " if p.is_dir() else "MISSING ", parent, sub))
         ok = ok and p.is_dir()
-    for mod in ("torch", "PySide6", "numpy", "PIL", "imageio"):
+    for mod in ("torch", "PySide6", "numpy", "PIL", "imageio", "OpenEXR"):
         try:
             __import__(mod)
             log("  ok       %s" % mod)

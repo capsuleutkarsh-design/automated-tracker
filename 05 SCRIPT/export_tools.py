@@ -154,24 +154,34 @@ def rotation_from_z_to(n):
     return np.eye(3) + vx + vx @ vx * ((1.0 - c) / (s * s))
 
 
-def apply_timeline_start(images, start_frame):
+def apply_timeline_start(images, start_frame, frame_step=1):
     """
     Put every registered image on the shot's timeline.
 
-    Extracted frames are always numbered 1..N on disk, so image k belongs on
-    timeline_start + (k - 1) - regardless of whether COLMAP registered frame 1.
-    Returns the offset applied.
+    Extracted frames are always renumbered 1..M on disk, but at Frame step N
+    they are every Nth frame of the shot: on-disk index k is source frame
+    1 + (k - 1) * N, so it belongs on timeline_start + (k - 1) * N - regardless
+    of whether COLMAP registered frame 1. The camera therefore carries a key
+    every N frames across the plate's real range and the DCC interpolates
+    between them; nothing is squeezed onto consecutive frames.
+
+    Returns the offset applied to the first frame (timeline_start - 1).
     """
+    step = max(1, int(frame_step or 1))
     offset = int(start_frame or 1) - 1
     for img in images.values():
-        img["frame"] = int(img["index"]) + offset
+        img["frame"] = offset + 1 + (int(img["index"]) - 1) * step
     return offset
 
 
-def timeline_start_of(images):
-    """Recover timeline_start from any image: frame = timeline_start + index - 1."""
+def timeline_start_of(images, frame_step=1):
+    """
+    Recover timeline_start from any image, undoing the rule above:
+    frame = timeline_start + (index - 1) * frame_step.
+    """
+    step = max(1, int(frame_step or 1))
     for img in images.values():
-        return int(img["frame"]) - int(img["index"]) + 1
+        return int(img["frame"]) - (int(img["index"]) - 1) * step
     return 1
 
 
@@ -455,19 +465,76 @@ def image_sequence_info(img_dir):
     return ext, counts[ext]
 
 
-def _sequence_range(images, img_dir):
-    """(timeline_start, timeline_end, n_frames, ext) covering the whole plate, not just registered frames."""
+def source_sequence_plate(folder):
+    """
+    The artist's own plate in a folder, as something a DCC can read directly.
+
+    The extracted frames under images/ are an internal cache - renumbered from 1
+    and, at Frame step N, only every Nth frame - so they are not what a Read node
+    should point at when the source was a sequence to begin with. This turns
+    shot_a_1001.exr .. shot_a_1060.exr into
+    {'pattern': '.../shot_a_%04d.exr', 'first': 1001, 'last': 1060, ...},
+    every frame, already numbered the way the timeline is.
+
+    The frame number is the last run of digits in the stem, the same rule
+    parse_colmap_images and detect_sequence_start use. Returns None when the
+    folder is not a numbered image sequence.
+    """
+    folder = Path(folder)
+    if not folder.is_dir():
+        return None
+    files = sorted(f for f in folder.iterdir()
+                   if f.is_file() and f.suffix.lower() in IMAGE_EXTS)
+    if not files:
+        return None
+
+    def _digits(path):
+        runs = list(re.finditer(r"\d+", path.stem))
+        return runs[-1] if runs else None
+
+    first_run = _digits(files[0])
+    last_run = _digits(files[-1])
+    if first_run is None or last_run is None:
+        return None
+
+    stem = files[0].stem
+    digits = len(first_run.group())
+    pattern_stem = stem[:first_run.start()] + f"%0{digits}d" + stem[first_run.end():]
+    return {
+        "pattern": str(folder / (pattern_stem + files[0].suffix)).replace("\\", "/"),
+        "first": int(first_run.group()),
+        "last": int(last_run.group()),
+        "count": len(files),
+        "ext": files[0].suffix.lower(),
+        "digits": digits,
+    }
+
+
+def _sequence_range(images, img_dir, frame_step=1, source_sequence=None):
+    """
+    (timeline_start, timeline_end, n_frames, ext) covering the whole plate, not
+    just the registered frames.
+
+    n_frames is how many files the plate actually has; the timeline range is
+    what the artist sees, so at Frame step N the M extracted frames still span
+    (M - 1) * N frames of the shot. A source sequence is the real plate - every
+    frame - so its range is simply its own length.
+    """
+    step = max(1, int(frame_step or 1))
+    t0 = timeline_start_of(images, step)
+    if source_sequence:
+        n_frames = int(source_sequence["count"])
+        return t0, t0 + n_frames - 1, n_frames, source_sequence["ext"]
     ext, n_on_disk = image_sequence_info(img_dir)
     n_frames = n_on_disk or max(int(i["index"]) for i in images.values())
-    t0 = timeline_start_of(images)
-    return t0, t0 + n_frames - 1, n_frames, ext
+    return t0, t0 + (n_frames - 1) * step, n_frames, ext
 
 
 # =============================================================================
 # EXPORTERS
 # =============================================================================
 def export_blender_script(scene_dir, cameras, images, points, output_script_path=None, fps=None,
-                          ground=None):
+                          ground=None, frame_step=1, source_sequence=None):
     """
     Generates a 1-Click Python script for Blender that sets up camera,
     animation, background image sequence, Geometry Nodes point cloud (EEVEE & Cycles renderable),
@@ -475,6 +542,11 @@ def export_blender_script(scene_dir, cameras, images, points, output_script_path
 
     The point cloud is read from points3D.ply next to the script (written by
     export_ply_pointcloud, Y-up) instead of being embedded as JSON.
+
+    `source_sequence` (see source_sequence_plate) is the artist's own plate and
+    is used as the background when there is one; otherwise the extracted frames
+    are. The scene frame range is the plate's real timeline range, so at
+    `frame_step` > 1 the camera is keyed every Nth frame inside it.
     """
     scene_path = Path(scene_dir).resolve()
     if output_script_path is None:
@@ -507,11 +579,33 @@ def export_blender_script(scene_dir, cameras, images, points, output_script_path
     shift_x = float((width / 2.0 - cx) / float(max(width, height)))
     shift_y = -float((height / 2.0 - cy) / float(max(width, height)))
 
+    step = max(1, int(frame_step or 1))
     img_dir = find_images_dir(scene_path)
-    # The plate covers the whole extracted sequence; the camera is keyed on the
-    # registered frames only.
-    start_frame, end_frame, n_frames, img_ext = _sequence_range(images, img_dir)
-    images_dir_str = str(img_dir).replace('\\', '/')
+    # The plate covers the whole sequence; the camera is keyed on the registered
+    # frames only, every `step` frames.
+    start_frame, end_frame, n_frames, img_ext = _sequence_range(images, img_dir, step, source_sequence)
+
+    # Which plate the background points at. A source sequence is the artist's
+    # own, every frame and already numbered like the timeline, so Blender only
+    # has to be told where its numbering starts. The extracted frames are an
+    # internal cache; at step > 1 they are every Nth frame and Blender's image
+    # user has no step of its own, so the header says so in plain words rather
+    # than showing a background that drifts away from the camera.
+    if source_sequence:
+        images_dir_str = str(Path(source_sequence["pattern"]).parent).replace('\\', '/')
+        img_ext = source_sequence["ext"]
+        frame_offset = int(source_sequence["first"]) - 1
+        plate_note = (f"Background: your source sequence, frames "
+                      f"{source_sequence['first']}-{source_sequence['last']}.")
+    else:
+        images_dir_str = str(img_dir).replace('\\', '/')
+        frame_offset = 0
+        plate_note = "Background: the extracted frames in images/."
+        if step > 1:
+            plate_note += (f"\nNOTE: Frame Step {step} was used, so those frames are every {step}th "
+                           f"frame of the shot\nand do NOT line up with the timeline one to one. "
+                           f"The camera is keyed every {step} frames\nfrom {start_frame}; for a "
+                           f"frame-accurate background, load the original plate yourself.")
 
     frames_data = []
     for img in sorted_images:
@@ -564,6 +658,8 @@ HOW TO USE IN BLENDER:
 3. Click 'Open' and select this file ({output_script_name}).
 4. Click 'Run Script' (or press Alt+P).
 5. The Tracked Camera, Video Background, Point Cloud (Renderable), and Ground Plane load instantly!
+
+{plate_note}
 =============================================================================
 """
 
@@ -713,6 +809,8 @@ def setup_tracked_scene():
                 bg_img.image = img_data
                 bg_img.image_user.frame_duration = len(frame_files)
                 bg_img.image_user.frame_start = {start_frame}
+                # the plate's own numbering: file number = scene frame - frame_start + 1 + frame_offset
+                bg_img.image_user.frame_offset = {frame_offset}
                 bg_img.image_user.use_auto_refresh = True
                 bg_img.alpha = 1.0
                 bg_img.display_depth = 'BACK'
@@ -881,6 +979,8 @@ def export_usd_scene(scene_dir, cameras, images, points, output_usd_path=None, f
     first_cam = next(iter(cameras.values()))
     lens = camera_intrinsics_mm(first_cam)
 
+    # Real timeline frames, so the stage spans the shot's own range; at a frame
+    # step the samples inside it simply sit every Nth frame and USD interpolates.
     start_frame = sorted_images[0]["frame"]
     end_frame = sorted_images[-1]["frame"]
 
@@ -930,12 +1030,16 @@ def export_usd_scene(scene_dir, cameras, images, points, output_usd_path=None, f
     return True
 
 
-def export_nuke_chan(scene_dir, cameras, images, output_chan_path=None):
+def export_nuke_chan(scene_dir, cameras, images, output_chan_path=None, frame_step=1):
     """
     Exports a clean, standard 8-column ASCII .chan camera tracking file for Nuke:
     Columns: frame  tx  ty  tz  rx  ry  rz  vfov
     Nuke reads column 8 as the VERTICAL field of view in degrees; the angles are
     XYZ-order Eulers in degrees (set rot_order XYZ on the Camera before importing).
+
+    Frame numbers are the shot's own: at Frame step N the keys land every N
+    frames across the real range, and a third comment line says so, because a
+    .chan with gaps in it otherwise looks like a failed solve.
     """
     scene_path = Path(scene_dir).resolve()
     if output_chan_path is None:
@@ -953,6 +1057,12 @@ def export_nuke_chan(scene_dir, cameras, images, output_chan_path=None):
         "# Y-up world, camera looks down -Z. Rotations in degrees, rot_order XYZ "
         "(set the Camera's rot_order to XYZ before importing). vfov is the vertical FOV.\n",
     ]
+    step = max(1, int(frame_step or 1))
+    if step > 1:
+        lines.append(
+            "# Solved at frame step %d: one key every %d frames over %d-%d, "
+            "interpolated in between.\n"
+            % (step, step, sorted_images[0]["frame"], sorted_images[-1]["frame"]))
     for img in sorted_images:
         f = img["frame"]
         loc, R_nuke = colmap_pose_to(img, "nuke")
@@ -971,10 +1081,11 @@ def export_nuke_chan(scene_dir, cameras, images, output_chan_path=None):
 
 
 def export_nuke_camera_script(scene_dir, cameras, images, points, output_nk_path=None, fps=None,
-                              ground=None):
+                              ground=None, frame_step=1, source_sequence=None):
     """
     Generates a full 1-Click VFX Node Graph (.nk) for Foundry Nuke:
     - Read node (Footage Sequence, offset onto the timeline)
+    - TimeWarp (only when the extracted frames are stepped; see below)
     - Camera3 node (Keyframed poses, lens, sensor aperture, win_translate)
     - ReadGeo2 node (3D Point Cloud PLY)
     - Card2 node (RANSAC Ground Plane)
@@ -983,6 +1094,11 @@ def export_nuke_camera_script(scene_dir, cameras, images, points, output_nk_path
     - Lens distortion annotations for exact matching
 
     World is Nuke's Y-up with the camera looking down -Z (see WORLD_BASES).
+
+    The Read points at `source_sequence` (the artist's own plate) when there is
+    one, and at the extracted frames otherwise. Stepped extracted frames do not
+    sit on timeline frames at all, so they get a TimeWarp that maps the timeline
+    back onto them instead.
     """
     scene_path = Path(scene_dir).resolve()
     if output_nk_path is None:
@@ -1004,11 +1120,13 @@ def export_nuke_camera_script(scene_dir, cameras, images, points, output_nk_path
     # Window Translate (Principal Point Offset) in Nuke NDC units, see nuke_win_translate
     win_u, win_v = nuke_win_translate(first_cam)
 
-    # Camera keys cover the registered frames; the plate covers the whole sequence.
+    # Camera keys cover the registered frames, every `step` of them; the plate
+    # covers the whole sequence.
+    step = max(1, int(frame_step or 1))
     start_frame = sorted_images[0]["frame"]
     end_frame = sorted_images[-1]["frame"]
     img_dir = find_images_dir(scene_path)
-    timeline_start, timeline_end, n_frames, img_ext = _sequence_range(images, img_dir)
+    timeline_start, timeline_end, n_frames, img_ext = _sequence_range(images, img_dir, step, source_sequence)
 
     # Distortion parameters, read per model by parse_colmap_cameras
     k1 = float(first_cam.get("k1", 0.0))
@@ -1044,8 +1162,42 @@ def export_nuke_camera_script(scene_dir, cameras, images, points, output_nk_path
     ply_name = "points3D.ply"
     ply_path_str = str((Path(output_nk_path).parent / ply_name)).replace('\\', '/')
 
-    img_dir_str = str(img_dir).replace('\\', '/')
-    img_seq_path = f"{img_dir_str}/frame_%06d{img_ext}"
+    # Which plate the Read points at, and what has to happen for it to line up
+    # with the camera:
+    #  - a source sequence is the artist's own plate: every frame, numbered as
+    #    the timeline is, so it needs an offset only when the two disagree;
+    #  - the extracted frames are numbered 1..M, so at step 1 the "offset" frame
+    #    mode puts file 1 on timeline_start;
+    #  - stepped extracted frames are every Nth frame of the shot and no offset
+    #    can fix that, so a TimeWarp maps the timeline onto them instead and
+    #    holds the ends.
+    timewarp_node_str = ""
+    plate_input = "Plate_Footage"
+    if source_sequence:
+        img_seq_path = source_sequence["pattern"]
+        read_first = int(source_sequence["first"])
+        read_last = int(source_sequence["last"])
+        read_offset = timeline_start - read_first
+    else:
+        img_dir_str = str(img_dir).replace('\\', '/')
+        img_seq_path = f"{img_dir_str}/frame_%06d{img_ext}"
+        read_first, read_last = 1, n_frames
+        read_offset = 0 if step > 1 else timeline_start - 1
+
+    frame_knobs = f" frame_mode offset\n frame {read_offset}\n" if read_offset else ""
+
+    if step > 1 and not source_sequence:
+        plate_input = "Plate_Timewarp"
+        timewarp_node_str = f'''TimeWarp {{
+ inputs 1
+ lookup {{{{clamp((frame - {timeline_start}) / {step} + 1, {read_first}, {read_last})}}}}
+ name Plate_Timewarp
+ label "frame step {step}: timeline {timeline_start} -> extracted frame 1"
+ selected false
+ xpos -180
+ ypos 70
+}}
+'''
 
     # RANSAC ground plane for Nuke Card (fitted once by the caller so Blender and Nuke agree)
     if ground is None and points is not None and len(points) >= 20:
@@ -1101,10 +1253,13 @@ TransformGeo {{
 
     scene_inputs = str(2 + extra_inputs)
     nk_fps = float(fps) if fps else 24.0
+    # The label is the first thing an artist reads: say that the camera is keyed
+    # every Nth frame rather than letting the gaps look like a failed solve.
+    keys_note = f" (key every {step})" if step > 1 else ""
 
-    # Read node: the files on disk are frame_000001..frame_N, so first/last and
-    # origfirst/origlast are the file range 1..N, and the "offset" frame mode puts
-    # file frame 1 on timeline_start (frame = timeline_start - 1) - A3.
+    # Read node: first/last and origfirst/origlast are the plate's own file
+    # numbering, and frame_knobs carries the "offset" frame mode when the plate
+    # has to be moved onto the timeline (A3).
     script = f'''set cut_paste_input [stack 0]
 version 14.0 v1
 BackdropNode {{
@@ -1112,7 +1267,7 @@ BackdropNode {{
  name Tracker_3D_Rig
  tile_color 0x243044ff
  gl_color 0x243044ff
- label "<b>Photogrammetry 3D Tracking Rig</b>\\n\\nCamera: {lens_mm:.2f}mm | Sensor: {sensor_width_mm:.1f}x{sensor_height_mm:.1f}mm | Shift: ({win_u:.4f}, {win_v:.4f})\\nDistortion: k1={k1:.6f}, k2={k2:.6f} | Points: {len(points):,} | Frames: {start_frame}-{end_frame} @ {nk_fps:.3f} fps | Plate: {timeline_start}-{timeline_end}"
+ label "<b>Photogrammetry 3D Tracking Rig</b>\\n\\nCamera: {lens_mm:.2f}mm | Sensor: {sensor_width_mm:.1f}x{sensor_height_mm:.1f}mm | Shift: ({win_u:.4f}, {win_v:.4f})\\nDistortion: k1={k1:.6f}, k2={k2:.6f} | Points: {len(points):,} | Frames: {start_frame}-{end_frame}{keys_note} @ {nk_fps:.3f} fps | Plate: {timeline_start}-{timeline_end}"
  note_font_size 14
  xpos -220
  ypos -120
@@ -1125,19 +1280,17 @@ Read {{
  inputs 0
  file "{img_seq_path}"
  format "{width} {height} 0 0 {width} {height} 1.0 {width}x{height}"
- first 1
- last {n_frames}
- origfirst 1
- origlast {n_frames}
- frame_mode offset
- frame {timeline_start - 1}
- frame_rate {nk_fps:.4f}
+ first {read_first}
+ last {read_last}
+ origfirst {read_first}
+ origlast {read_last}
+{frame_knobs} frame_rate {nk_fps:.4f}
  name Plate_Footage
  selected false
  xpos -180
  ypos 0
 }}
-push $cut_paste_input
+{timewarp_node_str}push $cut_paste_input
 Camera3 {{
  inputs 0
  rot_order XYZ
@@ -1170,7 +1323,7 @@ ReadGeo2 {{
 }}
 ScanlineRender {{
  inputs 3
- bg Plate_Footage
+ bg {plate_input}
  obj Scene3D
  cam Solved_Camera
  output_motion_vectors false
@@ -1388,7 +1541,7 @@ def _ensure_txt_model(model_dir, colmap_exe=None, log_callback=None):
 
 
 def export_all_formats(scene_dir, blender_path=None, log_callback=None, fps=None,
-                       start_frame=None, colmap_exe=None):
+                       start_frame=None, colmap_exe=None, frame_step=1, source_sequence=None):
     """
     Parses a COLMAP scene folder and automatically generates all export formats:
     - import_to_blender.py
@@ -1399,8 +1552,15 @@ def export_all_formats(scene_dir, blender_path=None, log_callback=None, fps=None
     - camera_track.usda (USD)
     - points3D.ply (Point Cloud)
     - camera_track.json
+
+    `frame_step` is the Frame step the solve was extracted at: the camera gets a
+    key every N frames across the plate's real range, always at the plate's own
+    frame rate. `source_sequence` (see source_sequence_plate) is the original
+    plate when the shot came in as an image sequence, and is what the Nuke Read
+    and the Blender background point at.
     """
     scene_path = Path(scene_dir).resolve()
+    step = max(1, int(frame_step or 1))
     sparse_dir = scene_path / "sparse"
 
     # When no rate is supplied (batch_reconstruct.bat / direct CLI use), work the shot
@@ -1443,13 +1603,17 @@ def export_all_formats(scene_dir, blender_path=None, log_callback=None, fps=None
     points = parse_colmap_points3D(points3D_file)
 
     # Frames are numbered from the extracted filenames, which the pipeline always
-    # renumbers from 1, so image k belongs on timeline_start + (k - 1) whether or
-    # not COLMAP registered frame 1 (A1). Every exporter below reads img['frame'],
-    # so doing it once here covers all of them.
-    offset = apply_timeline_start(images, start_frame)
+    # renumbers from 1, so image k belongs on timeline_start + (k - 1) * step
+    # whether or not COLMAP registered frame 1 (A1). Every exporter below reads
+    # img['frame'], so doing it once here covers all of them.
+    offset = apply_timeline_start(images, start_frame, step)
     if offset and log_callback:
         log_callback("   Timeline start %d - camera keys shifted by %+d frames."
                      % (int(start_frame), offset), "#a0a0b0")
+    if step > 1 and log_callback:
+        keyed = sorted(img["frame"] for img in images.values())
+        log_callback("   Frame step %d - camera keys land every %d frames, %d..%d."
+                     % (step, step, keyed[0], keyed[-1]), "#a0a0b0")
 
     # One seeded ground-plane fit shared by Blender and Nuke (C9).
     ground = detect_ground_plane_ransac(points) if len(points) >= 20 else None
@@ -1463,18 +1627,20 @@ def export_all_formats(scene_dir, blender_path=None, log_callback=None, fps=None
 
     # 2. Blender 1-Click Script
     blender_script = scene_path / "import_to_blender.py"
-    if export_blender_script(scene_path, cameras, images, points, blender_script, fps=fps, ground=ground):
+    if export_blender_script(scene_path, cameras, images, points, blender_script, fps=fps, ground=ground,
+                             frame_step=step, source_sequence=source_sequence):
         exported_files.append(str(blender_script))
 
     # 3. Nuke 1-Click Script (.nk)
     nuke_nk_file = scene_path / "camera_track_nuke.nk"
-    if export_nuke_camera_script(scene_path, cameras, images, points, nuke_nk_file, fps=fps, ground=ground):
+    if export_nuke_camera_script(scene_path, cameras, images, points, nuke_nk_file, fps=fps, ground=ground,
+                                 frame_step=step, source_sequence=source_sequence):
         exported_files.append(str(nuke_nk_file))
 
     # 4. Nuke .chan Camera File
     chan_file = scene_path / "camera_track.chan"
     # .chan carries no frame-rate field, so fps is not passed here.
-    if export_nuke_chan(scene_path, cameras, images, chan_file):
+    if export_nuke_chan(scene_path, cameras, images, chan_file, frame_step=step):
         exported_files.append(str(chan_file))
 
     # 5. Universal Scene Description (.usda)
@@ -1489,6 +1655,10 @@ def export_all_formats(scene_dir, blender_path=None, log_callback=None, fps=None
         json.dump({
             "fps": float(fps) if fps else None,
             "timeline_start": int(start_frame or 1),
+            # image k on disk is timeline frame timeline_start + (k - 1) * frame_step;
+            # a downstream tool needs the step to know that and to read the gaps
+            # between keys as intended rather than as missing frames.
+            "frame_step": step,
             "cameras": cameras,
             "images": images,
             "points_count": len(points)

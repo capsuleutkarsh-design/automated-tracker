@@ -126,6 +126,47 @@ class VideoPointPickerCanvas(QLabel):
             self.masks_changed.emit()
             self.update()
 
+    def layers_to_config(self):
+        """Every layer as the engine and the project file want it."""
+        return [l.to_config_dict() for l in self.layers]
+
+    def layers_from_config(self, configs, in_point=0, out_point=-1):
+        """
+        Replace the layer stack with one restored from a project file.
+
+        The counterpart to layers_to_config: points and animated masks come
+        back with their keyframes, and the in/out range with them, because a
+        trimmed range is as much of the artist's decision as the roto is. An
+        empty or unusable list leaves the default single layer alone rather
+        than dropping the canvas into a state with no active layer.
+
+        masks_changed is emitted so the layer panel relists, and the scaled
+        frame cache is dropped because every cached frame was drawn with the
+        previous layers' overlays baked in.
+        """
+        layers = []
+        for cfg in (configs or []):
+            if not isinstance(cfg, dict):
+                continue
+            try:
+                layers.append(TrackingLayer.from_config_dict(cfg))
+            except Exception:
+                # One unreadable layer must not cost the artist the others.
+                continue
+        if layers:
+            self.layers = layers
+        self.active_layer_idx = 0
+        self.selected_mask_id = None
+        self.current_poly.clear()
+        self.drag_start = None
+        self.drag_current = None
+        self.in_point = int(in_point)
+        self.out_point = int(out_point)
+        self.invalidate_frame_cache()
+        self.masks_changed.emit()
+        self.update()
+        return len(layers)
+
     def invalidate_frame_cache(self):
         """Drop every cached scaled frame. Call when a different clip is loaded."""
         self._scaled_cache.clear()

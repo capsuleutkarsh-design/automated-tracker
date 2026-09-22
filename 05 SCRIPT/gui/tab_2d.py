@@ -68,6 +68,23 @@ def build_2d_tab(win, tab):
     win.spin_start_frame_2d.setValue(1)
     win.spin_start_frame_2d.setToolTip("Frame number the shot's first frame sits on in your timeline.\nLeave at 1 unless the plate is numbered from something else -\na 1001-1200 sequence needs 1001, or the exported keys land\noff the end of your comp and read as a single static value.")
     form_row(mbody, "Timeline start", win.spin_start_frame_2d)
+
+    # An image sequence carries no frame rate, and 24 was simply assumed - so a
+    # 25 fps plate had every exported key placed at the wrong time. Video files
+    # fill this from the probe and lock it; sequences are the artist's to set.
+    win.spin_fps = QDoubleSpinBox()
+    win.spin_fps.setRange(1.0, 240.0)
+    win.spin_fps.setDecimals(3)
+    win.spin_fps.setSingleStep(1.0)
+    win.spin_fps.setValue(24.0)
+    win.spin_fps.setToolTip(
+        "Frame rate of the plate. Drives playback, the timecode readout and\n"
+        "every exported curve, so a wrong value puts the keys on wrong times.\n"
+        "Read from the file for a video and locked; editable for an image\n"
+        "sequence, which carries no rate of its own.\n"
+        "Common rates: 23.976, 24, 25, 29.97, 30, 48, 50, 60.")
+    win.spin_fps.valueChanged.connect(win._on_fps_changed)
+    form_row(mbody, "Frame rate", win.spin_fps)
     ins.addWidget(media_card)
 
     # ---- Layers ---------------------------------------------------------

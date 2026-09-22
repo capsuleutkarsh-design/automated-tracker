@@ -124,6 +124,24 @@ def build_3d_tab(win, tab, presets):
     win.spin_start_frame_3d.setValue(1)
     win.spin_start_frame_3d.setToolTip("Frame number the shot's first frame sits on in your timeline.\nLeave at 1 unless the plate is numbered from something else -\na 1001-1200 sequence needs 1001, or the exported keys land\noff the end of your comp and read as a single static value.")
     form_row(sbody, "Timeline start", win.spin_start_frame_3d)
+
+    # The rate belongs to the shot, not to a tab, so this only shows what the
+    # 2D tab holds - one field the artist can get out of step with the other
+    # would be worse than no field at all.
+    win.spin_fps_3d = QDoubleSpinBox()
+    win.spin_fps_3d.setRange(1.0, 240.0)
+    win.spin_fps_3d.setDecimals(3)
+    win.spin_fps_3d.setValue(24.0)
+    win.spin_fps_3d.setReadOnly(True)
+    win.spin_fps_3d.setButtonSymbols(QDoubleSpinBox.NoButtons)
+    win.spin_fps_3d.setFocusPolicy(Qt.NoFocus)
+    win.spin_fps_3d.setToolTip(
+        "Frame rate of the shot, shared with the 2D tab and set there.\n"
+        "Read from the file for a video; for an image sequence it is whatever\n"
+        "the 2D tab's Frame rate field says.\n"
+        "Common rates: 23.976, 24, 25, 29.97, 30, 48, 50, 60.")
+    form_row(sbody, "Frame rate", win.spin_fps_3d)
+
     sbody.addWidget(hint_label(
         "Auto-filled from the file numbering when you select an image sequence."))
     ins.addWidget(solver_card)

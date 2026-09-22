@@ -1,7 +1,10 @@
 """
 Headless end-to-end check: run the real GUI code path on one shot in 02 VIDEOS.
 
-    "00 PYTHON\\python.exe" tools\\e2e_plate.py <shot> [2d,3d]
+    "00 PYTHON\\python.exe" tools\\e2e_plate.py <shot> [2d,3d] [key=value ...]
+
+Extra key=value settings are applied before each run, e.g. step=3 to force a
+gapped 3D solve, fps=25, grid=8, mesh=1.
 
 <shot> is a clip file or an image-sequence folder inside 02 VIDEOS, e.g. a
 sequence numbered from 1001 to prove exports land on the plate's frames. The
@@ -46,6 +49,21 @@ win = tracker_gui.TrackerMainWindow()
 win.show()
 SHOT = sys.argv[1] if len(sys.argv) > 1 else "plate_1001"
 RUN = sys.argv[2] if len(sys.argv) > 2 else "2d,3d"
+OPTS = dict(a.split("=", 1) for a in sys.argv[3:] if "=" in a)
+
+
+def apply_opts():
+    """step=/fps=/grid=/mesh= from the command line, so one script covers the
+    awkward cases (a gapped solve, a sequence at 25 fps) without editing it."""
+    if "step" in OPTS:
+        win.spin_step.setValue(int(OPTS["step"]))
+        print("frame step set to", win.spin_step.value())
+    if "fps" in OPTS and hasattr(win, "spin_fps"):
+        win.spin_fps.setValue(float(OPTS["fps"]))
+        print("fps set to", win.spin_fps.value())
+    if "grid" in OPTS:
+        win.spin_grid_size.setValue(int(OPTS["grid"]))
+    win.chk_mesh_gen.setChecked(OPTS.get("mesh", "0") == "1")
 
 
 def wait_for(signal, timeout_s, what):
@@ -88,6 +106,7 @@ try:
     print("2D clip:", win.combo_2d_video.currentText(), "fps:", win.current_fps,
           "frames:", win.canvas_2d.total_frames, "slider:", win.slider_2d_frame.maximum() + 1,
           "timeline start (auto):", win.spin_start_frame_2d.value())
+    apply_opts()
     print("--- 2D log ---")
     print("\n".join(win.log_2d_text.toPlainText().splitlines()[-6:]))
 
@@ -118,7 +137,7 @@ try:
     pump(0.3)
     print("3D timeline start (auto):", win.spin_start_frame_3d.value(),
           "camera model:", win.combo_cam.currentText(), "preset:", win.preset_combo.currentText())
-    win.chk_mesh_gen.setChecked(False)
+    apply_opts()
     win._start_tracking_3d()
     if win.worker_3d is None:
         print("3D worker did not start")

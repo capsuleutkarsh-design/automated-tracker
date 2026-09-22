@@ -83,6 +83,15 @@ def test_timeline_offset_with_first_frame_unregistered():
     assert images[7]["frame"] == 2
 
 
+def test_timeline_offset_with_a_frame_step():
+    images = et.parse_colmap_images(DATA / "images.txt")
+    # every 3rd frame was extracted: on-disk 2 and 3 are source frames 4 and 7,
+    # so they belong on 1004 and 1007, not on 1002 and 1003
+    assert et.apply_timeline_start(images, 1001, 3) == 1000
+    assert images[7]["frame"] == 1004 and images[8]["frame"] == 1007
+    assert et.timeline_start_of(images, 3) == 1001
+
+
 def test_parse_colmap_points3D_to_arrays():
     pc = et.parse_colmap_points3D(DATA / "points3D.txt")
     assert len(pc) == 3

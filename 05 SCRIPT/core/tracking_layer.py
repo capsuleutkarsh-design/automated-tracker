@@ -59,12 +59,54 @@ class TrackingLayer:
             "grid_size": self.grid_size,
             "min_confidence": self.min_confidence,
             "query_points": copy.deepcopy(self.points) if self.mode != "grid" else None,
+            # query_points is what the engine tracks, so a grid layer has none.
+            # The project file needs the clicks back whatever the mode is, or
+            # switching a layer to grid and saving would throw them away.
+            "points": copy.deepcopy(self.points),
             "animated_masks": [m.to_dict() for m in self.animated_masks],
             # Only a layer the user explicitly put in corner-pin mode gets corner-pin
             # exports. "Has exactly 4 points" is not a corner pin - a 2x2 grid has 4.
             "export_cornerpin": bool(self.export_cornerpin or self.mode == "cornerpin"),
             "color": self.color
         }
+
+    @classmethod
+    def from_config_dict(cls, d):
+        """
+        Rebuild a layer from to_config_dict(), for the per-shot project file.
+
+        Missing keys fall back to the constructor's defaults, so a layer saved
+        by an older build still loads. AnimatedMask is imported here rather
+        than at module scope: this module is otherwise pure data and is
+        imported by code that has no business pulling in PIL.
+        """
+        from mask_animator import AnimatedMask
+
+        layer = cls(
+            d.get("name", "Layer 1 (Wall)"),
+            d.get("color", "#00d2ff"),
+            d.get("mode", "grid"),
+        )
+        try:
+            layer.grid_size = int(d.get("grid_size", layer.grid_size))
+        except (TypeError, ValueError):
+            pass
+        try:
+            layer.min_confidence = float(d.get("min_confidence", layer.min_confidence))
+        except (TypeError, ValueError):
+            pass
+        layer.export_cornerpin = bool(d.get("export_cornerpin", False))
+
+        # JSON has no tuples; the canvas and the engine both expect (frame, x, y).
+        raw_points = d.get("points")
+        if raw_points is None:
+            raw_points = d.get("query_points") or []
+        layer.points = [(int(p[0]), float(p[1]), float(p[2]))
+                        for p in raw_points if p is not None and len(p) >= 3]
+
+        layer.animated_masks = [AnimatedMask.from_dict(m)
+                                for m in (d.get("animated_masks") or [])]
+        return layer
 
 
 def point_in_poly(x, y, poly):

@@ -19,7 +19,7 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QLabel, QTabWidget, QMessageBox, QFileDialog, QTableWidgetItem,
         QInputDialog, QColorDialog, QListWidgetItem, QStackedLayout,
-        QGraphicsOpacityEffect
+        QGraphicsOpacityEffect, QDoubleSpinBox
     )
     from PySide6.QtCore import Qt, QTimer, QSettings, QThread, QObject, Signal
     from PySide6.QtGui import (
@@ -70,6 +70,7 @@ from core.hardware import gpu_monitor
 from core.proc import run_hidden, popen_gui
 from core.media_info import probe_fps, probe_frame_count, detect_sequence_start, sequence_files
 from core.presets import PRESETS, DEFAULT_PRESET
+from core import project as project_file
 from core.media_pool import (
     VIDEO_EXTS, scan_media_pool, find_latest_output,
     thumb_path, prune_thumb_cache,
@@ -143,10 +144,27 @@ class TrackerMainWindow(QMainWindow):
         self._settings_timer.setInterval(1500)
         self._settings_timer.timeout.connect(self._save_settings)
 
+        # The shot whose project file the window is currently holding, and the
+        # same debounce for it: the artist should never have to press save, but
+        # nor should a mask drag write the file on every mouse move.
+        self._project_shot = None
+        self._restoring_project = False
+        self._project_save_failed = False
+        # True once a shot with a project file on disk is loaded, so the
+        # auto-detected timeline start does not overwrite the saved one.
+        self._project_loaded = False
+        self._project_timer = QTimer(self)
+        self._project_timer.setSingleShot(True)
+        self._project_timer.setInterval(1500)
+        self._project_timer.timeout.connect(self._save_project)
+
         # Video Player State for 2D Tab
         # Real frame rate of the selected clip. Used for playback speed, the timecode
         # readout and every exported curve - it used to be hard-coded to 24.
         self.current_fps = 24.0
+        # A sequence carries no rate, so the last one the artist typed is the
+        # best guess for the next sequence they open. App-wide, not per shot.
+        self._last_user_fps = 24.0
         self.overlay_frames = None
         self.loaded_video_frames = None
         self.current_play_frame = 0
@@ -626,6 +644,11 @@ class TrackerMainWindow(QMainWindow):
             if idx >= 0 and self.combo_2d_video.currentIndex() != idx:
                 self.combo_2d_video.setCurrentIndex(idx)
 
+            # A saved project already holds the start the artist settled on;
+            # only guess from the file numbering when there is nothing saved.
+            if self._project_loaded and self._project_shot == Path(v_name).stem:
+                return
+
             # An image sequence carries its own frame numbering; use it so the
             # exported camera lands on the same frames as the plate.
             detected = detect_sequence_start(VIDEOS_DIR / v_name, default=1)
@@ -702,6 +725,9 @@ class TrackerMainWindow(QMainWindow):
             "enable_caspar_ba": self.chk_caspar_ba.isChecked(),
             "max_image_size": 4096,
             "init_max_forward_motion": preset_data.get("init_max_forward_motion", 1.0),
+            # The rate the artist set on the 2D tab, so a sequence exports on
+            # the right times instead of whatever the probe guessed.
+            "fps": self.current_fps if self.current_fps and self.current_fps > 0 else None,
             "timeline_start": self.spin_start_frame_3d.value(),
             "frame_step": self.spin_step.value(),
             "blender_path": self.txt_blender_path.text().strip() or None,
@@ -849,6 +875,9 @@ class TrackerMainWindow(QMainWindow):
         if 0 <= self.canvas_2d.active_layer_idx < self.layer_list.count():
             self.layer_list.setCurrentRow(self.canvas_2d.active_layer_idx)
         self.layer_list.blockSignals(False)
+        # Every handler that adds, deletes, renames, recolours or re-points a
+        # layer ends here, so this is the one place the project needs marking.
+        self._schedule_project_save()
 
     def _on_layer_selected(self, row):
         if row < 0 or row >= len(self.canvas_2d.layers):
@@ -1020,6 +1049,9 @@ class TrackerMainWindow(QMainWindow):
         if not video_path.exists():
             return
 
+        # The shot being left keeps its work: the debounce may not have fired yet.
+        self._flush_project_save()
+
         self._pause_playback()
         self.overlay_frames = None
         self.loaded_video_frames = None
@@ -1027,21 +1059,28 @@ class TrackerMainWindow(QMainWindow):
         # the previous clip's cached, scaled frames.
         self.canvas_2d.invalidate_frame_cache()
 
-        # Probe the real frame rate once, for both the extracted-frames path and the
-        # raw-video path below.
-        self.current_fps = probe_fps(video_path)
-
         # A numbered sequence tells us where it belongs on the timeline.
         detected_start = detect_sequence_start(video_path, default=1)
         if detected_start != self.spin_start_frame_2d.value():
-            self.spin_start_frame_2d.setValue(detected_start)
+            self._set_timeline_start(detected_start)
             if detected_start != 1:
                 self._append_log_2d(
                     f"Timeline start set to {detected_start} from the sequence numbering.",
                     ACCENT)
-        self._append_log_2d(
-            f"Frame rate detected: {self.current_fps:.3f} fps (used for playback, timecode "
-            f"and all exports).", TEXT_DIM)
+
+        # The saved project comes last, so anything the artist settled on wins
+        # over what the file numbering and the probe guessed a moment ago.
+        self._project_shot = video_path.stem
+        self._project_save_failed = False
+        saved = project_file.load_project(project_file.project_path(SCENES_DIR, video_path.stem))
+        self._project_loaded = saved is not None
+        self._apply_fps_for_clip(video_path, saved.get("fps") if saved else None)
+        if saved:
+            self._apply_project(saved)
+            self._append_log_2d(
+                f"Restored the saved project for '{video_path.stem}': "
+                f"{len(self.canvas_2d.layers)} layer(s), timeline start "
+                f"{self.spin_start_frame_2d.value()}.", OK)
 
         self._last_clip = video_name
         self._schedule_settings_save()
@@ -1060,8 +1099,7 @@ class TrackerMainWindow(QMainWindow):
             self._append_log_2d(
                 f"Image sequence: {len(files)} frames ({files[0].suffix.lower()}), "
                 f"timeline {self.spin_start_frame_2d.value()}-"
-                f"{self.spin_start_frame_2d.value() + len(files) - 1}. A sequence "
-                f"carries no frame rate, so {self.current_fps:.3f} fps is assumed.", TEXT_DIM)
+                f"{self.spin_start_frame_2d.value() + len(files) - 1}.", TEXT_DIM)
             return
 
         scene_images_dir = SCENES_DIR / video_path.stem / "images"
@@ -1376,6 +1414,7 @@ class TrackerMainWindow(QMainWindow):
         self.lbl_range_status.setText("Full")
         self._set_chip_state(self.lbl_range_status, "idle")
         self._append_log_2d("↺ Reset Tracking Range to full sequence.", ACCENT)
+        self._schedule_project_save()
 
     def _toggle_canvas_matte_overlay(self, checked):
         self.canvas_2d.show_mask_overlay = checked
@@ -1503,14 +1542,7 @@ class TrackerMainWindow(QMainWindow):
             return
 
         video_path = VIDEOS_DIR / v_name
-        res_text = self.combo_2d_res.currentText()
-        max_dim = 720
-        if "512p" in res_text:
-            max_dim = 512
-        elif "1080p" in res_text:
-            max_dim = 1080
-        elif "Original" in res_text:
-            max_dim = 0
+        max_dim = self._max_dimension_2d()
 
         offline = "Offline" in self.combo_2d_model.currentText()
 
@@ -1624,19 +1656,245 @@ class TrackerMainWindow(QMainWindow):
 
 
     # =========================================================================
+    # PER-SHOT PROJECT FILE
+    # =========================================================================
+    def _max_dimension_2d(self):
+        """Working resolution the Resolution combo asks for. 0 means original."""
+        res_text = self.combo_2d_res.currentText()
+        if "512p" in res_text:
+            return 512
+        if "1080p" in res_text:
+            return 1080
+        if "Original" in res_text:
+            return 0
+        return 720
+
+    def _project_state(self):
+        """Everything about the current shot that belongs in its project file."""
+        canvas = self.canvas_2d
+        data = project_file.default_project()
+        data["fps"] = float(self.current_fps) if self.current_fps and self.current_fps > 0 else 24.0
+        # One start for the shot: the two spin boxes mirror each other.
+        data["timeline_start"] = int(self.spin_start_frame_2d.value())
+        data["in_point"] = int(canvas.in_point)
+        data["out_point"] = int(canvas.out_point)
+        data["layers"] = canvas.layers_to_config()
+        data["settings_2d"] = {
+            "model": self.combo_2d_model.currentText(),
+            "resolution": self.combo_2d_res.currentText(),
+            "max_dimension": self._max_dimension_2d(),
+            "min_confidence": float(self.spin_min_conf.value()),
+            "grid_size": int(self.spin_grid_size.value()),
+            "auto_chunk": bool(self.chk_vram_chunk.isChecked()),
+        }
+        data["settings_3d"] = {
+            "preset": self.preset_combo.currentText(),
+            "solver_engine": self.combo_solver_engine.currentText(),
+            "camera_model": self.combo_cam.currentText(),
+            "tri_angle": float(self.spin_tri.value()),
+            "overlap": int(self.spin_overlap.value()),
+            "inliers": int(self.spin_inliers.value()),
+            "frame_step": int(self.spin_step.value()),
+            "single_camera": bool(self.chk_single_cam.isChecked()),
+            "ba_refine_distortion": bool(self.chk_ba_refine.isChecked()),
+            "use_gpu": bool(self.chk_gpu.isChecked()),
+            "caspar_ba": bool(self.chk_caspar_ba.isChecked()),
+            "generate_mesh": bool(self.chk_mesh_gen.isChecked()),
+            "blender_path": self.txt_blender_path.text().strip(),
+        }
+        return data
+
+    def _apply_project(self, data):
+        """
+        Put a loaded project back into the window.
+
+        Every widget is set with its signals blocked and `_restoring_project`
+        held, so restoring a shot cannot be mistaken for the artist editing it
+        and write the file back before it has finished loading.
+        """
+        self._restoring_project = True
+        try:
+            def combo_text(combo, text, quiet=True):
+                if text and combo.findText(text) >= 0:
+                    combo.blockSignals(quiet)
+                    combo.setCurrentText(text)
+                    combo.blockSignals(False)
+
+            def quiet(widget, value):
+                widget.blockSignals(True)
+                widget.setValue(value)
+                widget.blockSignals(False)
+
+            def quiet_check(widget, value):
+                widget.blockSignals(True)
+                widget.setChecked(bool(value))
+                widget.blockSignals(False)
+
+            s3 = data.get("settings_3d") or {}
+            # The preset first, and noisily, so its description panel updates:
+            # it writes the solver fields, and the saved values below are
+            # whatever the artist tuned on top of it.
+            combo_text(self.preset_combo, s3.get("preset"), quiet=False)
+            combo_text(self.combo_solver_engine, s3.get("solver_engine"))
+            combo_text(self.combo_cam, s3.get("camera_model"))
+            quiet(self.spin_tri, float(s3.get("tri_angle", self.spin_tri.value())))
+            quiet(self.spin_overlap, int(s3.get("overlap", self.spin_overlap.value())))
+            quiet(self.spin_inliers, int(s3.get("inliers", self.spin_inliers.value())))
+            quiet(self.spin_step, int(s3.get("frame_step", self.spin_step.value())))
+            quiet_check(self.chk_single_cam, s3.get("single_camera", True))
+            quiet_check(self.chk_ba_refine, s3.get("ba_refine_distortion", True))
+            quiet_check(self.chk_gpu, s3.get("use_gpu", True))
+            quiet_check(self.chk_caspar_ba, s3.get("caspar_ba", True))
+            quiet_check(self.chk_mesh_gen, s3.get("generate_mesh", False))
+            blender = (s3.get("blender_path") or "").strip()
+            if blender:
+                self.txt_blender_path.blockSignals(True)
+                self.txt_blender_path.setText(blender)
+                self.txt_blender_path.blockSignals(False)
+
+            s2 = data.get("settings_2d") or {}
+            combo_text(self.combo_2d_model, s2.get("model"))
+            combo_text(self.combo_2d_res, s2.get("resolution"))
+            quiet_check(self.chk_vram_chunk, s2.get("auto_chunk", True))
+
+            self._set_timeline_start(int(data.get("timeline_start", 1)))
+
+            self.canvas_2d.layers_from_config(
+                data.get("layers"),
+                in_point=data.get("in_point", 0),
+                out_point=data.get("out_point", -1))
+            self._refresh_layer_list()
+            self._on_layer_selected(self.canvas_2d.active_layer_idx)
+            self._sync_range_status()
+        except Exception as e:
+            log.exception("restoring the project failed")
+            self._append_log_2d(f"! Could not fully restore the saved project: {e}", WARN)
+        finally:
+            self._restoring_project = False
+
+    def _sync_range_status(self):
+        """Redraw the in/out chip from whatever the canvas now holds."""
+        canvas = self.canvas_2d
+        if canvas.in_point == 0 and canvas.out_point < 0:
+            self.lbl_range_status.setText("Full")
+            self._set_chip_state(self.lbl_range_status, "idle")
+            return
+        out_p = canvas.out_point if canvas.out_point >= 0 else self.slider_2d_frame.maximum()
+        self.lbl_range_status.setText(f"{canvas.in_point + 1} – {out_p + 1}")
+        self._set_chip_state(self.lbl_range_status, "key")
+
+    def _set_timeline_start(self, value):
+        """
+        Set both Timeline start boxes at once.
+
+        The shot has one start frame; two fields that can disagree is how a
+        camera ends up exported onto different frames from its own 2D tracks.
+        """
+        value = int(value)
+        for spin in (self.spin_start_frame_2d, self.spin_start_frame_3d):
+            if spin.value() != value:
+                spin.blockSignals(True)
+                spin.setValue(value)
+                spin.blockSignals(False)
+
+    def _on_timeline_start_changed(self, value):
+        self._set_timeline_start(value)
+        self._schedule_project_save()
+
+    def _apply_fps_for_clip(self, video_path, saved_fps=None):
+        """
+        Decide the shot's frame rate and put it in the fps field.
+
+        A video file knows its own rate, so that is read from the file and the
+        field locked. An image sequence does not, so the saved project wins,
+        then the last rate the artist typed, then 24 - and the field stays
+        editable, because only the artist knows what the plate was shot at.
+        """
+        video_path = Path(video_path)
+        if video_path.is_dir():
+            if saved_fps and float(saved_fps) > 0:
+                fps, source = float(saved_fps), "the saved project"
+            elif self._last_user_fps and self._last_user_fps > 0:
+                fps, source = float(self._last_user_fps), "the last rate you used"
+            else:
+                fps, source = 24.0, "the default"
+            editable = True
+            tip_source = ("An image sequence carries no frame rate, so this one is yours "
+                          "to set.")
+        else:
+            fps, source = float(probe_fps(video_path)), "the file"
+            editable = False
+            tip_source = "Read from the file, so it cannot be edited here."
+
+        self.current_fps = fps if fps > 0 else 24.0
+        for spin in (self.spin_fps, self.spin_fps_3d):
+            spin.blockSignals(True)
+            spin.setValue(self.current_fps)
+            spin.blockSignals(False)
+        self.spin_fps.setReadOnly(not editable)
+        self.spin_fps.setButtonSymbols(
+            QDoubleSpinBox.UpDownArrows if editable else QDoubleSpinBox.NoButtons)
+        self.spin_fps.setToolTip(
+            "Frame rate of the plate. Drives playback, the timecode readout and\n"
+            "every exported curve, so a wrong value puts the keys on wrong times.\n"
+            + tip_source + "\n"
+            "Common rates: 23.976, 24, 25, 29.97, 30, 48, 50, 60.")
+        self.canvas_2d.fps = self.current_fps
+        self._append_log_2d(
+            f"Frame rate {self.current_fps:.3f} fps, from {source} — used for playback, "
+            f"timecode and every export.", TEXT_DIM)
+
+    def _on_fps_changed(self, value):
+        """The artist typed a rate for a sequence."""
+        fps = float(value) if value and float(value) > 0 else 24.0
+        self.current_fps = fps
+        self._last_user_fps = fps
+        self.spin_fps_3d.blockSignals(True)
+        self.spin_fps_3d.setValue(fps)
+        self.spin_fps_3d.blockSignals(False)
+        self.canvas_2d.fps = fps
+        self.canvas_2d.update()
+        if self.is_playing:
+            self.play_timer.start(max(10, int(round(1000.0 / fps))))
+        self._append_log_2d(f"Frame rate set to {fps:.3f} fps by hand.", ACCENT)
+        self._schedule_project_save()
+        self._schedule_settings_save()
+
+    def _schedule_project_save(self):
+        if not self._closing and not self._restoring_project and self._project_shot:
+            self._project_timer.start()
+
+    def _save_project(self):
+        """
+        Write the current shot's project file.
+
+        A failure is not fatal - the artist carries on working - but it is the
+        one case where quitting really would lose work, so it is remembered and
+        closeEvent asks before quitting.
+        """
+        shot = self._project_shot
+        if not shot:
+            return False
+        path = project_file.project_path(SCENES_DIR, shot)
+        try:
+            project_file.save_project(path, self._project_state())
+            self._project_save_failed = False
+            return True
+        except Exception as e:
+            self._project_save_failed = True
+            log.warning("saving the project for %s failed: %s", shot, e)
+            self._status("Could not save the project for '%s': %s" % (shot, e), error=True)
+            return False
+
+    def _flush_project_save(self):
+        """Write now instead of waiting for the debounce (clip switch, close)."""
+        self._project_timer.stop()
+        if self._project_shot and not self._restoring_project:
+            self._save_project()
+
+    # =========================================================================
     # SHUTDOWN AND SETTINGS
     # =========================================================================
-    def _has_unsaved_2d_work(self):
-        """Layers, points, masks or an in/out range the user set by hand."""
-        canvas = getattr(self, "canvas_2d", None)
-        if canvas is None:
-            return False
-        if len(canvas.layers) > 1:
-            return True
-        for layer in canvas.layers:
-            if layer.points or layer.animated_masks:
-                return True
-        return canvas.in_point != 0 or canvas.out_point != -1
 
     def closeEvent(self, event):
         running = [(name, w) for name, w in (("3D solve", self.worker_3d),
@@ -1650,11 +1908,18 @@ class TrackerMainWindow(QMainWindow):
             if r != QMessageBox.Yes:
                 event.ignore()
                 return
-        if self._has_unsaved_2d_work():
+
+        # Layers, masks and the range now live in the shot's project file, so
+        # there is nothing to warn about - unless writing that file failed, in
+        # which case quitting really does lose the work.
+        self._flush_project_save()
+        if self._project_save_failed:
             r = QMessageBox.question(
-                self, "Unsaved 2D Work",
-                "Tracking layers, points, masks or an in/out range have been set on the "
-                "2D tab and are not saved anywhere.\n\nQuit and lose them?",
+                self, "Project Not Saved",
+                "The project file for '%s' could not be written, so the layers, points, "
+                "masks and in/out range on the 2D tab are not saved anywhere.\n\n"
+                "Check that 04 SCENES is writable.\n\nQuit and lose them?"
+                % (self._project_shot or "this shot"),
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if r != QMessageBox.Yes:
                 event.ignore()
@@ -1664,6 +1929,7 @@ class TrackerMainWindow(QMainWindow):
         self._pause_playback()
         self.vram_timer.stop()
         self._settings_timer.stop()
+        self._project_timer.stop()
 
         for name, w in running:
             self._status("Cancelling %s..." % name)
@@ -1697,20 +1963,36 @@ class TrackerMainWindow(QMainWindow):
 
     # -- QSettings (C18) ------------------------------------------------------
     def _wire_settings_autosave(self):
-        """Persist a moment after any persisted control changes."""
+        """
+        Persist a moment after any persisted control changes.
+
+        QSettings now only carries app-wide preferences (window, tab, Blender
+        path, last clip, last frame rate); every solver field is per shot and
+        goes to that shot's project file instead.
+        """
         s = self._schedule_settings_save
+        p = self._schedule_project_save
         self.tabs.currentChanged.connect(lambda _i: s())
         self.txt_blender_path.textChanged.connect(lambda _t: s())
-        self.preset_combo.currentTextChanged.connect(lambda _t: s())
+        self.txt_blender_path.textChanged.connect(lambda _t: p())
+        self.preset_combo.currentTextChanged.connect(lambda _t: p())
         for w in (self.combo_solver_engine, self.combo_cam,
                   self.combo_2d_model, self.combo_2d_res):
-            w.currentIndexChanged.connect(lambda _i: s())
+            w.currentIndexChanged.connect(lambda _i: p())
         for w in (self.spin_tri, self.spin_overlap, self.spin_inliers, self.spin_step,
-                  self.spin_start_frame_3d, self.spin_start_frame_2d, self.spin_min_conf):
-            w.valueChanged.connect(lambda _v: s())
+                  self.spin_min_conf):
+            w.valueChanged.connect(lambda _v: p())
         for w in (self.chk_single_cam, self.chk_ba_refine, self.chk_gpu,
                   self.chk_caspar_ba, self.chk_mesh_gen, self.chk_vram_chunk):
-            w.toggled.connect(lambda _b: s())
+            w.toggled.connect(lambda _b: p())
+        # Both Timeline start boxes describe the same thing, so either one
+        # moving carries the other with it before the project is written.
+        for w in (self.spin_start_frame_2d, self.spin_start_frame_3d):
+            w.valueChanged.connect(self._on_timeline_start_changed)
+        # Roto, points and the in/out range are the work itself.
+        self.canvas_2d.masks_changed.connect(p)
+        self.canvas_2d.in_point_requested.connect(lambda _f: p())
+        self.canvas_2d.out_point_requested.connect(lambda _f: p())
 
     def _schedule_settings_save(self):
         if not self._closing:
@@ -1723,24 +2005,9 @@ class TrackerMainWindow(QMainWindow):
             st.setValue("window/state", self.saveState())
             st.setValue("window/tab", self.tabs.currentIndex())
             st.setValue("blender/path", self.txt_blender_path.text().strip())
-            st.setValue("solver3d/preset", self.preset_combo.currentText())
-            st.setValue("solver3d/engine", self.combo_solver_engine.currentIndex())
-            st.setValue("solver3d/camera_model", self.combo_cam.currentIndex())
-            st.setValue("solver3d/tri_angle", self.spin_tri.value())
-            st.setValue("solver3d/overlap", self.spin_overlap.value())
-            st.setValue("solver3d/inliers", self.spin_inliers.value())
-            st.setValue("solver3d/frame_step", self.spin_step.value())
-            st.setValue("solver3d/timeline_start", self.spin_start_frame_3d.value())
-            st.setValue("solver3d/single_camera", self.chk_single_cam.isChecked())
-            st.setValue("solver3d/ba_refine", self.chk_ba_refine.isChecked())
-            st.setValue("solver3d/use_gpu", self.chk_gpu.isChecked())
-            st.setValue("solver3d/caspar_ba", self.chk_caspar_ba.isChecked())
-            st.setValue("solver3d/mesh", self.chk_mesh_gen.isChecked())
-            st.setValue("track2d/model", self.combo_2d_model.currentIndex())
-            st.setValue("track2d/resolution", self.combo_2d_res.currentIndex())
-            st.setValue("track2d/min_confidence", self.spin_min_conf.value())
-            st.setValue("track2d/timeline_start", self.spin_start_frame_2d.value())
-            st.setValue("track2d/vram_chunk", self.chk_vram_chunk.isChecked())
+            # The frame rate of a sequence is a guess until the artist makes it
+            # one, so the last one they typed is worth remembering app-wide.
+            st.setValue("track2d/last_fps", float(self._last_user_fps))
             st.setValue("media/last_clip", self.combo_2d_video.currentText() or self._last_clip)
             st.sync()
         except Exception as e:
@@ -1767,32 +2034,11 @@ class TrackerMainWindow(QMainWindow):
 
             self.txt_blender_path.setText(val("blender/path", "", str))
 
-            preset = val("solver3d/preset", "", str)
-            if preset and self.preset_combo.findText(preset) >= 0:
-                self.preset_combo.setCurrentText(preset)   # applies the preset values...
-            # ...then whatever the user tuned on top of it.
-            self.combo_solver_engine.setCurrentIndex(
-                val("solver3d/engine", self.combo_solver_engine.currentIndex(), int))
-            self.combo_cam.setCurrentIndex(
-                val("solver3d/camera_model", self.combo_cam.currentIndex(), int))
-            self.spin_tri.setValue(val("solver3d/tri_angle", self.spin_tri.value(), float))
-            self.spin_overlap.setValue(val("solver3d/overlap", self.spin_overlap.value(), int))
-            self.spin_inliers.setValue(val("solver3d/inliers", self.spin_inliers.value(), int))
-            self.spin_step.setValue(val("solver3d/frame_step", self.spin_step.value(), int))
-            self.spin_start_frame_3d.setValue(
-                val("solver3d/timeline_start", self.spin_start_frame_3d.value(), int))
-            self.chk_single_cam.setChecked(val("solver3d/single_camera", self.chk_single_cam.isChecked(), bool))
-            self.chk_ba_refine.setChecked(val("solver3d/ba_refine", self.chk_ba_refine.isChecked(), bool))
-            self.chk_gpu.setChecked(val("solver3d/use_gpu", self.chk_gpu.isChecked(), bool))
-            self.chk_caspar_ba.setChecked(val("solver3d/caspar_ba", self.chk_caspar_ba.isChecked(), bool))
-            self.chk_mesh_gen.setChecked(val("solver3d/mesh", self.chk_mesh_gen.isChecked(), bool))
+            last_fps = val("track2d/last_fps", 24.0, float)
+            self._last_user_fps = last_fps if last_fps and last_fps > 0 else 24.0
 
-            self.combo_2d_model.setCurrentIndex(val("track2d/model", 0, int))
-            self.combo_2d_res.setCurrentIndex(val("track2d/resolution", 0, int))
-            self.spin_min_conf.setValue(val("track2d/min_confidence", self.spin_min_conf.value(), float))
-            self.spin_start_frame_2d.setValue(
-                val("track2d/timeline_start", self.spin_start_frame_2d.value(), int))
-            self.chk_vram_chunk.setChecked(val("track2d/vram_chunk", True, bool))
+            # Everything else the solver tabs hold is per shot and comes from
+            # 04 SCENES/<shot>/project.json when the clip is selected.
         except Exception as e:
             log.warning("loading settings failed: %s", e)
 

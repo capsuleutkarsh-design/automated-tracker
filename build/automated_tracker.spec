@@ -38,6 +38,10 @@ hidden += [
     "imageio_ffmpeg",
     "PIL.Image",
     "PIL.ImageDraw",
+    # STMap delivery writes 32-bit float EXR; without these the frozen build
+    # silently falls back to a 16-bit PNG that clips the map values.
+    "OpenEXR",
+    "Imath",
     "scipy",                                     # optional, pulled by some timm paths
 ]
 

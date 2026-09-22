@@ -13,10 +13,75 @@ from PySide6.QtCore import QThread, Signal
 from mask_animator import AnimatedMask, rasterize_masks_to_png
 from core.media_info import probe_fps
 from core.proc import popen_hidden
-from core.colmap_model import find_best_model, model_stats
+from core.colmap_model import find_best_model, model_stats, model_error, registered_indices
 
 
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.exr', '.tif', '.tiff'}
+
+# How much worse the solve is allowed to get in exchange for more frames, and
+# the point past which a mean reprojection error is bad regardless (1.3).
+MAX_ERROR_GROWTH = 0.25
+MAX_ERROR_PX = 4.0
+
+
+def _should_adopt(old_stats, old_err, new_stats, new_err):
+    """
+    Whether the registered model replaces the one the mapper produced.
+
+    image_registrator can always add frames - if it has to, it will force a pose
+    that no longer agrees with the rest of the solve, and the whole camera
+    starts to wobble. So a gain in frames is necessary but not sufficient: the
+    mean reprojection error must also stay where it was, within a quarter, and
+    under MAX_ERROR_PX in absolute terms.
+
+    Either error may be None when COLMAP could not tell us; then frame count is
+    all there is to go on. Returns (adopt, reason) - the reason is logged either
+    way, so the artist can see what the tool decided and why.
+    """
+    old_imgs = old_stats[0] if old_stats else 0
+    new_imgs = new_stats[0] if new_stats else 0
+
+    if new_imgs <= old_imgs:
+        return False, ("registering added no frames (%d, was %d)" % (new_imgs, old_imgs))
+
+    if old_err is None or new_err is None:
+        return True, ("%d frames instead of %d; reprojection error unknown, so the "
+                      "frame count decided it" % (new_imgs, old_imgs))
+
+    if new_err > old_err * (1.0 + MAX_ERROR_GROWTH):
+        return False, ("the extra frames pushed the reprojection error from %.3f to "
+                       "%.3f px, more than the %d%% it is allowed to grow"
+                       % (old_err, new_err, int(MAX_ERROR_GROWTH * 100)))
+
+    if new_err > MAX_ERROR_PX:
+        return False, ("the reprojection error would be %.3f px, over the %.1f px "
+                       "a usable track stays under" % (new_err, MAX_ERROR_PX))
+
+    return True, ("%d frames instead of %d, reprojection error %.3f px (was %.3f)"
+                  % (new_imgs, old_imgs, new_err, old_err))
+
+
+def frame_ranges(numbers, max_ranges=12):
+    """
+    [1017, 1018, 1019, 1025] -> '1017-1019, 1025'.
+
+    Artists read a shot as ranges, not as a list of every frame, and a solve can
+    easily skip fifty of them; long lists are cut off rather than filling the log.
+    """
+    nums = sorted(set(int(n) for n in numbers))
+    if not nums:
+        return ""
+    runs = [[nums[0], nums[0]]]
+    for n in nums[1:]:
+        if n == runs[-1][1] + 1:
+            runs[-1][1] = n
+        else:
+            runs.append([n, n])
+    shown = runs[:max_ranges]
+    text = ", ".join(str(a) if a == b else "%d-%d" % (a, b) for a, b in shown)
+    if len(runs) > len(shown):
+        text += ", and %d more" % (len(runs) - len(shown))
+    return text
 
 
 # -----------------------------------------------------------------------------
@@ -494,6 +559,19 @@ class TrackerWorker(QThread):
             self.video_status_signal.emit(video.name, "No Track Found ✖")
             return False
 
+        # Step 4.6: register the frames the mapper walked past (1.3).
+        #
+        # A mapper that stops at 54 of 60 frames has usually run out of patience
+        # rather than out of information - the features are in the database, the
+        # incremental loop just never came back to them. image_registrator puts
+        # them against the finished model and bundle_adjuster settles the result.
+        if extracted and best_model is not None and registered < extracted and not self.is_cancelled:
+            best_model, registered = self._register_missing(
+                best_model, registered, extracted, db_path, track_dir, env)
+            if self.is_cancelled:
+                self.video_status_signal.emit(video.name, "Cancelled")
+                return False
+
         # A camera with keys on only some frames is not a usable track: Nuke and
         # AE would interpolate across the gaps and the plate would swim. Say so
         # here, in frame counts an artist can act on, instead of reporting
@@ -510,9 +588,12 @@ class TrackerWorker(QThread):
                 self.video_status_signal.emit(video.name, f"Solved {registered}/{extracted} ✖")
                 return False
             if registered < extracted:
+                missing = frame_ranges(self._missing_timeline_frames(best_model, extracted))
+                named = f" Could not register frames {missing}." if missing else ""
                 self.log_signal.emit(
-                    f"! COLMAP solved {registered} of {extracted} frames ({coverage:.0%}). "
-                    f"The exported camera has keys only on solved frames; the "
+                    f"! COLMAP solved {registered} of {extracted} frames ({coverage:.0%})."
+                    + named +
+                    f" The exported camera has keys only on solved frames; the "
                     f"{extracted - registered} missing frame(s) will be interpolated by "
                     f"your DCC. Check those frames before relying on the track.", "#e0a000")
             else:
@@ -567,12 +648,12 @@ class TrackerWorker(QThread):
         self.log_signal.emit(f"▶ Generating Blender 1-Click Script, USD (.usda), Point Cloud (.ply), Nuke (.chan & .nk), and Alembic (.abc)...", "#ffffff")
         exported = False
         try:
-            from export_tools import export_all_formats
+            from export_tools import export_all_formats, source_sequence_plate
             b_path = self.config.get("blender_path")
             # Frame rate comes from the source clip; the exporters used to assume 30.
             if video.is_file():
                 src_fps = probe_fps(video)
-                fps_note = f"detected from {video.name}"
+                fps_note = f"probed from the clip {video.name}"
             else:
                 # An image sequence folder carries no frame rate of its own; look for a
                 # matching clip in 02 VIDEOS before falling back to a stated default.
@@ -582,23 +663,65 @@ class TrackerWorker(QThread):
                     cand = videos_dir / (base_name + ext)
                     if cand.exists():
                         src_fps = probe_fps(cand)
-                        fps_note = f"detected from {cand.name}"
+                        fps_note = f"probed from the clip {cand.name}"
                         break
                 if src_fps is None:
                     src_fps = 24.0
                     fps_note = "image sequence has no frame rate - assuming 24"
-            eff_fps = src_fps / frame_step
+
+            # A rate the artist typed wins over anything probed: sequences carry
+            # no rate at all, and a clip can be wrapped at a rate it was not shot
+            # at, which is exactly the case the probe gets wrong (1.2).
+            try:
+                ui_fps = float(self.config.get("fps"))
+            except (TypeError, ValueError):
+                ui_fps = None
+            if ui_fps and ui_fps > 0:
+                src_fps, fps_note = ui_fps, "set in the UI"
+
+            # The rate written into the exports is the plate's, never divided by
+            # the step. Dividing it made a stepped solve play back at the right
+            # speed only in a comp running at src_fps/step; the keys themselves
+            # belong every Nth frame of the real timeline instead.
+            timeline_start = int(self.config.get("timeline_start", 1))
             self.log_signal.emit(
-                f"   Frame rate for exports: {eff_fps:.3f} fps ({fps_note}"
-                + (f", step {frame_step}" if frame_step > 1 else "") + ")",
-                "#a0a0b0")
+                f"   Frame rate for exports: {src_fps:.3f} fps ({fps_note}).", "#a0a0b0")
+            if frame_step > 1:
+                self.log_signal.emit(
+                    f"   Frame step {frame_step}: camera keys land every {frame_step} frames from "
+                    f"{timeline_start} ({timeline_start}, {timeline_start + frame_step}, "
+                    f"{timeline_start + 2 * frame_step}, ...) at the plate's own "
+                    f"{src_fps:.3f} fps; your DCC interpolates in between.", "#a0a0b0")
+
+            # The extracted frames are an internal cache - renumbered from 1 and,
+            # at a frame step, not one per timeline frame. When the shot came in
+            # as an image sequence the artist already has the real plate, so the
+            # exports point at that instead.
+            plate = source_sequence_plate(video) if video.is_dir() else None
+            if plate:
+                self.log_signal.emit(
+                    f"   Plate for Nuke and Blender: your own sequence "
+                    f"{Path(plate['pattern']).name}, frames {plate['first']}-{plate['last']}.",
+                    "#a0a0b0")
+            elif frame_step > 1:
+                self.log_signal.emit(
+                    "   Plate for Nuke and Blender: the extracted frames in images/. They are "
+                    f"every {frame_step}th frame, so the Nuke script gets a TimeWarp that maps "
+                    "the timeline back onto them; Blender's background cannot step, and the "
+                    "script says so in its header.", "#a0a0b0")
+            else:
+                self.log_signal.emit(
+                    "   Plate for Nuke and Blender: the extracted frames in images/.", "#a0a0b0")
+
             exp_res = export_all_formats(
                 track_dir,
                 blender_path=b_path,
                 log_callback=lambda m, c: self.log_signal.emit(m, c),
-                fps=eff_fps,
-                start_frame=self.config.get("timeline_start", 1),
+                fps=src_fps,
+                start_frame=timeline_start,
                 colmap_exe=self.colmap_exe,
+                frame_step=frame_step,
+                source_sequence=plate,
             )
             if exp_res.get("success"):
                 exported = True
@@ -638,6 +761,85 @@ class TrackerWorker(QThread):
         self.log_signal.emit(f"✔ Successfully tracked and exported '{base_name}'! (Results in 3D_CAMERA_TRACK/{timestamp}/)", "#00ff88")
         self.video_status_signal.emit(video.name, "Completed ✔")
         return True
+
+    def _missing_timeline_frames(self, model_dir, extracted):
+        """
+        The timeline frame numbers that have no camera key.
+
+        COLMAP image ids are handed out in matching order and say nothing about
+        where a frame sits in the shot; the on-disk index does. Frame k on disk
+        is source frame 1 + (k - 1) * step, so it is timeline frame
+        timeline_start + (k - 1) * step - the number the artist sees in Nuke and
+        can go and fix by hand.
+        """
+        have = set(registered_indices(model_dir))
+        if not have:
+            return []
+        start = int(self.config.get("timeline_start", 1))
+        step = max(1, int(self.config.get("frame_step", 1) or 1))
+        return [start + (k - 1) * step for k in range(1, extracted + 1) if k not in have]
+
+    def _register_missing(self, best_model, registered, extracted, db_path, track_dir, env):
+        """
+        Add the skipped frames to the model the mapper built.
+
+        Returns (model, registered): the registered model when it is genuinely
+        better, otherwise the pair it was handed, untouched.
+        """
+        missing = extracted - registered
+        out_dir = track_dir / "sparse_registered"
+        self.log_signal.emit(
+            f"▶ Trying to register the {missing} frame(s) the mapper skipped...", "#ffffff")
+        self.progress_signal.emit(85, f"Registering {missing} skipped frame(s)...")
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        reg_cmd = [
+            str(self.colmap_exe), "image_registrator",
+            "--database_path", str(db_path),
+            "--input_path", str(best_model),
+            "--output_path", str(out_dir),
+        ]
+        if not self._run_command(reg_cmd, env, "COLMAP Image Registrator"):
+            if not self.is_cancelled:
+                self.log_signal.emit(
+                    "   Could not register the missing frames - keeping the mapper's model.",
+                    "#e0a000")
+            return best_model, registered
+        if self.is_cancelled:
+            return best_model, registered
+
+        # Poses forced in one at a time do not agree with each other until the
+        # whole model is solved again together.
+        ba_cmd = [
+            str(self.colmap_exe), "bundle_adjuster",
+            "--input_path", str(out_dir),
+            "--output_path", str(out_dir),
+        ]
+        if not self._run_command(ba_cmd, env, "COLMAP Bundle Adjuster"):
+            if not self.is_cancelled:
+                self.log_signal.emit(
+                    "   Bundle adjustment of the registered model failed - keeping the "
+                    "mapper's model.", "#e0a000")
+            return best_model, registered
+        if self.is_cancelled:
+            return best_model, registered
+
+        old_stats = model_stats(best_model)
+        new_stats = model_stats(out_dir)
+        adopt, reason = _should_adopt(
+            old_stats,
+            model_error(best_model, self.colmap_exe),
+            new_stats,
+            model_error(out_dir, self.colmap_exe),
+        )
+        if not adopt:
+            self.log_signal.emit(f"   Keeping the mapper's model: {reason}.", "#e0a000")
+            return best_model, registered
+
+        gained = new_stats[0] - old_stats[0]
+        self.log_signal.emit(
+            f"✔ Registered {gained} more frame(s) - {reason}.", "#00ff88")
+        return out_dir, new_stats[0]
 
     def _kill_process(self):
         """Stop the current child for good: terminate, wait, then kill (B7, B8)."""
