@@ -23,7 +23,7 @@ from gui.canvas import VideoPointPickerCanvas
 from gui.ui_kit import (
     tame_combos, scrollable_strip,
     card, form_row, button_row, inspector_scroll, make_button,
-    hint_label, strip, divider,
+    strip, divider,
 )
 
 
@@ -171,8 +171,10 @@ def build_2d_tab(win, tab):
     win.combo_2d_res.addItems([
         "720p (HD - Recommended)", "512p (Fast)", "1080p (Full HD)", "Original"])
     win.combo_2d_res.setToolTip(
-        "Working resolution for the tracker. Higher is more precise but much\n"
-        "heavier on VRAM - 'Original' on a 4K clip needs chunking to fit.")
+        "Size the clip is loaded at. CoTracker itself always samples every block\n"
+        "at its own fixed model resolution, so this does not make the tracking more\n"
+        "precise - it only changes how much detail survives the downscale and how\n"
+        "much RAM, VRAM upload and load time the clip costs. 720p suits most clips.")
     form_row(abody, "Resolution", win.combo_2d_res)
 
     win.spin_min_conf = QDoubleSpinBox()
@@ -280,6 +282,9 @@ def build_2d_tab(win, tab):
     win.btn_del_key.clicked.connect(win._delete_mask_keyframe_on_current)
     win.btn_next_key = make_button("Next ▶", "Next mask keyframe  ( ] )", "compact")
     win.btn_next_key.clicked.connect(win._jump_next_keyframe)
+    win.btn_del_mask = make_button(
+        "Del Mask", "Delete the selected mask with all its keyframes  (Shift+Del)", "compact")
+    win.btn_del_mask.clicked.connect(win.canvas_2d.delete_selected_mask)
 
     win.lbl_key_status = QLabel("◆ f1")
     win.lbl_key_status.setObjectName("valueChip")
@@ -287,7 +292,7 @@ def build_2d_tab(win, tab):
     win.lbl_key_status.setMinimumWidth(74)
 
     for wdg in (win.btn_prev_key, win.btn_set_key, win.btn_del_key,
-                win.btn_next_key, win.lbl_key_status):
+                win.btn_next_key, win.btn_del_mask, win.lbl_key_status):
         kbar.addWidget(wdg)
 
     divider(kbar, vertical=True)
@@ -362,7 +367,7 @@ def build_2d_tab(win, tab):
 
     win.btn_stop_2d = QPushButton("Cancel")
     win.btn_stop_2d.setObjectName("danger")
-    win.btn_stop_2d.setToolTip("Stop the running track after the current step")
+    win.btn_stop_2d.setToolTip("Stop the running track after the current block of frames")
     win.btn_stop_2d.setFixedWidth(100)
     win.btn_stop_2d.setEnabled(False)
     win.btn_stop_2d.clicked.connect(win._stop_tracking_2d)

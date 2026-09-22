@@ -23,11 +23,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "build" / "Runtime"
 
-sys.path.insert(0, str(ROOT / "build"))
-try:
-    from build_app import APP_VERSION
-except Exception:
-    APP_VERSION = "1.1.0"
+# Single source of the version: 05 SCRIPT/core/version.py
+sys.path.insert(0, str(ROOT / "05 SCRIPT"))
+from core.version import APP_VERSION  # noqa: E402
 
 # Everything the app needs that is not in git. Paths are relative to the root
 # and unpack to the same place.
@@ -38,9 +36,20 @@ FOLDERS = [
     "06 COTRACKER",
     "05 SCRIPT/gui/assets",
 ]
-SKIP_DIRS = {"__pycache__", ".git", ".pytest_cache"}
+SKIP_DIRS = {"__pycache__", ".git", ".pytest_cache", "pip-cache", ".cache"}
 SKIP_SUFFIX = {".pyc", ".pyo"}
 SKIP_NAMES = {"README.md"}          # the placeholder READMEs live in git
+
+# Build-only packages and unused binaries that would otherwise ship in the
+# runtime: PyInstaller and its hooks are needed to *make* the exe, never to run
+# the app, and ffplay.exe is a 228 MB player nothing calls.
+SKIP_DIR_PREFIXES = ("PyInstaller", "_pyinstaller_hooks_contrib",
+                     "pyinstaller-", "pyinstaller_hooks_contrib-")
+SKIP_FILES = {"ffplay.exe"}
+
+
+def _skip_dir(name):
+    return name in SKIP_DIRS or name.lower().startswith(tuple(p.lower() for p in SKIP_DIR_PREFIXES))
 
 # GitHub refuses release assets over 2 GB. Roll to a new part before a file
 # could push the current one past this, assuming the worst case (no compression).
@@ -62,10 +71,12 @@ def collect():
         if not base.is_dir():
             sys.exit("missing folder: %s" % folder)
         for dirpath, dirnames, filenames in os.walk(base):
-            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            dirnames[:] = [d for d in dirnames if not _skip_dir(d)]
             for name in filenames:
                 p = Path(dirpath) / name
                 if p.suffix in SKIP_SUFFIX or (name in SKIP_NAMES and p.parent == base):
+                    continue
+                if name.lower() in SKIP_FILES:
                     continue
                 files.append(p)
     return files

@@ -24,6 +24,10 @@ BUILD.bat clean        wipe dist/ and work/ first, then full build
 BUILD.bat exe          stop after the executable
 BUILD.bat installer    skip freezing, re-run Inno on the last build
 BUILD.bat check        verify prerequisites only, build nothing
+
+extra words, combinable with the above in any order:
+BUILD.bat ... console  debug exe with a console window (build_app.py --console)
+BUILD.bat ... noverify skip the built exe's self-test     (build_app.py --no-verify)
 ```
 
 Run `BUILD.bat check` first if you are unsure — it reports every missing piece
@@ -96,8 +100,21 @@ or `BUILD.bat installer`.
 
 ## Version number
 
-Set `APP_VERSION` near the top of `build_app.py`. It is written to
-`build/version.txt`, which `installer.iss` reads, so both halves stay in step.
+The version lives in exactly one place: `APP_VERSION` in
+`05 SCRIPT/core/version.py`. The app shows it in the title bar, status bar and
+About box; `build_app.py` imports it and writes `build/version.txt`, which
+`installer.iss` reads (and refuses to compile without); `tools/pack_runtime.py`
+names the runtime zips with it; `SETUP.bat` parses the same line to pick the
+matching GitHub release. Bump it there, build, then tag the release with the
+bare number (`1.1.0`, no `v`).
+
+## Logs and crash reports
+
+The built app has no console. Everything it prints goes to
+`%LOCALAPPDATA%\AutomatedTracker\logs\app.log` (rotating, 2 MB x 3), and an
+unhandled exception writes `error_<timestamp>.log` in the same folder and shows
+a dialog with that path. Ask users for those files. `--selftest` still writes
+`selftest.txt` next to the exe.
 
 ## Troubleshooting
 

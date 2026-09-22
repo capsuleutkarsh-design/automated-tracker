@@ -72,15 +72,16 @@ def build_3d_tab(win, tab, presets):
     )
     form_row(sbody, "Solver engine", win.combo_solver_engine)
 
+    # First token of every item must be a real COLMAP --ImageReader.camera_model
+    # name: tracker_gui.py passes currentText().split()[0] straight to COLMAP.
     win.combo_cam = QComboBox()
     win.combo_cam.addItems([
         "SIMPLE_RADIAL (Standard / Recommended)",
-        "RADIAL",
-        "OPENCV",
+        "RADIAL (Two radial terms)",
+        "OPENCV (Radial + tangential)",
         "OPENCV_FISHEYE (Wide-Angle / Action Cam)",
         "PINHOLE (Zero Distortion)",
-        "SPHERICAL (360° Panoramic VR / Insta360)",
-        "EUCM (Enhanced Unified Model / Drone Fisheye)",
+        "FULL_OPENCV (Heavy distortion / Drone Fisheye)",
     ])
     win.combo_cam.setToolTip("Lens distortion model COLMAP solves for.")
     form_row(sbody, "Camera model", win.combo_cam)

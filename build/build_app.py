@@ -26,8 +26,13 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 SRC = ROOT / "05 SCRIPT"
 
+# The version is defined once, in 05 SCRIPT/core/version.py; this file only
+# stamps it into build/version.txt for the Inno Setup script.
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+from core.version import APP_VERSION  # noqa: E402
+
 APP_NAME = "Automated_Tracker"
-APP_VERSION = "1.1.0"
 PUBLISHER = "Automated Tracker"
 
 DIST = HERE / "dist"

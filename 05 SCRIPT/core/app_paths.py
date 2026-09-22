@@ -65,6 +65,16 @@ def ffprobe_exe():
     return _first_existing(FFMPEG_DIR / "bin" / "ffprobe.exe", FFMPEG_DIR / "ffprobe.exe")
 
 
+def colmap_bat():
+    """The COLMAP.bat wrapper that sets up COLMAP's own Qt plugin path."""
+    return COLMAP_DIR / "COLMAP.bat"
+
+
+def colmap_plugins_dir():
+    """COLMAP's Qt plugin folder, wherever the distribution put it."""
+    return _first_existing(COLMAP_DIR / "plugins", COLMAP_DIR / "bin" / "plugins")
+
+
 def bundled_dir():
     """
     Read-only folder holding data files bundled into the build (sys._MEIPASS),
@@ -90,6 +100,26 @@ def writable_cache_dir():
     except Exception:
         p = Path(tempfile.gettempdir())
     return p
+
+
+def _cache_subdir(name):
+    p = writable_cache_dir() / name
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        p = Path(tempfile.gettempdir()) / "AutomatedTracker" / name
+        p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def logs_dir():
+    """%LOCALAPPDATA%\\AutomatedTracker\\logs - app.log and crash reports."""
+    return _cache_subdir("logs")
+
+
+def thumbs_dir():
+    """%LOCALAPPDATA%\\AutomatedTracker\\thumbs - scrub thumbnails."""
+    return _cache_subdir("thumbs")
 
 
 def ensure_runtime_dirs():

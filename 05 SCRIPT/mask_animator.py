@@ -6,8 +6,7 @@ Supports:
 - Dynamic spatio-temporal trajectory filtering for 2D Point Tracking (CoTracker3).
 """
 
-import math
-import numpy as np
+import copy
 from pathlib import Path
 from PIL import Image, ImageDraw
 
@@ -36,7 +35,8 @@ class MaskKeyframe:
         return {
             "frame_idx": self.frame_idx,
             "mask_type": self.mask_type,
-            "data": self.data
+            # A copy: the canvas edits kf.data in place while a config is in flight.
+            "data": copy.deepcopy(self.data)
         }
 
 
@@ -52,8 +52,6 @@ class AnimatedMask:
         self.color = color
         self.is_visible = True
         self.is_locked = False
-        self.feather_radius = 0
-        self.invert = False
         self.keyframes = {}  # frame_idx (int) -> MaskKeyframe
 
     def set_keyframe(self, frame_idx, data, mask_type=None):
@@ -130,8 +128,6 @@ class AnimatedMask:
             "color": self.color,
             "is_visible": self.is_visible,
             "is_locked": self.is_locked,
-            "feather_radius": self.feather_radius,
-            "invert": self.invert,
             "keyframes": {str(f): kf.to_dict() for f, kf in self.keyframes.items()}
         }
 
@@ -146,19 +142,23 @@ class AnimatedMask:
         )
         mask.is_visible = d.get("is_visible", True)
         mask.is_locked = d.get("is_locked", False)
-        mask.feather_radius = d.get("feather_radius", 0)
-        mask.invert = d.get("invert", False)
         kfs = d.get("keyframes", {})
         for f_str, kf_data in kfs.items():
             mask.set_keyframe(int(f_str), kf_data["data"], kf_data.get("mask_type"))
         return mask
 
 
-def export_to_nuke_roto_script(animated_masks, width, height, total_frames, output_path):
+def export_to_nuke_roto_script(animated_masks, width, height, total_frames, output_path, timeline_start=1):
     """
     Exports keyframed animated rotomasks directly as a native Foundry Nuke Roto / Bezier setup.
     Can be pasted directly into Nuke's Node Graph (Ctrl+V).
+
+    Keyframes are stored on 0-based source frames; `timeline_start` is the frame the
+    clip's first frame sits on in the comp (1, or 1001 for a numbered plate), the
+    same offset the 2D tracker exports use. `total_frames` is unused and kept only
+    so existing callers' positional arguments still line up.
     """
+    timeline_start = int(timeline_start)
     out_file = Path(output_path)
     
     script_lines = [
@@ -196,8 +196,8 @@ def export_to_nuke_roto_script(animated_masks, width, height, total_frames, outp
                     # Invert Y for Nuke (Nuke's origin (0,0) is bottom-left, screen is top-left)
                     nx = pts[pt_idx][0]
                     ny = height - pts[pt_idx][1]
-                    x_curve_parts.append(f"x{f+1} {nx:.2f}")
-                    y_curve_parts.append(f"x{f+1} {ny:.2f}")
+                    x_curve_parts.append(f"x{f + timeline_start} {nx:.2f}")
+                    y_curve_parts.append(f"x{f + timeline_start} {ny:.2f}")
 
             x_curve_str = " ".join(x_curve_parts)
             y_curve_str = " ".join(y_curve_parts)

@@ -108,6 +108,34 @@ CHEV_UP = _CHEV["chev_up.png"]
 CHEV_DOWN_ACCENT = _CHEV["chev_down_accent.png"]
 
 
+def apply_dark_palette(app):
+    """
+    Some parts of a widget are drawn by the native style, not the stylesheet -
+    combo and spin arrows most visibly. They take their colour from the palette,
+    so it has to agree with the theme or they come out dark-on-dark.
+    """
+    from PySide6.QtGui import QColor, QPalette
+
+    pal = QPalette()
+    pal.setColor(QPalette.Window, QColor(BG_APP))
+    pal.setColor(QPalette.WindowText, QColor(TEXT))
+    pal.setColor(QPalette.Base, QColor(BG_INPUT))
+    pal.setColor(QPalette.AlternateBase, QColor(BG_PANEL))
+    pal.setColor(QPalette.Text, QColor(TEXT))
+    pal.setColor(QPalette.Button, QColor(BG_RAISED))
+    pal.setColor(QPalette.ButtonText, QColor(TEXT))
+    pal.setColor(QPalette.BrightText, QColor(ERR))
+    pal.setColor(QPalette.Highlight, QColor(ACCENT_DIM))
+    pal.setColor(QPalette.HighlightedText, QColor('#ffffff'))
+    pal.setColor(QPalette.ToolTipBase, QColor(BG_RAISED))
+    pal.setColor(QPalette.ToolTipText, QColor(TEXT))
+    pal.setColor(QPalette.PlaceholderText, QColor(TEXT_MUTED))
+    pal.setColor(QPalette.Disabled, QPalette.Text, QColor(TEXT_MUTED))
+    pal.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(TEXT_MUTED))
+    pal.setColor(QPalette.Disabled, QPalette.WindowText, QColor(TEXT_MUTED))
+    app.setPalette(pal)
+
+
 DARK_STUDIO_QSS = f"""
 /* ========================================================================
    BASE

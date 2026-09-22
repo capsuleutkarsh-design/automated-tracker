@@ -2,7 +2,7 @@
 Tracking Layer Data Model and Spatial Math Utilities
 """
 
-import numpy as np
+import copy
 
 
 class TrackingLayer:
@@ -51,20 +51,27 @@ class TrackingLayer:
         return sorted(s)
 
     def to_config_dict(self):
+        # Copies, not references: the canvas keeps editing these lists while the
+        # worker thread reads the config.
         return {
             "name": self.name,
             "mode": self.mode,
             "grid_size": self.grid_size,
             "min_confidence": self.min_confidence,
-            "query_points": self.points if self.mode != "grid" else None,
+            "query_points": copy.deepcopy(self.points) if self.mode != "grid" else None,
             "animated_masks": [m.to_dict() for m in self.animated_masks],
-            "export_cornerpin": self.export_cornerpin or (self.mode == "cornerpin") or (len(self.points) == 4),
+            # Only a layer the user explicitly put in corner-pin mode gets corner-pin
+            # exports. "Has exactly 4 points" is not a corner pin - a 2x2 grid has 4.
+            "export_cornerpin": bool(self.export_cornerpin or self.mode == "cornerpin"),
             "color": self.color
         }
 
 
-def point_in_poly_canvas(x, y, poly):
-    """Ray-casting algorithm for point-in-polygon hit detection on canvas."""
+def point_in_poly(x, y, poly):
+    """
+    Ray-casting point-in-polygon test.
+    poly: list of [px, py] or (px, py) vertices.
+    """
     n = len(poly)
     if n < 3:
         return False
@@ -83,13 +90,20 @@ def point_in_poly_canvas(x, y, poly):
     return inside
 
 
-def is_pt_in_mask_canvas(x, y, mask):
-    """Checks if point (x, y) is inside mask dictionary (poly or legacy rect)."""
-    if isinstance(mask, (list, tuple)) and len(mask) == 4:
-        x1, y1, x2, y2 = mask
-        return (min(x1, x2) <= x <= max(x1, x2)) and (min(y1, y2) <= y <= max(y1, y2))
+def is_point_in_mask(x, y, mask):
+    """
+    Checks if coordinate (x, y) is inside mask dict or bounding box list.
+    Supports rectangle: {"type": "rect", "coords": [x1, y1, x2, y2]}
+    Supports polygon:   {"type": "poly", "points": [(x1, y1), (x2, y2), ...]}
+    Supports legacy:    [x1, y1, x2, y2]
+    """
+    if isinstance(mask, (list, tuple)):
+        if len(mask) == 4:
+            x1, y1, x2, y2 = mask
+            return (min(x1, x2) <= x <= max(x1, x2)) and (min(y1, y2) <= y <= max(y1, y2))
+        return False
     elif isinstance(mask, dict):
-        m_type = mask.get("type", "poly")
+        m_type = mask.get("type", "rect")
         if m_type == "rect":
             coords = mask.get("coords", [])
             if len(coords) == 4:
@@ -97,5 +111,5 @@ def is_pt_in_mask_canvas(x, y, mask):
                 return (min(x1, x2) <= x <= max(x1, x2)) and (min(y1, y2) <= y <= max(y1, y2))
         elif m_type == "poly":
             pts = mask.get("points", [])
-            return point_in_poly_canvas(x, y, pts)
+            return point_in_poly(x, y, pts)
     return False

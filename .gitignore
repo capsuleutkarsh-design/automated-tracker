@@ -22,13 +22,19 @@ _runtime_download/
 # Python caches
 __pycache__/
 *.pyc
-
-# Stale duplicate of the UI (kept on disk, not tracked)
-05 SCRIPT/gui_backup_v1/
-05 SCRIPT/test_extract/
+.pytest_cache/
 
 # Large UI background images
 05 SCRIPT/gui/assets/
 
-# Stashed torch headers, never needed by the app
-/_ATTIC/00 PYTHON/
+# Written by --selftest next to the launcher
+selftest.txt
+
+# Per-user cache (thumbnails, logs) if the app is ever pointed at the repo
+AutomatedTracker/
+
+# Personal dev configuration (Claude Code launch.json etc.)
+.claude/
+
+# Anything stashed out of the tree. Nothing live references it.
+/_ATTIC/

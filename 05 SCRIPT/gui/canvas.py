@@ -2,6 +2,7 @@
 Interactive Video Preview Canvas with Multi-Mask Roto & Point Tracking HUD
 """
 
+import uuid
 import numpy as np
 from pathlib import Path
 from PySide6.QtWidgets import QLabel, QMenu
@@ -12,7 +13,7 @@ from PySide6.QtGui import (
 )
 
 from mask_animator import AnimatedMask
-from core.tracking_layer import TrackingLayer, point_in_poly_canvas, is_pt_in_mask_canvas
+from core.tracking_layer import TrackingLayer, point_in_poly
 
 
 class VideoPointPickerCanvas(QLabel):
@@ -40,10 +41,13 @@ class VideoPointPickerCanvas(QLabel):
         """)
         self.setMinimumSize(480, 280)
         self.current_pixmap = None
-        # Cached result of scaling current_pixmap into the widget, keyed by
-        # (pixmap identity, widget width, widget height).
-        self._scaled_cache = None
-        self._scaled_key = None
+        # Scaled copies of recently shown frames at display size, keyed by frame
+        # index (plus source size, widget size and overlay/clean view), so scrubbing
+        # back and forth and looping playback never re-run SmoothTransformation on
+        # a full-resolution pixmap for a frame already scaled once.
+        self._scaled_cache = {}
+        self._scaled_cache_max = 96
+        self._source_sig = None
         self.orig_w = 1920
         self.orig_h = 1080
         self.current_frame = 0
@@ -71,6 +75,7 @@ class VideoPointPickerCanvas(QLabel):
         self.selected_vertex_idx = None
         self.is_dragging_shape = False
         self.is_dragging_vertex = False
+        self._mask_drag_dirty = False
 
     @property
     def active_layer(self):
@@ -94,8 +99,11 @@ class VideoPointPickerCanvas(QLabel):
         self.total_frames = total_frames
         self.fps = fps
         self.current_pixmap = QPixmap.fromImage(qimage)
-        self._scaled_cache = None
-        self._scaled_key = None
+        # A different clip (size or length) means every cached frame is stale.
+        sig = (orig_w, orig_h, total_frames)
+        if sig != self._source_sig:
+            self._source_sig = sig
+            self.invalidate_frame_cache()
         self.setStyleSheet("""
             background-color: #090b10;
             border: 1px solid #1c2436;
@@ -118,11 +126,9 @@ class VideoPointPickerCanvas(QLabel):
             self.masks_changed.emit()
             self.update()
 
-    def clear_points(self):
-        self.clear_active_layer_points()
-
-    def clear_boxes(self):
-        self.clear_active_layer_masks()
+    def invalidate_frame_cache(self):
+        """Drop every cached scaled frame. Call when a different clip is loaded."""
+        self._scaled_cache.clear()
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -148,16 +154,62 @@ class VideoPointPickerCanvas(QLabel):
                     return
 
     def _scaled_pixmap(self):
-        """Scaled copy of the current frame, reused until the frame or the widget size changes."""
+        """Scaled copy of the current frame at display size, cached per frame index."""
         if self.current_pixmap is None:
             return None
-        key = (self.current_pixmap.cacheKey(), self.width(), self.height())
-        if key != self._scaled_key or self._scaled_cache is None:
-            self._scaled_cache = self.current_pixmap.scaled(
+        key = (self.current_frame, self.current_pixmap.width(), self.current_pixmap.height(),
+               self.width(), self.height(), self.is_overlay_active)
+        pix = self._scaled_cache.get(key)
+        if pix is None:
+            pix = self.current_pixmap.scaled(
                 self.width(), self.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
-            self._scaled_key = key
-        return self._scaled_cache
+            if len(self._scaled_cache) >= self._scaled_cache_max:
+                # Drop the oldest entry (dicts keep insertion order).
+                self._scaled_cache.pop(next(iter(self._scaled_cache)))
+            self._scaled_cache[key] = pix
+        return pix
+
+    def _new_mask_id(self):
+        """Unique mask id. The old m_<count>_<frame> scheme repeated after a delete."""
+        return f"m_{uuid.uuid4().hex[:8]}"
+
+    def _find_or_create_mask(self, category, kind_label, mask_type):
+        """
+        The selected mask if it has this category (a new keyframe on it), otherwise a
+        new mask of the category appended to the active layer and selected.
+        """
+        if self.selected_mask_id:
+            for m in self.active_layer.animated_masks:
+                if m.id == self.selected_mask_id and m.category == category:
+                    return m
+        count = len(self.active_layer.animated_masks) + 1
+        prefix = "Inc" if category == "inclusion" else "Exc"
+        mask = AnimatedMask(self._new_mask_id(), f"{prefix} {kind_label} #{count}", category, mask_type)
+        self.active_layer.animated_masks.append(mask)
+        self.selected_mask_id = mask.id
+        return mask
+
+    def _selected_mask(self):
+        if not (self.selected_mask_id and self.active_layer):
+            return None
+        return next((m for m in self.active_layer.animated_masks if m.id == self.selected_mask_id), None)
+
+    def delete_selected_keyframe(self):
+        """Delete the selected mask's keyframe on the current frame (Del)."""
+        m = self._selected_mask()
+        if m and m.has_keyframe(self.current_frame):
+            self._delete_keyframe_on_mask(m, self.current_frame)
+            return True
+        return False
+
+    def delete_selected_mask(self):
+        """Delete the selected mask with all its keyframes (Shift+Del / Del Mask button)."""
+        m = self._selected_mask()
+        if m:
+            self._delete_entire_mask(m)
+            return True
+        return False
 
     def _view_to_orig_coords(self, pos):
         lbl_w, lbl_h = self.width(), self.height()
@@ -207,7 +259,7 @@ class VideoPointPickerCanvas(QLabel):
                                         return
                 masks_at_f = self.active_layer.get_masks_at_frame(self.current_frame)
                 for minfo in reversed(masks_at_f):
-                    if minfo["type"] == "poly" and point_in_poly_canvas(ox, oy, minfo["points"]):
+                    if minfo["type"] == "poly" and point_in_poly(ox, oy, minfo["points"]):
                         self.selected_mask_id = minfo["mask_obj"].id
                         self.is_dragging_shape = True
                         self.drag_start = (ox, oy)
@@ -247,22 +299,7 @@ class VideoPointPickerCanvas(QLabel):
     def _finish_current_poly(self):
         if len(self.current_poly) >= 3 and self.active_layer:
             category = "inclusion" if self.interaction_mode == "inclusion_poly" else "exclusion"
-            
-            target_mask = None
-            if self.selected_mask_id:
-                for m in self.active_layer.animated_masks:
-                    if m.id == self.selected_mask_id and m.category == category:
-                        target_mask = m
-                        break
-            
-            if not target_mask:
-                count = len(self.active_layer.animated_masks) + 1
-                cat_label = "Inc Poly" if category == "inclusion" else "Exc Poly"
-                m_id = f"m_{count}_{int(self.current_frame)}"
-                target_mask = AnimatedMask(m_id, f"{cat_label} #{count}", category, "poly")
-                self.active_layer.animated_masks.append(target_mask)
-                self.selected_mask_id = target_mask.id
-
+            target_mask = self._find_or_create_mask(category, "Poly", "poly")
             target_mask.set_keyframe(self.current_frame, list(self.current_poly), "poly")
             self.current_poly.clear()
             self.masks_changed.emit()
@@ -296,7 +333,8 @@ class VideoPointPickerCanvas(QLabel):
                         kf.data = [(px + dx, py + dy) for px, py in pts]
                     
                     self.drag_start = (ox, oy)
-                    self.masks_changed.emit()
+                    # Listeners rebuild lists on masks_changed; emit once on release.
+                    self._mask_drag_dirty = True
                     self.update()
 
         elif self.drag_start and self.interaction_mode in ("inclusion_box", "exclusion_box"):
@@ -314,6 +352,9 @@ class VideoPointPickerCanvas(QLabel):
             self.is_dragging_vertex = False
             self.drag_start = None
             self.selected_vertex_idx = None
+            if self._mask_drag_dirty:
+                self._mask_drag_dirty = False
+                self.masks_changed.emit()
             self.update()
 
         elif self.drag_start and self.interaction_mode in ("inclusion_box", "exclusion_box"):
@@ -322,22 +363,7 @@ class VideoPointPickerCanvas(QLabel):
             x2, y2 = ox, oy
             if abs(x2 - x1) > 5 and abs(y2 - y1) > 5 and self.active_layer:
                 category = "inclusion" if self.interaction_mode == "inclusion_box" else "exclusion"
-                
-                target_mask = None
-                if self.selected_mask_id:
-                    for m in self.active_layer.animated_masks:
-                        if m.id == self.selected_mask_id and m.category == category:
-                            target_mask = m
-                            break
-                
-                if not target_mask:
-                    count = len(self.active_layer.animated_masks) + 1
-                    cat_label = "Inc Box" if category == "inclusion" else "Exc Box"
-                    m_id = f"m_{count}_{int(self.current_frame)}"
-                    target_mask = AnimatedMask(m_id, f"{cat_label} #{count}", category, "rect")
-                    self.active_layer.animated_masks.append(target_mask)
-                    self.selected_mask_id = target_mask.id
-
+                target_mask = self._find_or_create_mask(category, "Box", "rect")
                 target_mask.set_keyframe(self.current_frame, [x1, y1, x2, y2], "rect")
                 self.masks_changed.emit()
 
@@ -371,7 +397,7 @@ class VideoPointPickerCanvas(QLabel):
         if self.active_layer:
             masks_at_f = self.active_layer.get_masks_at_frame(self.current_frame)
             for minfo in reversed(masks_at_f):
-                if minfo["type"] == "poly" and point_in_poly_canvas(ox, oy, minfo["points"]):
+                if minfo["type"] == "poly" and point_in_poly(ox, oy, minfo["points"]):
                     clicked_mask_info = minfo
                     break
 
@@ -461,10 +487,11 @@ class VideoPointPickerCanvas(QLabel):
             self.update()
             event.accept()
         elif key in (Qt.Key_Delete, Qt.Key_Backspace):
-            if self.selected_mask_id and self.active_layer:
-                m = next((mask for mask in self.active_layer.animated_masks if mask.id == self.selected_mask_id), None)
-                if m:
-                    self._delete_entire_mask(m)
+            # Del removes only the keyframe under the playhead; Shift+Del the whole mask.
+            if event.modifiers() & Qt.ShiftModifier:
+                self.delete_selected_mask()
+            else:
+                self.delete_selected_keyframe()
             event.accept()
         else:
             super().keyPressEvent(event)

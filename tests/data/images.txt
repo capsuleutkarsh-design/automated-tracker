@@ -1,0 +1,9 @@
+# Image list with two lines of data per image:
+#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME
+#   POINTS2D[] as (X, Y, POINT3D_ID)
+# Number of images: 2, mean observations per image: 1
+# frame_000001.png was NOT registered - the common case that used to shift every key (A1).
+7 1 0 0 0 0 0 0 5 frame_000002.png
+100.5 200.5 1 300.5 400.5 -1
+8 0 1 0 0 1 2 3 5 frame_000003.png
+

@@ -16,6 +16,12 @@ setlocal EnableDelayedExpansion
 ::    BUILD.bat exe          stop after the executable, skip the installer
 ::    BUILD.bat installer    skip freezing, just re-run Inno on the last build
 ::    BUILD.bat check        only verify prerequisites
+::
+::  Extra words, in any order and combinable with the above:
+::    console                debug exe with a console window (--console)
+::    noverify               skip the built exe's self-test   (--no-verify)
+::
+::    e.g.  BUILD.bat clean console      BUILD.bat exe noverify
 :: ==========================================================================
 
 pushd "%~dp0" >nul
@@ -26,14 +32,22 @@ set "ROOT=%cd%"
 popd >nul
 
 set "PY=%ROOT%\00 PYTHON\python.exe"
-set "MODE=%~1"
-if "%MODE%"=="" set "MODE=all"
+set "MODE=all"
+set "EXTRA="
+for %%A in (%*) do (
+    if /i "%%~A"=="console"  set "EXTRA=!EXTRA! --console"
+    if /i "%%~A"=="noverify" set "EXTRA=!EXTRA! --no-verify"
+    if /i "%%~A"=="clean"     set "MODE=clean"
+    if /i "%%~A"=="exe"       set "MODE=exe"
+    if /i "%%~A"=="installer" set "MODE=installer"
+    if /i "%%~A"=="check"     set "MODE=check"
+)
 
 echo.
 echo ================================================================
 echo   Automated Tracker build
 echo   root : %ROOT%
-echo   mode : %MODE%
+echo   mode : %MODE%%EXTRA%
 echo ================================================================
 echo.
 
@@ -76,9 +90,9 @@ if "%MODE%"=="check" (
 if /i not "%MODE%"=="installer" (
     echo [build] ---- step 1 of 2 : building the executable ----
     if /i "%MODE%"=="clean" (
-        "%PY%" "%BUILD_DIR%\build_app.py" --clean
+        "%PY%" "%BUILD_DIR%\build_app.py" --clean%EXTRA%
     ) else (
-        "%PY%" "%BUILD_DIR%\build_app.py"
+        "%PY%" "%BUILD_DIR%\build_app.py"%EXTRA%
     )
     if errorlevel 1 (
         echo.

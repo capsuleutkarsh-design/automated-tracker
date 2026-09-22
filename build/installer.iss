@@ -19,11 +19,14 @@
 #define SrcRoot        ".."
 #define DistDir        "dist\Automated_Tracker"
 
-; version.txt is written by build_app.py; fall back if it is not there yet
-#ifexist "version.txt"
-  #define AppVersion Trim(FileRead(FileOpen("version.txt")))
+; version.txt is written by build_app.py from 05 SCRIPT\core\version.py, the
+; single source of the version. Resolve it against this script's own folder,
+; not the compiler's working directory, and refuse to build without it rather
+; than silently stamping a stale number.
+#ifexist SourcePath + "\version.txt"
+  #define AppVersion Trim(FileRead(FileOpen(SourcePath + "\version.txt")))
 #else
-  #define AppVersion "1.1.0"
+  #error version.txt is missing - run build_app.py (or BUILD.bat) first
 #endif
 
 [Setup]
@@ -70,7 +73,8 @@ Source: "{#DistDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs cr
 ; ---- external tools the app runs -------------------------------------------
 Source: "{#SrcRoot}\01 COLMAP\*"; DestDir: "{app}\01 COLMAP"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#SrcRoot}\03 FFMPEG\*"; DestDir: "{app}\03 FFMPEG"; \
+; ffplay.exe is a 228 MB media player the app never runs
+Source: "{#SrcRoot}\03 FFMPEG\*"; DestDir: "{app}\03 FFMPEG"; Excludes: "ffplay.exe"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; ---- CoTracker weights (the python package itself is inside the exe) --------
@@ -80,6 +84,11 @@ Source: "{#SrcRoot}\06 COTRACKER\checkpoints\*"; DestDir: "{app}\06 COTRACKER\ch
 ; ---- optional sample footage ------------------------------------------------
 Source: "{#SrcRoot}\02 VIDEOS\*"; DestDir: "{app}\02 VIDEOS"; \
     Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist; Tasks: sampleclip
+
+[InstallDelete]
+; PyInstaller's _internal folder is replaced wholesale on upgrade. Without this,
+; modules dropped between releases would linger and shadow the new ones.
+Type: filesandordirs; Name: "{app}\_internal"
 
 [Dirs]
 ; Working folders the app writes into. Users are not admins at run time, so
@@ -97,9 +106,13 @@ Name: "{autodesktop}\{#AppName}";  Filename: "{app}\{#AppExeName}"; Tasks: deskt
 Filename: "{app}\{#AppExeName}"; Description: "Launch {#AppName}"; \
     Flags: nowait postinstall skipifsilent
 
-[UninstallDelete]
-; Generated caches - leave the user's own scenes and media alone
-Type: filesandordirs; Name: "{localappdata}\AutomatedTracker"
+; No [UninstallDelete] for the per-user cache (%LOCALAPPDATA%\AutomatedTracker).
+; The uninstaller runs elevated, so {localappdata} resolves to the *elevating*
+; account's profile - which is not necessarily the person who used the app, and
+; deleting inside another user's profile is exactly what an uninstaller must
+; not do. The cache is small and self-limiting anyway: thumbnails are pruned
+; at every start and app.log rotates at 2 MB. Users who want it gone delete
+; %LOCALAPPDATA%\AutomatedTracker themselves.
 
 [Code]
 function InitializeSetup(): Boolean;

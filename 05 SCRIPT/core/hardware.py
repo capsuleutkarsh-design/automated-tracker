@@ -2,8 +2,6 @@
 Real-time Hardware Monitoring for NVIDIA GPUs (NVML Ctypes and nvidia-smi fallback)
 """
 
-import os
-import time
 import threading
 import subprocess
 import ctypes
@@ -43,6 +41,9 @@ class GPUInfoProvider:
         self._offline_lock = threading.Lock()
         self._offline_thread = None
         self._offline_stop = threading.Event()
+        # nvidia-smi is either installed or it is not; once it has failed to
+        # launch there is no point spawning it again every poll.
+        self._smi_missing = False
         self._init_nvml()
 
     def _init_nvml(self):
@@ -75,17 +76,24 @@ class GPUInfoProvider:
             'vram_pct': 0
         }
 
+    # Without NVML each reading costs a process launch, so poll slowly.
+    FALLBACK_INTERVAL_S = 10.0
+
     def _start_offline_worker(self):
         """Refreshes the slow fallbacks off the caller's thread."""
-        if self._offline_thread is not None:
+        if self._offline_thread is not None or self._offline_stop.is_set():
             return
 
         def _loop():
-            while not self._offline_stop.wait(0.0):
+            while not self._offline_stop.is_set():
                 reading = self._query_slow_fallbacks()
                 with self._offline_lock:
                     self._offline_cache = reading
-                if self._offline_stop.wait(2.0):
+                # Nothing left to poll: no nvidia-smi and no CUDA torch. The
+                # reading cannot change, so let the thread end.
+                if self._smi_missing and not reading['available']:
+                    break
+                if self._offline_stop.wait(self.FALLBACK_INTERVAL_S):
                     break
 
         self._offline_thread = threading.Thread(
@@ -93,8 +101,18 @@ class GPUInfoProvider:
         )
         self._offline_thread.start()
 
-    def stop(self):
+    def stop(self, timeout=2.0):
+        """Stop the fallback poller. Safe to call more than once."""
         self._offline_stop.set()
+        t = self._offline_thread
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout)
+        if self._has_nvml and self._nvml is not None:
+            try:
+                self._nvml.nvmlShutdown()
+            except Exception:
+                pass
+            self._has_nvml = False
 
     def query(self) -> Dict[str, any]:
         """
@@ -142,8 +160,10 @@ class GPUInfoProvider:
     def _query_slow_fallbacks(self) -> Dict[str, any]:
         # nvidia-smi fallback (silent, no window)
         try:
+            if self._smi_missing:
+                raise FileNotFoundError('nvidia-smi')
             cmd = ['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total,name', '--format=csv,noheader,nounits']
-            res = subprocess.run(cmd, text=True, timeout=1, **hidden_kwargs(capture=True))
+            res = subprocess.run(cmd, text=True, timeout=3, **hidden_kwargs(capture=True))
             if res.returncode == 0 and res.stdout.strip():
                 parts = [p.strip() for p in res.stdout.strip().split(',')]
                 if len(parts) >= 4:
@@ -160,6 +180,8 @@ class GPUInfoProvider:
                         'total_mb': total_mb,
                         'vram_pct': vram_pct
                     }
+        except FileNotFoundError:
+            self._smi_missing = True
         except Exception:
             pass
 

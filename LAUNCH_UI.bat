@@ -10,12 +10,14 @@ set "SCRIPT_PY=%TOP%\05 SCRIPT\tracker_gui.py"
 set "COLMAP_DIR=%TOP%\01 COLMAP"
 set "FFMPEG_DIR=%TOP%\03 FFMPEG"
 
-:: Add local binaries and embedded python to PATH
+:: Add local binaries and embedded python to PATH.
+:: QT_PLUGIN_PATH is deliberately NOT set here: COLMAP's Qt5 plugins must not
+:: leak into the Qt6 (PySide6) GUI process. core\workers.py sets it for the
+:: COLMAP child processes only.
 set "PATH=%COLMAP_DIR%\bin;%FFMPEG_DIR%\bin;%COLMAP_DIR%;%FFMPEG_DIR%;%TOP%\00 PYTHON;%TOP%\00 PYTHON\Scripts;%PATH%"
-set "QT_PLUGIN_PATH=%COLMAP_DIR%\plugins;%QT_PLUGIN_PATH%"
 
 if exist "%LOCAL_PY%" (
-    echo Starting Automated_Tracker_V001.1 GUI...
+    echo Starting Automated Tracker...
     "%LOCAL_PY%" "%SCRIPT_PY%"
     if %errorlevel% neq 0 (
         echo.

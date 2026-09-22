@@ -6,12 +6,12 @@ so every exported curve landed on the wrong timing for anything that was not
 shot at that rate. Everything now asks this module instead.
 """
 
-import os
+import re
 import json
 import subprocess
 from pathlib import Path
 
-from core.app_paths import BASE_DIR, ffprobe_exe as _resolved_ffprobe
+from core.app_paths import ffprobe_exe as _resolved_ffprobe
 from core.proc import hidden_kwargs
 
 DEFAULT_FPS = 24.0
@@ -141,8 +141,6 @@ def detect_sequence_start(folder, default=1):
 
     Returns `default` when the folder is not a numbered sequence.
     """
-    import re
-
     folder = Path(folder)
     if not folder.is_dir():
         return int(default)

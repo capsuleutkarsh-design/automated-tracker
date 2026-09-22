@@ -51,13 +51,24 @@ release as zip parts. After cloning, run once:
 SETUP.bat
 ```
 
-It downloads the parts, verifies their checksums and unpacks them into place,
-using only tools that ship with Windows (curl, certutil, tar). Then start the
-app with:
+It downloads the parts for the release that matches this checkout (the version
+in `05 SCRIPT/core/version.py`), verifies their checksums and unpacks them into
+place, using only tools that ship with Windows (curl, certutil, tar). Then
+start the app with:
 
 ```
 LAUNCH_UI.bat
 ```
+
+Batch solving is done from the app: select several shots in the media table
+(or none, for all of them) and start the 3D solve. The old standalone
+`RUN_BATCH.bat` / `batch_reconstruct.bat` COLMAP pipeline duplicated the
+worker with different settings and has been removed.
+
+Settings (window layout, Blender path, solver and tracker options, last clip)
+persist between runs. Logs and crash reports go to
+`%LOCALAPPDATA%\AutomatedTracker\logs`; `LAUNCH_UI.bat` (or the built exe)
+with `--selftest` writes a `selftest.txt` health report.
 
 The folder is a portable layout: `00 PYTHON` (bundled interpreter),
 `01 COLMAP`, `02 VIDEOS` (drop clips here), `03 FFMPEG`, `04 SCENES` (output),

@@ -12,6 +12,11 @@ setlocal EnableDelayedExpansion
 ::    SETUP.bat            download what is missing and unpack
 ::    SETUP.bat force      re-download and unpack everything
 ::
+::  The release to fetch from is the one matching this checkout: the tag is read
+::  from 05 SCRIPT\core\version.py (APP_VERSION = "x.y.z"), so an older clone
+::  never downloads a newer, mismatched runtime. Release tags are the bare
+::  version number, e.g. "1.1.0".
+::
 ::  Set ATRACK_RUNTIME_URL to fetch the parts from somewhere else, e.g. a
 ::  local folder:  set ATRACK_RUNTIME_URL=file:///D:/runtime
 :: ==========================================================================
@@ -20,8 +25,29 @@ pushd "%~dp0" >nul
 set "ROOT=%cd%"
 popd >nul
 
+set "VERSION_PY=%ROOT%\05 SCRIPT\core\version.py"
+set "VER="
+if exist "%VERSION_PY%" (
+    for /f "tokens=2 delims==" %%V in ('findstr /b /c:"APP_VERSION" "%VERSION_PY%"') do (
+        if not defined VER set "VER=%%V"
+    )
+)
+if defined VER (
+    set "VER=!VER:"=!"
+    set "VER=!VER: =!"
+)
+
 set "BASE=%ATRACK_RUNTIME_URL%"
-if "%BASE%"=="" set "BASE=https://github.com/capsuleutkarsh-design/automated-tracker/releases/latest/download"
+if "%BASE%"=="" (
+    if not defined VER (
+        echo [setup] ERROR: could not read APP_VERSION from
+        echo         %VERSION_PY%
+        echo         Set ATRACK_RUNTIME_URL to the release download URL instead.
+        pause
+        exit /b 1
+    )
+    set "BASE=https://github.com/capsuleutkarsh-design/automated-tracker/releases/download/!VER!"
+)
 set "DL=%ROOT%\_runtime_download"
 set "MODE=%~1"
 
@@ -35,6 +61,7 @@ echo.
 echo ================================================================
 echo   Automated Tracker - runtime setup
 echo   folder : %ROOT%
+echo   version: %VER%
 echo   source : %BASE%
 echo ================================================================
 echo.

@@ -6,8 +6,12 @@ Modular Main Coordinator & GUI Application Window
 import sys
 import os
 import shutil
-import subprocess
 import random
+import logging
+import logging.handlers
+import threading
+import traceback
+import datetime
 from pathlib import Path
 
 try:
@@ -17,12 +21,13 @@ try:
         QInputDialog, QColorDialog, QListWidgetItem, QStackedLayout,
         QGraphicsOpacityEffect
     )
-    from PySide6.QtCore import Qt, QTimer
+    from PySide6.QtCore import Qt, QTimer, QSettings, QThread, QObject, Signal
     from PySide6.QtGui import (
-        QColor, QImage, QPixmap, QPainter, QDragEnterEvent, QDropEvent, QPalette
+        QColor, QImage, QPixmap, QDragEnterEvent, QDropEvent
     )
 except ImportError:
-    print("[ERROR] PySide6 is not installed. Please run launch_gui.bat or install it via: pip install PySide6")
+    print("[ERROR] PySide6 is not installed. Please run LAUNCH_UI.bat (it uses the bundled "
+          "00 PYTHON interpreter) or install it via: pip install PySide6")
     sys.exit(1)
 
 # Running from source, the package folder has to be importable. Frozen, the
@@ -32,22 +37,30 @@ if not getattr(sys, 'frozen', False) and str(_here) not in sys.path:
     sys.path.insert(0, str(_here))
 
 from core.app_paths import (
-    BASE_DIR, COLMAP_DIR, VIDEOS_DIR, FFMPEG_DIR, SCENES_DIR, COTRACKER_DIR,
-    colmap_exe, ffmpeg_exe, ensure_runtime_dirs,
+    BASE_DIR, COLMAP_DIR, VIDEOS_DIR, FFMPEG_DIR, SCENES_DIR,
+    colmap_exe, ffmpeg_exe, colmap_bat, colmap_plugins_dir, ensure_runtime_dirs,
+    logs_dir, thumbs_dir,
 )
+from core.version import APP_VERSION, display_version
 
-SCRIPT_DIR = _here
+# The self-test exists to diagnose an install that will not start, so it runs
+# before the GUI package is imported - a broken gui module must not hide it.
+if __name__ == "__main__" and "--selftest" in sys.argv:
+    from core.selftest import run_selftest
+    sys.exit(run_selftest())
+
 COLMAP_EXE = colmap_exe()
 FFMPEG_EXE = ffmpeg_exe()
-COLMAP_BAT = COLMAP_DIR / "COLMAP.bat"
+COLMAP_BAT = colmap_bat()
 
 # A fresh install ships without these; the app writes into them.
 ensure_runtime_dirs()
 
+log = logging.getLogger("tracker_gui")
+
 # Import Modular GUI & Core Components
 from gui.theme import (
-    DARK_STUDIO_QSS, OK, ERR, TEXT, TEXT_MUTED,
-    BG_APP, BG_PANEL, BG_INPUT, BG_RAISED, ACCENT_DIM,
+    DARK_STUDIO_QSS, OK, ERR, WARN, ACCENT, TEXT_DIM, apply_dark_palette,
 )
 from gui.tab_3d import build_3d_tab
 from gui.tab_2d import build_2d_tab
@@ -56,138 +69,79 @@ from core.workers import TrackerWorker, CoTrackerWorker, FrameExtractorWorker
 from core.hardware import gpu_monitor
 from core.proc import run_hidden, popen_gui
 from core.media_info import probe_fps, probe_frame_count, detect_sequence_start
+from core.presets import PRESETS, DEFAULT_PRESET
+from core.media_pool import (
+    VIDEO_EXTS, scan_media_pool, find_latest_output,
+    thumb_path, prune_thumb_cache,
+)
 
-PRESETS = {
-    "Handheld / Walking (Recommended)": {
-        "description": "Optimized for moving camera shots (walking, crane, handheld). Uses a low initial triangulation angle and allows forward-dominant motion, which COLMAP otherwise rejects on walk-forward shots.",
-        "solver_engine": "Incremental",
-        "tri_angle": 2.5,
-        "init_max_forward_motion": 1.0,
-        "overlap": 35,
-        "inliers": 40,
-        "camera_model": "SIMPLE_RADIAL",
-        "single_camera": True,
-        "use_gpu": True,
-        "max_image_size": 4096,
-        "frame_step": 1
-    },
-    "Hierarchical Multi-Cluster (Long Shots)": {
-        "description": "Splits a long shot into overlapping clusters and solves them in parallel before merging, which is faster than a single incremental pass on long takes. Falls back to the incremental mapper automatically if the cluster solve fails.",
-        "solver_engine": "Hierarchical",
-        "tri_angle": 2.5,
-        "init_max_forward_motion": 1.0,
-        "overlap": 35,
-        "inliers": 40,
-        "camera_model": "SIMPLE_RADIAL",
-        "single_camera": True,
-        "use_gpu": True,
-        "max_image_size": 4096,
-        "frame_step": 1
-    },
-    "360° VR / Panoramic (Insta360 / GoPro Max)": {
-        "description": "Native spherical equirectangular camera model for 360 VR cameras and panoramic video stitches.",
-        "solver_engine": "Incremental",
-        "tri_angle": 3.0,
-        "init_max_forward_motion": 1.0,
-        "overlap": 25,
-        "inliers": 50,
-        "camera_model": "SPHERICAL",
-        "single_camera": True,
-        "use_gpu": True,
-        "max_image_size": 4096,
-        "frame_step": 1
-    },
-    "Drone / Aerial Orbit": {
-        "description": "Optimized for outdoor and high-altitude shots with wide parallax and high keypoint count.",
-        "solver_engine": "Incremental",
-        "tri_angle": 12.0,
-        "init_max_forward_motion": 0.95,
-        "overlap": 20,
-        "inliers": 100,
-        "camera_model": "OPENCV",
-        "single_camera": True,
-        "use_gpu": True,
-        "max_image_size": 4096,
-        "frame_step": 1
-    },
-    "Slow / Subtle Motion (Small Movement)": {
-        "description": "Very forgiving on small camera movements. Subsamples frames to increase baseline and lowers initialization angle.",
-        "solver_engine": "Incremental",
-        "tri_angle": 3.0,
-        "init_max_forward_motion": 1.0,
-        "overlap": 15,
-        "inliers": 40,
-        "camera_model": "SIMPLE_RADIAL",
-        "single_camera": True,
-        "use_gpu": True,
-        "max_image_size": 4096,
-        "frame_step": 2
-    },
-    "Fast Action / Quick Turns": {
-        "description": "Increases matching overlap window (30 frames) to maintain tracking during rapid camera motion.",
-        "solver_engine": "Incremental",
-        "tri_angle": 8.0,
-        "init_max_forward_motion": 1.0,
-        "overlap": 30,
-        "inliers": 50,
-        "camera_model": "SIMPLE_RADIAL",
-        "single_camera": True,
-        "use_gpu": True,
-        "max_image_size": 4096,
-        "frame_step": 1
-    },
-    "Action Cam / GoPro / Fisheye": {
-        "description": "Uses Fisheye distortion model for wide-angle and action camera lenses.",
-        "solver_engine": "Incremental",
-        "tri_angle": 6.0,
-        "init_max_forward_motion": 1.0,
-        "overlap": 20,
-        "inliers": 60,
-        "camera_model": "OPENCV_FISHEYE",
-        "single_camera": True,
-        "use_gpu": True,
-        "max_image_size": 4096,
-        "frame_step": 1
-    },
-    "Standard / Default": {
-        "description": "Default COLMAP settings.",
-        "solver_engine": "Incremental",
-        "tri_angle": 16.0,
-        "init_max_forward_motion": 1.0,
-        "overlap": 15,
-        "inliers": 100,
-        "camera_model": "SIMPLE_RADIAL",
-        "single_camera": True,
-        "use_gpu": True,
-        "max_image_size": 4096,
-        "frame_step": 1
-    },
-    "Custom (Manual Tuning)": {
-        "description": "Unlock all parameters for full manual control.",
-        "solver_engine": "Incremental",
-        "tri_angle": 6.0,
-        "init_max_forward_motion": 1.0,
-        "overlap": 20,
-        "inliers": 60,
-        "camera_model": "SIMPLE_RADIAL",
-        "single_camera": True,
-        "use_gpu": True,
-        "max_image_size": 4096,
-        "frame_step": 1
-    }
-}
+# QSettings identity - registry key on Windows.
+SETTINGS_ORG = "AutomatedTracker"
+SETTINGS_APP = "AutomatedTracker"
+
+
+class MediaCopyWorker(QThread):
+    """
+    Copies clips into 02 VIDEOS off the GUI thread. A multi-GB plate used to
+    freeze the window for the whole copy, and a permission error vanished.
+
+    jobs: list of (src_path, overwrite)
+    """
+    progress_signal = Signal(str)            # status text
+    finished_signal = Signal(list, list)     # copied names, "name: error" strings
+
+    def __init__(self, jobs, dest_dir):
+        super().__init__()
+        self.jobs = [(Path(s), bool(o)) for s, o in jobs]
+        self.dest_dir = Path(dest_dir)
+
+    def run(self):
+        copied, errors = [], []
+        total = len(self.jobs)
+        for i, (src, overwrite) in enumerate(self.jobs, start=1):
+            dst = self.dest_dir / src.name
+            try:
+                self.dest_dir.mkdir(parents=True, exist_ok=True)
+                if src.resolve() == dst.resolve():
+                    continue
+                if dst.exists() and not overwrite:
+                    errors.append("%s: already in the media pool (not replaced)" % src.name)
+                    continue
+                size_mb = src.stat().st_size / (1024 * 1024)
+                self.progress_signal.emit(
+                    "Importing %d/%d: %s (%.0f MB)..." % (i, total, src.name, size_mb))
+                shutil.copy2(src, dst)
+                copied.append(src.name)
+            except Exception as e:
+                errors.append("%s: %s" % (src.name, e))
+        self.finished_signal.emit(copied, errors)
 
 
 class TrackerMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Automated_Tracker_V001.1 — VFX Studio (3D SfM & 2D AI Motion Tracker)")
+        self.setWindowTitle("Automated Tracker %s — VFX Studio (3D SfM & 2D AI Motion Tracker)"
+                            % display_version())
         self.resize(1280, 850)
         self.setMinimumSize(1000, 680)
         self.setAcceptDrops(True)
         self.worker_3d = None
         self.worker_2d = None
+        # Exactly one frame extractor at a time. A request that arrives while
+        # one is running is parked here and started when it finishes.
         self.frame_extractor = None
+        self._pending_extract = None
+        self.copy_worker = None
+        self._pending_imports = []
+        self._closing = False
+
+        self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        self._last_clip = self.settings.value("media/last_clip", "", type=str)
+        # Settings are written a moment after the last change, not on every tick.
+        self._settings_timer = QTimer(self)
+        self._settings_timer.setSingleShot(True)
+        self._settings_timer.setInterval(1500)
+        self._settings_timer.timeout.connect(self._save_settings)
 
         # Video Player State for 2D Tab
         # Real frame rate of the selected clip. Used for playback speed, the timecode
@@ -208,6 +162,8 @@ class TrackerMainWindow(QMainWindow):
         self._setup_style()
         self._init_ui()
         self._on_preset_changed(self.preset_combo.currentText())
+        self._load_settings()
+        self._wire_settings_autosave()
 
         # Deferred init for fast UI display
         QTimer.singleShot(20, self._deferred_init)
@@ -228,29 +184,48 @@ class TrackerMainWindow(QMainWindow):
         return px if not px.isNull() else None
 
     def _deferred_init(self):
+        # A saved Blender path wins over auto-detection.
+        if not self.txt_blender_path.text().strip():
+            try:
+                from export_tools import find_blender_executable
+                detected_b = find_blender_executable()
+                if detected_b:
+                    self.txt_blender_path.setText(str(detected_b))
+            except Exception as e:
+                self._status("Blender auto-detect failed: %s" % e, error=True)
+
+        # Old thumbnails cost disk for nothing; keep the cache bounded.
         try:
-            from export_tools import find_blender_executable
-            detected_b = find_blender_executable()
-            if detected_b:
-                self.txt_blender_path.setText(str(detected_b))
-        except Exception:
-            pass
+            removed = prune_thumb_cache(thumbs_dir())
+            if removed:
+                log.info("pruned %d thumbnail(s) from %s", removed, thumbs_dir())
+        except Exception as e:
+            log.warning("thumbnail cache prune failed: %s", e)
 
         # A frozen build has no console, so an exception here would vanish and
         # leave an empty media list with no explanation.
         try:
             self._refresh_videos()
         except Exception as e:
+            log.exception("media folder unreadable")
             self._append_log_3d(
-                f"✖ Could not read the media folder: {e}", "#ff4b4b")
+                f"✖ Could not read the media folder: {e}", ERR)
             self._append_log_2d(
-                f"✖ Could not read the media folder: {e}", "#ff4b4b")
+                f"✖ Could not read the media folder: {e}", ERR)
             QMessageBox.warning(
                 self, "Media Folder Unreadable",
                 "Could not read:\n%s\n\n%s\n\n"
                 "Check the folder exists and you have permission to read it."
                 % (VIDEOS_DIR, e))
         self._update_hardware_monitor()
+
+    def _status(self, text, error=False):
+        """Status-bar message that is also written to app.log (C19)."""
+        try:
+            self.status_msg.setText(text)
+        except Exception:
+            pass
+        (log.error if error else log.info)(text)
 
     @staticmethod
     def _set_chip_state(widget, state):
@@ -394,7 +369,7 @@ class TrackerMainWindow(QMainWindow):
         self.status_colmap = QLabel("COLMAP: Ready")
         self.status_colmap.setObjectName("statusChip")
 
-        self.status_ver = QLabel("v001.1")
+        self.status_ver = QLabel(display_version())
         self.status_ver.setObjectName("statusChip")
 
         statusbar.addPermanentWidget(self.status_gpu)
@@ -403,14 +378,13 @@ class TrackerMainWindow(QMainWindow):
         statusbar.addPermanentWidget(self.status_ver)
 
     def _open_colmap_gui(self):
-        colmap_bat = COLMAP_EXE.parent.parent / "COLMAP.bat"
-        if colmap_bat.exists():
+        if COLMAP_BAT.exists():
             # Use the .bat wrapper which sets up Qt plugin paths
-            popen_gui([str(colmap_bat), "gui"])
+            popen_gui([str(COLMAP_BAT), "gui"])
         elif COLMAP_EXE.exists():
             # Set QT_PLUGIN_PATH for COLMAP's own Qt libraries
             env = os.environ.copy()
-            plugins_dir = COLMAP_EXE.parent.parent / "plugins"
+            plugins_dir = colmap_plugins_dir()
             if plugins_dir.exists():
                 env["QT_PLUGIN_PATH"] = str(plugins_dir)
             popen_gui([str(COLMAP_EXE), "gui"], env=env)
@@ -421,16 +395,17 @@ class TrackerMainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "About Automated Tracker",
-            "AUTOMATED TRACKER V001.1\n\n"
+            "AUTOMATED TRACKER %s\n\n"
             "VFX Studio Camera Tracking & 2D Motion Tracking System\n"
             "Engines: COLMAP (3D SfM) & Meta CoTracker3 (2D Point Tracking)\n"
-            "Pipeline Integrations: Blender (.abc) & Foundry Nuke (.nk / .abc)"
+            "Pipeline Integrations: Blender (.abc) & Foundry Nuke (.nk / .abc)\n\n"
+            "Logs: %s" % (display_version(), logs_dir())
         )
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
-                if Path(url.toLocalFile()).suffix.lower() in {".mp4", ".mov", ".avi", ".mkv", ".m4v"}:
+                if Path(url.toLocalFile()).suffix.lower() in VIDEO_EXTS:
                     event.acceptProposedAction()
                     return
 
@@ -438,18 +413,52 @@ class TrackerMainWindow(QMainWindow):
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
                 filepath = url.toLocalFile()
-                if Path(filepath).suffix.lower() in {".mp4", ".mov", ".avi", ".mkv", ".m4v"}:
+                if Path(filepath).suffix.lower() in VIDEO_EXTS:
                     event.acceptProposedAction()
                     self._import_dropped_video(filepath)
                     return
 
     def _import_dropped_video(self, filepath):
-        VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
-        src = Path(filepath)
-        dst = VIDEOS_DIR / src.name
-        if src.resolve() != dst.resolve():
-            shutil.copy2(src, dst)
+        # A dropped clip replaces one of the same name, as it always did.
+        self._import_media_files([filepath], overwrite=True)
+
+    def _import_media_files(self, files, overwrite=False):
+        """
+        Copy clips into 02 VIDEOS on a worker thread (B14). One copy runs at a
+        time; further requests queue behind it.
+        """
+        jobs = [(f, overwrite) for f in files]
+        if self.copy_worker is not None and self.copy_worker.isRunning():
+            self._pending_imports.extend(jobs)
+            self._status("Import queued (%d file(s) waiting)" % len(self._pending_imports))
+            return
+        self.copy_worker = MediaCopyWorker(jobs, VIDEOS_DIR)
+        self.copy_worker.progress_signal.connect(self._status)
+        self.copy_worker.finished_signal.connect(self._on_copy_finished)
+        self._status("Importing %d file(s)..." % len(jobs))
+        self.copy_worker.start()
+
+    def _on_copy_finished(self, copied, errors):
+        for name in copied:
+            self._append_log_3d(f"✔ Imported {name} into 02 VIDEOS.", OK)
+        for err in errors:
+            self._append_log_3d(f"✖ Import failed - {err}", ERR)
+            log.error("import failed: %s", err)
+        if errors:
+            QMessageBox.warning(
+                self, "Import Problems",
+                "%d file(s) could not be imported:\n\n%s" % (len(errors), "\n".join(errors[:12])))
+        self._status("Imported %d file(s)%s" % (
+            len(copied), (", %d failed" % len(errors)) if errors else ""))
+        if copied:
+            self._last_clip = copied[-1]
         self._refresh_videos()
+        if self._pending_imports and not self._closing:
+            jobs, self._pending_imports = self._pending_imports, []
+            self.copy_worker = MediaCopyWorker(jobs, VIDEOS_DIR)
+            self.copy_worker.progress_signal.connect(self._status)
+            self.copy_worker.finished_signal.connect(self._on_copy_finished)
+            self.copy_worker.start()
 
     def _update_hardware_monitor(self):
         try:
@@ -467,8 +476,12 @@ class TrackerMainWindow(QMainWindow):
             else:
                 self.status_gpu.setText("Device: CPU Mode")
                 self._set_chip_state(self.status_gpu, "idle")
-        except Exception:
-            self.status_gpu.setText("GPU: Ready")
+        except Exception as e:
+            self.status_gpu.setText("GPU: Unknown")
+            self._set_chip_state(self.status_gpu, "bad")
+            if not getattr(self, "_gpu_error_logged", False):
+                self._gpu_error_logged = True
+                log.warning("GPU monitor query failed: %s", e)
 
         b_path = self.txt_blender_path.text().strip() if hasattr(self, 'txt_blender_path') else None
         if b_path:
@@ -519,40 +532,30 @@ class TrackerMainWindow(QMainWindow):
         )
         if fpath:
             self.txt_blender_path.setText(fpath)
-            self._append_log_3d(f"✔ Set Blender executable path to: {fpath}", "#00ff88")
+            self._append_log_3d(f"✔ Set Blender executable path to: {fpath}", OK)
+            self._schedule_settings_save()
 
     def _add_videos(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, "Select Video or Image Sequence Files", "", "Video & Image Files (*.mp4 *.mov *.avi *.mkv *.m4v *.exr *.png *.jpg *.jpeg *.tif *.tiff);;All Files (*.*)"
         )
         if files:
-            VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
-            for f in files:
-                dest = VIDEOS_DIR / Path(f).name
-                if not dest.exists():
-                    shutil.copy2(f, dest)
-            self._refresh_videos()
+            self._import_media_files(files, overwrite=False)
 
     def _refresh_videos(self):
         VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
         self.table.setRowCount(0)
+
+        # Repopulating the combo fires currentTextChanged for every addItem,
+        # and each one used to start a frame extractor (B1). Fill it silently
+        # and select the clip once afterwards.
+        previous = self.combo_2d_video.currentText() or self._last_clip
+        self.combo_2d_video.blockSignals(True)
         self.combo_2d_video.clear()
 
-        video_exts = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
-        seq_exts = {".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
-        
-        # Files and Sequence folders
-        items = []
-        for f in VIDEOS_DIR.iterdir():
-            if f.is_file() and f.suffix.lower() in video_exts:
-                items.append(f)
-            elif f.is_dir():
-                # Folder containing image sequence
-                sub_imgs = [s for s in f.iterdir() if s.is_file() and s.suffix.lower() in seq_exts]
-                if sub_imgs:
-                    items.append(f)
+        items = scan_media_pool(VIDEOS_DIR)
 
-        for v in sorted(items, key=lambda x: x.name):
+        for v in items:
             row = self.table.rowCount()
             self.table.insertRow(row)
             self.table.setItem(row, 0, QTableWidgetItem(v.name))
@@ -565,22 +568,24 @@ class TrackerMainWindow(QMainWindow):
                 self.table.setItem(row, 1, QTableWidgetItem(f"{count} Frames"))
 
             scene_dir = SCENES_DIR / v.stem
-            is_3d_completed = (
-                (scene_dir / "3D_CAMERA_TRACK" / "_latest" / "sparse" / "cameras.txt").exists() or
-                (scene_dir / "sparse" / "cameras.txt").exists() or
-                (any((scene_dir / "3D_CAMERA_TRACK").glob("*/sparse/cameras.txt")) if (scene_dir / "3D_CAMERA_TRACK").exists() else False)
-            )
-            if is_3d_completed:
+            solved, _ = find_latest_output(
+                scene_dir, "3D_CAMERA_TRACK", "sparse/cameras.txt", legacy_subdirs=("",))
+            if solved:
                 status_item = QTableWidgetItem("● Solved (3D Ready)")
-                status_item.setForeground(QColor("#00ff88"))
+                status_item.setForeground(QColor(OK))
                 status_item.setTextAlignment(Qt.AlignCenter)
             else:
                 status_item = QTableWidgetItem("○ Ready to Track")
-                status_item.setForeground(QColor("#00d2ff"))
+                status_item.setForeground(QColor(ACCENT))
                 status_item.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row, 2, status_item)
 
             self.combo_2d_video.addItem(v.name)
+
+        idx = self.combo_2d_video.findText(previous) if previous else -1
+        if idx >= 0:
+            self.combo_2d_video.setCurrentIndex(idx)
+        self.combo_2d_video.blockSignals(False)
 
         if items:
             self._on_2d_video_selected(self.combo_2d_video.currentText())
@@ -629,7 +634,7 @@ class TrackerMainWindow(QMainWindow):
                 if detected != 1:
                     self._append_log_3d(
                         f"Timeline start set to {detected} from the sequence numbering "
-                        f"of '{v_name}'.", "#00d2ff")
+                        f"of '{v_name}'.", ACCENT)
 
     def _on_table_row_double_clicked(self, item):
         row = item.row()
@@ -645,16 +650,10 @@ class TrackerMainWindow(QMainWindow):
                 self._open_scenes_folder()
 
     def _start_tracking_3d(self):
-        video_exts = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
-        seq_exts = {".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
-        videos = []
-        for f in VIDEOS_DIR.iterdir():
-            if f.is_file() and f.suffix.lower() in video_exts:
-                videos.append(f)
-            elif f.is_dir():
-                sub_imgs = [s for s in f.iterdir() if s.is_file() and s.suffix.lower() in seq_exts]
-                if sub_imgs:
-                    videos.append(f)
+        if self.worker_3d is not None and self.worker_3d.isRunning():
+            self._append_log_3d("A 3D solve is already running.", WARN)
+            return
+        videos = scan_media_pool(VIDEOS_DIR)
 
         if not videos:
             QMessageBox.warning(self, "No Videos Found", f"Please add at least one video or image sequence into:\n{VIDEOS_DIR}")
@@ -673,10 +672,10 @@ class TrackerMainWindow(QMainWindow):
                 videos = picked
                 self._append_log_3d(
                     f"Solving {len(videos)} selected shot(s): "
-                    f"{', '.join(v.name for v in videos)}", "#00d2ff")
+                    f"{', '.join(v.name for v in videos)}", ACCENT)
         else:
             self._append_log_3d(
-                f"No row selected - solving all {len(videos)} shot(s) in 02 VIDEOS.", "#a0a0b0")
+                f"No row selected - solving all {len(videos)} shot(s) in 02 VIDEOS.", TEXT_DIM)
 
         # Masks were drawn against whatever clip the 2D tab has loaded, so they must only
         # be applied to that clip - not to every video in the batch.
@@ -687,14 +686,13 @@ class TrackerMainWindow(QMainWindow):
         mask_shot = Path(self.combo_2d_video.currentText()).stem if self.combo_2d_video.currentText() else None
         if all_masks and mask_shot:
             self._append_log_3d(
-                f"{len(all_masks)} roto mask(s) will be applied to '{mask_shot}' only.", "#00d2ff")
+                f"{len(all_masks)} roto mask(s) will be applied to '{mask_shot}' only.", ACCENT)
 
         cam_raw = self.combo_cam.currentText().split()[0].strip()
-        preset_data = PRESETS.get(self.preset_combo.currentText(), PRESETS["Custom (Manual Tuning)"])
+        preset_data = PRESETS.get(self.preset_combo.currentText(), PRESETS[DEFAULT_PRESET])
         config = {
             "solver_engine": self.combo_solver_engine.currentText(),
             "tri_angle": self.spin_tri.value(),
-            "init_max_forward_motion": 1.0,
             "overlap": self.spin_overlap.value(),
             "inliers": self.spin_inliers.value(),
             "camera_model": cam_raw,
@@ -734,17 +732,17 @@ class TrackerMainWindow(QMainWindow):
 
     def _stop_tracking_3d(self):
         if self.worker_3d and self.worker_3d.isRunning():
-            self._append_log_3d("⏹ Stopping 3D tracking process...", "#ff4b4b")
+            self._append_log_3d("⏹ Stopping 3D tracking process...", ERR)
             self.worker_3d.cancel()
             self.btn_stop_3d.setEnabled(False)
 
     def _on_worker_3d_finished(self, success, message):
         self.btn_start_3d.setEnabled(True)
         self.btn_stop_3d.setEnabled(False)
-        self._append_log_3d(f"\n{message}", "#00ff88" if success else "#ff4b4b")
+        self._append_log_3d(f"\n{message}", OK if success else ERR)
         self._refresh_videos()
 
-    def _append_log_3d(self, text, color="#c0c0d0"):
+    def _append_log_3d(self, text, color=TEXT_DIM):
         self.log_text.append(f'<span style="color: {color};">{text}</span>')
         sb = self.log_text.verticalScrollBar()
         sb.setValue(sb.maximum())
@@ -764,29 +762,15 @@ class TrackerMainWindow(QMainWindow):
         v_name = self.table.item(row, 0).text()
         shot_name = Path(v_name).stem
         shot_dir = SCENES_DIR / shot_name
-        nk_file = None
-        target_scene = shot_dir / "3D_CAMERA_TRACK" / "_latest"
-
-        if (target_scene / "camera_track_nuke.nk").exists():
-            nk_file = target_scene / "camera_track_nuke.nk"
-        else:
-            track_root = shot_dir / "3D_CAMERA_TRACK"
-            if track_root.exists():
-                for sub in sorted(track_root.iterdir(), reverse=True):
-                    if sub.is_dir() and sub.name != "_latest" and (sub / "camera_track_nuke.nk").exists():
-                        nk_file = sub / "camera_track_nuke.nk"
-                        target_scene = sub
-                        break
-            if not nk_file and (shot_dir / "camera_track_nuke.nk").exists():
-                nk_file = shot_dir / "camera_track_nuke.nk"
-                target_scene = shot_dir
+        nk_file, target_scene = find_latest_output(
+            shot_dir, "3D_CAMERA_TRACK", "camera_track_nuke.nk", legacy_subdirs=("",))
 
         if nk_file and nk_file.exists():
             with open(nk_file, "r", encoding="utf-8") as f:
                 content = f.read()
             QApplication.clipboard().setText(content)
             self._flash_button_feedback(self.btn_export_3d_nuke, "🎥 Export for Nuke (.abc / .nk)", "✔ Copied to Clipboard!")
-            self._append_log_3d(f"📋 Copied Nuke 3D Camera node ({nk_file.name}) to clipboard! Press Ctrl+V inside Nuke.", "#ffd000")
+            self._append_log_3d(f"📋 Copied Nuke 3D Camera node ({nk_file.name}) to clipboard! Press Ctrl+V inside Nuke.", WARN)
             os.startfile(target_scene)
         else:
             QMessageBox.information(
@@ -804,16 +788,16 @@ class TrackerMainWindow(QMainWindow):
 
         v_name = self.table.item(row, 0).text()
         shot_dir = SCENES_DIR / Path(v_name).stem
-        target_scene = shot_dir / "3D_CAMERA_TRACK" / "_latest"
-        if not (target_scene / "import_to_blender.py").exists() and not (target_scene / "camera_track.abc").exists():
-            target_scene = shot_dir
+        found, target_scene = find_latest_output(
+            shot_dir, "3D_CAMERA_TRACK", ["import_to_blender.py", "camera_track.abc"],
+            legacy_subdirs=("",))
 
-        if not (target_scene / "import_to_blender.py").exists() and not (target_scene / "camera_track.abc").exists():
+        if not found:
             QMessageBox.warning(self, "3D Track Not Found", f"No 3D camera track found for '{v_name}'. Run 3D Camera Tracking first.")
             return
 
         blender_path = self.txt_blender_path.text().strip() or None
-        self._append_log_3d(f"▶ Exporting 3D Track for Blender...", "#ea7600")
+        self._append_log_3d(f"▶ Exporting 3D Track for Blender...", WARN)
 
         try:
             from export_tools import auto_export_alembic_via_blender
@@ -823,15 +807,15 @@ class TrackerMainWindow(QMainWindow):
                 log_callback=lambda m, c: self._append_log_3d(m, c)
             )
         except Exception as e:
-            self._append_log_3d(f"Notice: Alembic export check: {e}", "#e0a000")
+            self._append_log_3d(f"Notice: Alembic export check: {e}", WARN)
 
         abc_file = target_scene / "camera_track.abc"
         if abc_file.exists():
             self._flash_button_feedback(self.btn_export_3d_blender, "🎬 Export for Blender (.abc)", "✔ Alembic Ready!")
-            self._append_log_3d(f"🎉 Blender Alembic (.abc) ready: {abc_file.name}", "#00ff88")
+            self._append_log_3d(f"🎉 Blender Alembic (.abc) ready: {abc_file.name}", OK)
         else:
             self._flash_button_feedback(self.btn_export_3d_blender, "🎬 Export for Blender (.abc)", "✔ Script Ready!")
-            self._append_log_3d(f"✔ Blender 1-Click Script ready: import_to_blender.py", "#00ff88")
+            self._append_log_3d(f"✔ Blender 1-Click Script ready: import_to_blender.py", OK)
 
         os.startfile(target_scene)
 
@@ -913,7 +897,7 @@ class TrackerMainWindow(QMainWindow):
             self.canvas_2d.active_layer_idx = len(self.canvas_2d.layers) - 1
             self._refresh_layer_list()
             self._on_layer_selected(self.canvas_2d.active_layer_idx)
-            self._append_log_2d(f"➕ Added new tracking layer: [{name.strip()}]", "#00ff88")
+            self._append_log_2d(f"➕ Added new tracking layer: [{name.strip()}]", OK)
 
     def _delete_active_layer(self):
         if len(self.canvas_2d.layers) <= 1:
@@ -925,7 +909,7 @@ class TrackerMainWindow(QMainWindow):
         self.canvas_2d.active_layer_idx = max(0, cur_idx - 1)
         self._refresh_layer_list()
         self._on_layer_selected(self.canvas_2d.active_layer_idx)
-        self._append_log_2d(f"🗑 Deleted layer [{del_name}].", "#ff3355")
+        self._append_log_2d(f"🗑 Deleted layer [{del_name}].", ERR)
 
     def _rename_active_layer(self):
         cur_l = self.canvas_2d.active_layer
@@ -935,7 +919,7 @@ class TrackerMainWindow(QMainWindow):
         if ok and name.strip():
             cur_l.name = name.strip()
             self._refresh_layer_list()
-            self._append_log_2d(f"✏️ Renamed layer to [{cur_l.name}].", "#00d2ff")
+            self._append_log_2d(f"✏️ Renamed layer to [{cur_l.name}].", ACCENT)
 
     def _change_layer_color(self):
         cur_l = self.canvas_2d.active_layer
@@ -987,16 +971,16 @@ class TrackerMainWindow(QMainWindow):
             self.radio_points.setChecked(True)
         count = len(self.canvas_2d.points)
         l_name = self.canvas_2d.active_layer.name if self.canvas_2d.active_layer else "Layer"
-        self._append_log_2d(f"✔ [{l_name}] Added point #{count} at ({x:.1f}, {y:.1f}) on frame {frame_idx+1}", "#00d2ff")
+        self._append_log_2d(f"✔ [{l_name}] Added point #{count} at ({x:.1f}, {y:.1f}) on frame {frame_idx+1}", ACCENT)
         self._refresh_layer_list()
 
     def _jump_to_point_keyframe(self):
         if self.canvas_2d.points:
             target_f = int(self.canvas_2d.points[0][0])
             self.slider_2d_frame.setValue(target_f)
-            self._append_log_2d(f"⏮ Jumped timeline to point keyframe {target_f+1}.", "#00d2ff")
+            self._append_log_2d(f"⏮ Jumped timeline to point keyframe {target_f+1}.", ACCENT)
         else:
-            self._append_log_2d("No manual points placed on active layer yet.", "#a0a0b0")
+            self._append_log_2d("No manual points placed on active layer yet.", TEXT_DIM)
 
     def _on_view_layer_changed(self, idx):
         if idx == 0:
@@ -1004,7 +988,7 @@ class TrackerMainWindow(QMainWindow):
             self.overlay_frames = None
             cur = self.slider_2d_frame.value()
             self._on_2d_frame_slider_changed(cur)
-            self._append_log_2d("👁️ Switched view to Clean Raw Video.", "#00d2ff")
+            self._append_log_2d("👁️ Switched view to Clean Raw Video.", ACCENT)
         elif idx == 1:
             self._load_overlay_into_player()
 
@@ -1019,7 +1003,7 @@ class TrackerMainWindow(QMainWindow):
         cur = self.slider_2d_frame.value()
         self._on_2d_frame_slider_changed(cur)
         l_name = self.canvas_2d.active_layer.name if self.canvas_2d.active_layer else "Active Layer"
-        self._append_log_2d(f"🗑 Cleared tracking points on [{l_name}].", "#00ff88")
+        self._append_log_2d(f"🗑 Cleared tracking points on [{l_name}].", OK)
 
     def _clear_active_layer_masks(self):
         self.canvas_2d.clear_active_layer_masks()
@@ -1027,7 +1011,7 @@ class TrackerMainWindow(QMainWindow):
         cur = self.slider_2d_frame.value()
         self._on_2d_frame_slider_changed(cur)
         l_name = self.canvas_2d.active_layer.name if self.canvas_2d.active_layer else "Active Layer"
-        self._append_log_2d(f"🗑 Cleared inclusion && exclusion masks on [{l_name}].", "#00ff88")
+        self._append_log_2d(f"🗑 Cleared inclusion && exclusion masks on [{l_name}].", OK)
 
     def _on_2d_video_selected(self, video_name):
         if not video_name:
@@ -1039,6 +1023,9 @@ class TrackerMainWindow(QMainWindow):
         self._pause_playback()
         self.overlay_frames = None
         self.loaded_video_frames = None
+        # A different clip with the same size and length would otherwise show
+        # the previous clip's cached, scaled frames.
+        self.canvas_2d.invalidate_frame_cache()
 
         # Probe the real frame rate once, for both the extracted-frames path and the
         # raw-video path below.
@@ -1051,10 +1038,13 @@ class TrackerMainWindow(QMainWindow):
             if detected_start != 1:
                 self._append_log_2d(
                     f"Timeline start set to {detected_start} from the sequence numbering.",
-                    "#00d2ff")
+                    ACCENT)
         self._append_log_2d(
             f"Frame rate detected: {self.current_fps:.3f} fps (used for playback, timecode "
-            f"and all exports).", "#a0a0b0")
+            f"and all exports).", TEXT_DIM)
+
+        self._last_clip = video_name
+        self._schedule_settings_save()
 
         scene_images_dir = SCENES_DIR / video_path.stem / "images"
         if scene_images_dir.exists() and list(scene_images_dir.glob("*.jpg")):
@@ -1064,18 +1054,10 @@ class TrackerMainWindow(QMainWindow):
             self._load_frame_preview(jpgs[0], 0, len(jpgs))
             return
 
-        import tempfile
-        tmp_img = Path(tempfile.gettempdir()) / f"thumb_{video_path.stem}_0.jpg"
+        tmp_img = self._thumbnail_for(video_path, 0, "-ss", "0.0")
         total_frames = probe_frame_count(video_path, self.current_fps, default=100) or 100
 
-        if not tmp_img.exists():
-            cmd = [str(FFMPEG_EXE), "-y", "-loglevel", "error", "-ss", "0.0", "-i", str(video_path), "-vframes", "1", "-q:v", "2", str(tmp_img)]
-            try:
-                run_hidden(cmd)
-            except Exception:
-                pass
-
-        if tmp_img.exists():
+        if tmp_img is not None:
             self.slider_2d_frame.setRange(0, total_frames - 1)
             self.slider_2d_frame.setValue(0)
             self._load_frame_preview(tmp_img, 0, total_frames)
@@ -1083,14 +1065,65 @@ class TrackerMainWindow(QMainWindow):
             self.slider_2d_frame.setRange(0, 0)
             self.slider_2d_frame.setValue(0)
 
-        self._append_log_2d(f"⏳ Unpacking frame sequence for '{video_path.name}' in background for smooth 60 FPS scrubbing...", "#00d2ff")
+        self._append_log_2d(f"⏳ Unpacking frame sequence for '{video_path.name}' in background for smooth 60 FPS scrubbing...", ACCENT)
+        self._start_frame_extractor(video_path, scene_images_dir)
+
+    def _thumbnail_for(self, video_path, frame_idx, *seek_args):
+        """
+        Cached single frame of a clip for scrubbing before its frame cache
+        exists (B12). Keyed by path + size + mtime, so a re-imported or renamed
+        clip never shows another clip's frames. Returns the path or None, and
+        reports an ffmpeg failure instead of hiding it (C19).
+        """
+        tmp_img = thumb_path(thumbs_dir(), video_path, frame_idx)
+        if tmp_img.exists():
+            return tmp_img
+        cmd = [str(FFMPEG_EXE), "-y", "-loglevel", "error"]
+        cmd += list(seek_args)
+        cmd += ["-i", str(video_path), "-vframes", "1", "-q:v", "3", "-threads", "4", str(tmp_img)]
+        try:
+            r = run_hidden(cmd, capture=True, timeout=60)
+            if not tmp_img.exists():
+                err = (r.stdout or b"")
+                if isinstance(err, bytes):
+                    err = err.decode("utf-8", "replace")
+                self._status("Could not read frame %d of %s: %s" % (
+                    frame_idx + 1, video_path.name, err.strip()[:120] or "ffmpeg wrote nothing"),
+                    error=True)
+                return None
+            return tmp_img
+        except Exception as e:
+            self._status("ffmpeg failed on %s: %s" % (video_path.name, e), error=True)
+            return None
+
+    def _start_frame_extractor(self, video_path, scene_images_dir):
+        """
+        Run exactly one FrameExtractorWorker at a time (B1). If one is still
+        running for another clip, cancel it when the worker supports it and
+        wait briefly; otherwise park the request until it finishes.
+        """
+        video_path = Path(video_path)
+        ex = self.frame_extractor
+        if ex is not None and ex.isRunning():
+            if Path(ex.video_path) == video_path:
+                return  # already extracting this clip
+            if hasattr(ex, "cancel"):
+                ex.cancel()
+                ex.wait(5000)
+            if ex.isRunning():
+                self._pending_extract = (video_path, Path(scene_images_dir))
+                self._append_log_2d(
+                    f"Frame extraction for '{video_path.name}' will start after "
+                    f"'{Path(ex.video_path).name}' finishes.", TEXT_DIM)
+                return
+        self._pending_extract = None
         self.frame_extractor = FrameExtractorWorker(video_path, scene_images_dir, FFMPEG_EXE)
         self.frame_extractor.finished_signal.connect(self._on_frames_extracted)
         self.frame_extractor.start()
 
     def _on_frames_extracted(self, shot_name, count):
         if count > 0:
-            self._append_log_2d(f"✔ Extracted {count} frames for '{shot_name}' into 04 SCENES/{shot_name}/images/! Scrubbing is now instant.", "#00ff88")
+            self._append_log_2d(f"✔ Extracted {count} frames for '{shot_name}' into 04 SCENES/{shot_name}/images/! Scrubbing is now instant.", OK)
             v_name = self.combo_2d_video.currentText()
             if Path(v_name).stem == shot_name:
                 scene_images_dir = SCENES_DIR / shot_name / "images"
@@ -1100,7 +1133,17 @@ class TrackerMainWindow(QMainWindow):
                     self.slider_2d_frame.setRange(0, len(jpgs) - 1)
                     self.slider_2d_frame.setValue(cur_val)
                     self._load_frame_preview(jpgs[cur_val], cur_val, len(jpgs))
+        else:
+            self._append_log_2d(
+                f"✖ Frame extraction produced nothing for '{shot_name}'. "
+                f"Check the clip plays and that 04 SCENES is writable.", ERR)
         self._update_keyframe_status()
+
+        if self._pending_extract and not self._closing:
+            video_path, images_dir = self._pending_extract
+            self._pending_extract = None
+            self._append_log_2d(f"⏳ Unpacking frame sequence for '{video_path.name}'...", ACCENT)
+            self._start_frame_extractor(video_path, images_dir)
 
     def _extract_frames_for_current_video(self):
         v_name = self.combo_2d_video.currentText()
@@ -1108,10 +1151,8 @@ class TrackerMainWindow(QMainWindow):
             return
         video_path = VIDEOS_DIR / v_name
         scene_images_dir = SCENES_DIR / video_path.stem / "images"
-        self._append_log_2d(f"⏳ Extracting frame sequence for '{video_path.name}'...", "#00d2ff")
-        self.frame_extractor = FrameExtractorWorker(video_path, scene_images_dir, FFMPEG_EXE)
-        self.frame_extractor.finished_signal.connect(self._on_frames_extracted)
-        self.frame_extractor.start()
+        self._append_log_2d(f"⏳ Extracting frame sequence for '{video_path.name}'...", ACCENT)
+        self._start_frame_extractor(video_path, scene_images_dir)
 
     def _load_frame_preview(self, img_path_or_array, frame_idx, total_frames):
         from PIL import Image
@@ -1132,8 +1173,9 @@ class TrackerMainWindow(QMainWindow):
             secs = int(total_sec % 60)
             fr = int(frame_idx % fps_int)
             self.lbl_frame_idx.setText(f"{hrs:02d}:{mins:02d}:{secs:02d}:{fr:02d} ({frame_idx+1}/{total_frames})")
-        except Exception:
-            pass
+        except Exception as e:
+            log.exception("frame preview failed")
+            self._status("Could not display frame %d: %s" % (frame_idx + 1, e), error=True)
 
     def _on_2d_frame_slider_changed(self, val):
         if self.overlay_frames is not None and len(self.overlay_frames) > 0 and 0 <= val < len(self.overlay_frames):
@@ -1156,25 +1198,12 @@ class TrackerMainWindow(QMainWindow):
                 self._update_keyframe_status()
                 return
 
-        import tempfile
-        sec = val / 24.0
-        tmp_img = Path(tempfile.gettempdir()) / f"thumb_{video_path.stem}_{val}.jpg"
-        if not tmp_img.exists():
-            cmd = [
-                str(FFMPEG_EXE), "-y", "-loglevel", "error",
-                "-ss", f"{sec:.3f}",
-                "-noaccurate_seek",
-                "-i", str(video_path),
-                "-vframes", "1",
-                "-q:v", "3",
-                "-threads", "4",
-                str(tmp_img)
-            ]
-            try:
-                run_hidden(cmd)
-            except Exception:
-                pass
-        if tmp_img.exists():
+        # The clip's real rate, not 24 (B13): on a 30 fps clip the old maths
+        # showed the wrong frame while the cache was still being built.
+        fps = self.current_fps if self.current_fps and self.current_fps > 0 else 24.0
+        sec = val / fps
+        tmp_img = self._thumbnail_for(video_path, val, "-ss", f"{sec:.3f}", "-noaccurate_seek")
+        if tmp_img is not None:
             total_f = max(1, self.slider_2d_frame.maximum() + 1)
             self._load_frame_preview(tmp_img, val, total_f)
 
@@ -1212,7 +1241,7 @@ class TrackerMainWindow(QMainWindow):
         self.canvas_2d.masks_changed.emit()
         self.canvas_2d.update()
         self._update_keyframe_status()
-        self._append_log_2d(f"🔷 Keyframe created/updated at Frame {cur_f+1} on [{layer.name}].", "#00ff88")
+        self._append_log_2d(f"🔷 Keyframe created/updated at Frame {cur_f+1} on [{layer.name}].", OK)
 
     def _delete_mask_keyframe_on_current(self):
         layer = self.canvas_2d.active_layer
@@ -1228,7 +1257,7 @@ class TrackerMainWindow(QMainWindow):
             self.canvas_2d.masks_changed.emit()
             self.canvas_2d.update()
             self._update_keyframe_status()
-            self._append_log_2d(f"🗑 Deleted keyframe at Frame {cur_f+1}.", "#ffaa00")
+            self._append_log_2d(f"🗑 Deleted keyframe at Frame {cur_f+1}.", WARN)
 
     def _update_keyframe_status(self):
         cur_f = self.slider_2d_frame.value()
@@ -1306,21 +1335,21 @@ class TrackerMainWindow(QMainWindow):
         out_p = self.canvas_2d.out_point if self.canvas_2d.out_point >= 0 else self.slider_2d_frame.maximum()
         self.lbl_range_status.setText(f"{self.canvas_2d.in_point+1} – {out_p+1}")
         self._set_chip_state(self.lbl_range_status, "key")
-        self._append_log_2d(f"📍 Set Tracking In-Point to Frame {self.canvas_2d.in_point+1}.", "#00d2ff")
+        self._append_log_2d(f"📍 Set Tracking In-Point to Frame {self.canvas_2d.in_point+1}.", ACCENT)
 
     def _set_out_point(self, frame_idx):
         self.canvas_2d.out_point = int(frame_idx)
         in_p = self.canvas_2d.in_point
         self.lbl_range_status.setText(f"{in_p+1} – {self.canvas_2d.out_point+1}")
         self._set_chip_state(self.lbl_range_status, "key")
-        self._append_log_2d(f"📍 Set Tracking Out-Point to Frame {self.canvas_2d.out_point+1}.", "#00d2ff")
+        self._append_log_2d(f"📍 Set Tracking Out-Point to Frame {self.canvas_2d.out_point+1}.", ACCENT)
 
     def _reset_tracking_range(self):
         self.canvas_2d.in_point = 0
         self.canvas_2d.out_point = -1
         self.lbl_range_status.setText("Full")
         self._set_chip_state(self.lbl_range_status, "idle")
-        self._append_log_2d("↺ Reset Tracking Range to full sequence.", "#00d2ff")
+        self._append_log_2d("↺ Reset Tracking Range to full sequence.", ACCENT)
 
     def _toggle_canvas_matte_overlay(self, checked):
         self.canvas_2d.show_mask_overlay = checked
@@ -1351,29 +1380,21 @@ class TrackerMainWindow(QMainWindow):
         tot_f = max(1, self.canvas_2d.total_frames)
 
         from mask_animator import export_to_nuke_roto_script
-        success = export_to_nuke_roto_script(layer.animated_masks, w, h, tot_f, out_file)
+        success = export_to_nuke_roto_script(layer.animated_masks, w, h, tot_f, out_file,
+                                             timeline_start=self.spin_start_frame_2d.value())
         if success:
             nk_text = out_file.read_text(encoding="utf-8")
             from PySide6.QtWidgets import QApplication
             QApplication.clipboard().setText(nk_text)
-            self._append_log_2d(f"✔ Exported Nuke Roto node to: {out_file.name}", "#00ff88")
-            self._append_log_2d("📋 Copied Roto node to Clipboard! Press Ctrl+V directly in Nuke Node Graph.", "#00d2ff")
+            self._append_log_2d(f"✔ Exported Nuke Roto node to: {out_file.name}", OK)
+            self._append_log_2d("📋 Copied Roto node to Clipboard! Press Ctrl+V directly in Nuke Node Graph.", ACCENT)
             QMessageBox.information(self, "Nuke Roto Exported", f"Successfully exported Nuke Roto node!\n\nSaved to: {out_file}\n\nCopied to Clipboard! You can paste (Ctrl+V) directly into Nuke's Node Graph.")
 
     def _find_latest_overlay(self, shot_name):
-        shot_dir = SCENES_DIR / shot_name
-        if (shot_dir / "2D_POINT_TRACK" / "_latest" / "tracks_2d_overlay.mp4").exists():
-            return shot_dir / "2D_POINT_TRACK" / "_latest" / "tracks_2d_overlay.mp4"
-        point_track_dir = shot_dir / "2D_POINT_TRACK"
-        if point_track_dir.exists():
-            ts_dirs = sorted([d for d in point_track_dir.iterdir() if d.is_dir() and d.name != "_latest"], reverse=True)
-            for d in ts_dirs:
-                ov = d / "tracks_2d_overlay.mp4"
-                if ov.exists():
-                    return ov
-        if (shot_dir / "cotracker_2d" / "tracks_2d_overlay.mp4").exists():
-            return shot_dir / "cotracker_2d" / "tracks_2d_overlay.mp4"
-        return None
+        overlay, _ = find_latest_output(
+            SCENES_DIR / shot_name, "2D_POINT_TRACK", "tracks_2d_overlay.mp4",
+            legacy_subdirs=("cotracker_2d",))
+        return overlay
 
     def _load_overlay_into_player(self):
         v_name = self.combo_2d_video.currentText()
@@ -1392,7 +1413,7 @@ class TrackerMainWindow(QMainWindow):
         self.combo_view_layer.setCurrentIndex(1)
         self.combo_view_layer.blockSignals(False)
 
-        self._append_log_2d("Loading motion overlay video into built-in player...", "#00d2ff")
+        self._append_log_2d("Loading motion overlay video into built-in player...", ACCENT)
         try:
             import imageio.v3 as iio
             self.overlay_frames = iio.imread(str(overlay_file), plugin="FFMPEG")
@@ -1400,9 +1421,9 @@ class TrackerMainWindow(QMainWindow):
             self.slider_2d_frame.setValue(0)
             self._load_frame_preview(self.overlay_frames[0], 0, len(self.overlay_frames))
             self._start_playback()
-            self._append_log_2d(f"✔ Loaded {len(self.overlay_frames)} overlay frames into player.", "#00ff88")
+            self._append_log_2d(f"✔ Loaded {len(self.overlay_frames)} overlay frames into player.", OK)
         except Exception as e:
-            self._append_log_2d(f"Notice: Loading overlay failed: {e}", "#e0a000")
+            self._append_log_2d(f"Notice: Loading overlay failed: {e}", WARN)
 
     def _open_2d_output_folder(self):
         v_name = self.combo_2d_video.currentText()
@@ -1429,37 +1450,16 @@ class TrackerMainWindow(QMainWindow):
         shot_name = Path(v_name).stem
         shot_dir = SCENES_DIR / shot_name
 
-        nk_file = None
-        target_scene = shot_dir / "2D_POINT_TRACK" / "_latest"
-        if (target_scene / "tracks_2d_cornerpin_nuke.nk").exists():
-            nk_file = target_scene / "tracks_2d_cornerpin_nuke.nk"
-        elif (target_scene / "tracks_2d_nuke.nk").exists():
-            nk_file = target_scene / "tracks_2d_nuke.nk"
-
-        if not nk_file:
-            pt_root = shot_dir / "2D_POINT_TRACK"
-            if pt_root.exists():
-                for sub in sorted(pt_root.iterdir(), reverse=True):
-                    if sub.is_dir() and sub.name != "_latest":
-                        if (sub / "tracks_2d_cornerpin_nuke.nk").exists():
-                            nk_file = sub / "tracks_2d_cornerpin_nuke.nk"
-                            target_scene = sub
-                            break
-                        elif (sub / "tracks_2d_nuke.nk").exists():
-                            nk_file = sub / "tracks_2d_nuke.nk"
-                            target_scene = sub
-                            break
-
-        if not nk_file and (shot_dir / "cotracker_2d" / "tracks_2d_nuke.nk").exists():
-            nk_file = shot_dir / "cotracker_2d" / "tracks_2d_nuke.nk"
-            target_scene = shot_dir / "cotracker_2d"
+        nk_file, target_scene = find_latest_output(
+            shot_dir, "2D_POINT_TRACK", ["tracks_2d_cornerpin_nuke.nk", "tracks_2d_nuke.nk"],
+            legacy_subdirs=("cotracker_2d",))
 
         if nk_file and nk_file.exists():
             with open(nk_file, "r", encoding="utf-8") as f:
                 content = f.read()
             QApplication.clipboard().setText(content)
             self._flash_button_feedback(self.btn_export_2d_nuke, "📋 Export for Nuke (Tracker Node)", "✔ Copied to Clipboard!")
-            self._append_log_2d(f"📋 Copied Nuke 2D Tracker node ({nk_file.name}) to clipboard! Press Ctrl+V inside Nuke.", "#00ff88")
+            self._append_log_2d(f"📋 Copied Nuke 2D Tracker node ({nk_file.name}) to clipboard! Press Ctrl+V inside Nuke.", OK)
             os.startfile(target_scene)
         else:
             QMessageBox.information(
@@ -1468,6 +1468,9 @@ class TrackerMainWindow(QMainWindow):
             )
 
     def _start_tracking_2d(self):
+        if self.worker_2d is not None and self.worker_2d.isRunning():
+            self._append_log_2d("A 2D track is already running.", WARN)
+            return
         v_name = self.combo_2d_video.currentText()
         if not v_name:
             QMessageBox.warning(self, "No Video Selected", "Please select a video from the dropdown.")
@@ -1522,7 +1525,7 @@ class TrackerMainWindow(QMainWindow):
                 if outside:
                     self._append_log_2d(
                         f"! [{l.name}] {len(outside)} of {len(l.points)} points sit outside "
-                        f"frames {in_pt + 1}–{last + 1} and will be skipped.", "#e0a000")
+                        f"frames {in_pt + 1}–{last + 1} and will be skipped.", WARN)
 
             layers_config.append(l.to_config_dict())
 
@@ -1551,11 +1554,11 @@ class TrackerMainWindow(QMainWindow):
 
     def _stop_tracking_2d(self):
         if self.worker_2d and self.worker_2d.isRunning():
-            self._append_log_2d("⏹ Stopping 2D tracking process...", "#ff4b4b")
+            self._append_log_2d("⏹ Stopping 2D tracking process...", ERR)
             self.worker_2d.cancel()
             self.btn_stop_2d.setEnabled(False)
 
-    def _append_log_2d(self, text, color="#c0c0d0"):
+    def _append_log_2d(self, text, color=TEXT_DIM):
         self.log_2d_text.append(f'<span style="color: {color};">{text}</span>')
         sb = self.log_2d_text.verticalScrollBar()
         sb.setValue(sb.maximum())
@@ -1567,7 +1570,7 @@ class TrackerMainWindow(QMainWindow):
     def _on_worker_2d_finished(self, success, message):
         self.btn_start_2d.setEnabled(True)
         self.btn_stop_2d.setEnabled(False)
-        self._append_log_2d(f"\n{message}", "#00ff88" if success else "#ff4b4b")
+        self._append_log_2d(f"\n{message}", OK if success else ERR)
         if success:
             self._load_overlay_into_player()
 
@@ -1582,223 +1585,345 @@ class TrackerMainWindow(QMainWindow):
                 stat_item.setTextAlignment(Qt.AlignCenter)
                 if "✔" in status or "Completed" in status:
                     stat_item.setText("● Solved (3D Ready)")
-                    stat_item.setForeground(QColor("#00ff88"))
+                    stat_item.setForeground(QColor(OK))
                 elif "✖" in status or "Failed" in status or "Error" in status:
                     stat_item.setText("✕ " + status.replace("✖", "").strip())
-                    stat_item.setForeground(QColor("#ff4b4b"))
+                    stat_item.setForeground(QColor(ERR))
                 elif "Processing" in status or "Extracting" in status or "Matching" in status or "Tracking" in status:
                     stat_item.setText("◌ " + status)
-                    stat_item.setForeground(QColor("#ffd700"))
+                    stat_item.setForeground(QColor(WARN))
                 else:
                     stat_item.setText(status)
-                    stat_item.setForeground(QColor("#00d2ff"))
+                    stat_item.setForeground(QColor(ACCENT))
 
 
-def apply_dark_palette(app):
-    """
-    Some parts of a widget are drawn by the native style, not the stylesheet -
-    combo and spin arrows most visibly. They take their colour from the palette,
-    so it has to agree with the theme or they come out dark-on-dark.
-    """
-    pal = QPalette()
-    pal.setColor(QPalette.Window, QColor(BG_APP))
-    pal.setColor(QPalette.WindowText, QColor(TEXT))
-    pal.setColor(QPalette.Base, QColor(BG_INPUT))
-    pal.setColor(QPalette.AlternateBase, QColor(BG_PANEL))
-    pal.setColor(QPalette.Text, QColor(TEXT))
-    pal.setColor(QPalette.Button, QColor(BG_RAISED))
-    pal.setColor(QPalette.ButtonText, QColor(TEXT))
-    pal.setColor(QPalette.BrightText, QColor(ERR))
-    pal.setColor(QPalette.Highlight, QColor(ACCENT_DIM))
-    pal.setColor(QPalette.HighlightedText, QColor('#ffffff'))
-    pal.setColor(QPalette.ToolTipBase, QColor(BG_RAISED))
-    pal.setColor(QPalette.ToolTipText, QColor(TEXT))
-    pal.setColor(QPalette.PlaceholderText, QColor(TEXT_MUTED))
-    pal.setColor(QPalette.Disabled, QPalette.Text, QColor(TEXT_MUTED))
-    pal.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(TEXT_MUTED))
-    pal.setColor(QPalette.Disabled, QPalette.WindowText, QColor(TEXT_MUTED))
-    app.setPalette(pal)
+    # =========================================================================
+    # SHUTDOWN AND SETTINGS
+    # =========================================================================
+    def _has_unsaved_2d_work(self):
+        """Layers, points, masks or an in/out range the user set by hand."""
+        canvas = getattr(self, "canvas_2d", None)
+        if canvas is None:
+            return False
+        if len(canvas.layers) > 1:
+            return True
+        for layer in canvas.layers:
+            if layer.points or layer.animated_masks:
+                return True
+        return canvas.in_point != 0 or canvas.out_point != -1
 
+    def closeEvent(self, event):
+        running = [(name, w) for name, w in (("3D solve", self.worker_3d),
+                                             ("2D track", self.worker_2d))
+                   if w is not None and w.isRunning()]
+        if running:
+            r = QMessageBox.question(
+                self, "Job Running",
+                "A job is running (%s). Cancel it and quit?" % ", ".join(n for n, _ in running),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if r != QMessageBox.Yes:
+                event.ignore()
+                return
+        if self._has_unsaved_2d_work():
+            r = QMessageBox.question(
+                self, "Unsaved 2D Work",
+                "Tracking layers, points, masks or an in/out range have been set on the "
+                "2D tab and are not saved anywhere.\n\nQuit and lose them?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if r != QMessageBox.Yes:
+                event.ignore()
+                return
 
-def run_selftest():
-    """
-    Report what the app can and cannot find, then exit.
+        self._closing = True
+        self._pause_playback()
+        self.vram_timer.stop()
+        self._settings_timer.stop()
 
-    A windowed build has nowhere to print, so this writes selftest.txt next to
-    the executable (falling back to the user cache if that folder is read-only).
-    Useful for checking an install, and the only way to see inside a frozen
-    build when it will not start.
+        for name, w in running:
+            self._status("Cancelling %s..." % name)
+            try:
+                w.cancel()
+            except Exception as e:
+                log.warning("cancel() failed for %s: %s", name, e)
+        for name, w in running:
+            # Bounded: COLMAP is terminated by cancel(); the mapper steps still
+            # take a moment to notice. Beyond this we leave anyway.
+            if not w.wait(15000):
+                log.warning("%s worker did not stop within 15 s; exiting anyway", name)
 
-        Automated_Tracker.exe --selftest
-    """
-    import platform
-    from core.app_paths import (
-        is_frozen, BASE_DIR, COLMAP_DIR, VIDEOS_DIR, FFMPEG_DIR, SCENES_DIR,
-        COTRACKER_DIR, colmap_exe, ffmpeg_exe, ffprobe_exe, writable_cache_dir,
-    )
+        for w in (self.frame_extractor, self.copy_worker):
+            if w is not None and w.isRunning():
+                if hasattr(w, "cancel"):
+                    try:
+                        w.cancel()
+                    except Exception:
+                        pass
+                w.wait(5000)
 
-    lines = []
-    problems = []
-
-    def row(label, ok, detail=""):
-        lines.append("  [%s] %-26s %s" % ("ok " if ok else "FAIL", label, detail))
-        if not ok:
-            problems.append(label)
-
-    lines.append("Automated Tracker self-test")
-    lines.append("=" * 62)
-    lines.append("  python      : %s" % sys.version.split()[0])
-    lines.append("  platform    : %s" % platform.platform())
-    lines.append("  frozen      : %s" % is_frozen())
-    lines.append("  executable  : %s" % sys.executable)
-    lines.append("  base dir    : %s" % BASE_DIR)
-    lines.append("")
-    lines.append("Folders")
-    row("01 COLMAP", COLMAP_DIR.is_dir(), str(COLMAP_DIR))
-    row("02 VIDEOS", VIDEOS_DIR.is_dir(), str(VIDEOS_DIR))
-    row("03 FFMPEG", FFMPEG_DIR.is_dir(), str(FFMPEG_DIR))
-    row("04 SCENES", SCENES_DIR.is_dir(), str(SCENES_DIR))
-    row("06 COTRACKER", COTRACKER_DIR.is_dir(), str(COTRACKER_DIR))
-
-    lines.append("")
-    lines.append("Executables")
-    row("colmap.exe", colmap_exe().exists(), str(colmap_exe()))
-    row("ffmpeg.exe", ffmpeg_exe().exists(), str(ffmpeg_exe()))
-    row("ffprobe.exe", ffprobe_exe().exists(), str(ffprobe_exe()))
-
-    lines.append("")
-    lines.append("CoTracker weights")
-    for name in ("scaled_offline.pth", "scaled_online.pth"):
-        p = COTRACKER_DIR / "checkpoints" / name
-        row(name, p.exists(),
-            ("%.0f MB" % (p.stat().st_size / 1024 ** 2)) if p.exists() else "missing")
-
-    # Running from source, the vendored cotracker package is only importable once
-    # 06 COTRACKER is on sys.path - which is what the engine module does on import.
-    if not is_frozen() and str(COTRACKER_DIR) not in sys.path:
-        sys.path.insert(0, str(COTRACKER_DIR))
-
-    lines.append("")
-    lines.append("Python packages")
-    for mod in ("torch", "torchvision", "numpy", "PIL", "imageio", "PySide6", "cotracker"):
         try:
-            __import__(mod)
-            row(mod, True)
+            gpu_monitor.stop()
         except Exception as e:
-            row(mod, False, str(e)[:60])
+            log.warning("gpu monitor stop failed: %s", e)
+
+        self._save_settings()
+        log.info("window closed")
+        event.accept()
+
+    # -- QSettings (C18) ------------------------------------------------------
+    def _wire_settings_autosave(self):
+        """Persist a moment after any persisted control changes."""
+        s = self._schedule_settings_save
+        self.tabs.currentChanged.connect(lambda _i: s())
+        self.txt_blender_path.textChanged.connect(lambda _t: s())
+        self.preset_combo.currentTextChanged.connect(lambda _t: s())
+        for w in (self.combo_solver_engine, self.combo_cam,
+                  self.combo_2d_model, self.combo_2d_res):
+            w.currentIndexChanged.connect(lambda _i: s())
+        for w in (self.spin_tri, self.spin_overlap, self.spin_inliers, self.spin_step,
+                  self.spin_start_frame_3d, self.spin_start_frame_2d, self.spin_min_conf):
+            w.valueChanged.connect(lambda _v: s())
+        for w in (self.chk_single_cam, self.chk_ba_refine, self.chk_gpu,
+                  self.chk_caspar_ba, self.chk_mesh_gen, self.chk_vram_chunk):
+            w.toggled.connect(lambda _b: s())
+
+    def _schedule_settings_save(self):
+        if not self._closing:
+            self._settings_timer.start()
+
+    def _save_settings(self):
+        st = self.settings
+        try:
+            st.setValue("window/geometry", self.saveGeometry())
+            st.setValue("window/state", self.saveState())
+            st.setValue("window/tab", self.tabs.currentIndex())
+            st.setValue("blender/path", self.txt_blender_path.text().strip())
+            st.setValue("solver3d/preset", self.preset_combo.currentText())
+            st.setValue("solver3d/engine", self.combo_solver_engine.currentIndex())
+            st.setValue("solver3d/camera_model", self.combo_cam.currentIndex())
+            st.setValue("solver3d/tri_angle", self.spin_tri.value())
+            st.setValue("solver3d/overlap", self.spin_overlap.value())
+            st.setValue("solver3d/inliers", self.spin_inliers.value())
+            st.setValue("solver3d/frame_step", self.spin_step.value())
+            st.setValue("solver3d/timeline_start", self.spin_start_frame_3d.value())
+            st.setValue("solver3d/single_camera", self.chk_single_cam.isChecked())
+            st.setValue("solver3d/ba_refine", self.chk_ba_refine.isChecked())
+            st.setValue("solver3d/use_gpu", self.chk_gpu.isChecked())
+            st.setValue("solver3d/caspar_ba", self.chk_caspar_ba.isChecked())
+            st.setValue("solver3d/mesh", self.chk_mesh_gen.isChecked())
+            st.setValue("track2d/model", self.combo_2d_model.currentIndex())
+            st.setValue("track2d/resolution", self.combo_2d_res.currentIndex())
+            st.setValue("track2d/min_confidence", self.spin_min_conf.value())
+            st.setValue("track2d/timeline_start", self.spin_start_frame_2d.value())
+            st.setValue("track2d/vram_chunk", self.chk_vram_chunk.isChecked())
+            st.setValue("media/last_clip", self.combo_2d_video.currentText() or self._last_clip)
+            st.sync()
+        except Exception as e:
+            log.warning("saving settings failed: %s", e)
+
+    def _load_settings(self):
+        st = self.settings
+
+        def val(key, default, typ):
+            try:
+                v = st.value(key, default, type=typ)
+                return default if v is None else v
+            except Exception:
+                return default
+
+        try:
+            geo = st.value("window/geometry")
+            if geo:
+                self.restoreGeometry(geo)
+            state = st.value("window/state")
+            if state:
+                self.restoreState(state)
+            self.tabs.setCurrentIndex(max(0, min(self.tabs.count() - 1, val("window/tab", 0, int))))
+
+            self.txt_blender_path.setText(val("blender/path", "", str))
+
+            preset = val("solver3d/preset", "", str)
+            if preset and self.preset_combo.findText(preset) >= 0:
+                self.preset_combo.setCurrentText(preset)   # applies the preset values...
+            # ...then whatever the user tuned on top of it.
+            self.combo_solver_engine.setCurrentIndex(
+                val("solver3d/engine", self.combo_solver_engine.currentIndex(), int))
+            self.combo_cam.setCurrentIndex(
+                val("solver3d/camera_model", self.combo_cam.currentIndex(), int))
+            self.spin_tri.setValue(val("solver3d/tri_angle", self.spin_tri.value(), float))
+            self.spin_overlap.setValue(val("solver3d/overlap", self.spin_overlap.value(), int))
+            self.spin_inliers.setValue(val("solver3d/inliers", self.spin_inliers.value(), int))
+            self.spin_step.setValue(val("solver3d/frame_step", self.spin_step.value(), int))
+            self.spin_start_frame_3d.setValue(
+                val("solver3d/timeline_start", self.spin_start_frame_3d.value(), int))
+            self.chk_single_cam.setChecked(val("solver3d/single_camera", self.chk_single_cam.isChecked(), bool))
+            self.chk_ba_refine.setChecked(val("solver3d/ba_refine", self.chk_ba_refine.isChecked(), bool))
+            self.chk_gpu.setChecked(val("solver3d/use_gpu", self.chk_gpu.isChecked(), bool))
+            self.chk_caspar_ba.setChecked(val("solver3d/caspar_ba", self.chk_caspar_ba.isChecked(), bool))
+            self.chk_mesh_gen.setChecked(val("solver3d/mesh", self.chk_mesh_gen.isChecked(), bool))
+
+            self.combo_2d_model.setCurrentIndex(val("track2d/model", 0, int))
+            self.combo_2d_res.setCurrentIndex(val("track2d/resolution", 0, int))
+            self.spin_min_conf.setValue(val("track2d/min_confidence", self.spin_min_conf.value(), float))
+            self.spin_start_frame_2d.setValue(
+                val("track2d/timeline_start", self.spin_start_frame_2d.value(), int))
+            self.chk_vram_chunk.setChecked(val("track2d/vram_chunk", True, bool))
+        except Exception as e:
+            log.warning("loading settings failed: %s", e)
+
+
+# =============================================================================
+# CRASH HANDLER AND LOGGING (B3)
+# =============================================================================
+class _CrashRelay(QObject):
+    """Carries a crash report from any thread to a dialog on the GUI thread."""
+    report = Signal(str, str)
+
+
+_crash_relay = None
+
+
+class _LogStream:
+    """
+    File-like stand-in for sys.stdout / sys.stderr. The windowed build has
+    neither, so print() would raise; this writes to app.log (and to the real
+    stream too when there is one).
+    """
+    encoding = "utf-8"
+
+    def __init__(self, level, mirror=None):
+        self._level = level
+        self._mirror = mirror
+        self._buf = ""
+
+    def write(self, text):
+        if not text:
+            return 0
+        if self._mirror is not None:
+            try:
+                self._mirror.write(text)
+            except Exception:
+                pass
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                logging.getLogger("stdout").log(self._level, line.rstrip())
+        return len(text)
+
+    def flush(self):
+        if self._mirror is not None:
+            try:
+                self._mirror.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+
+def setup_logging():
+    """Everything printed or logged goes to a rotating app.log the user can send."""
+    folder = logs_dir()
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
     try:
-        import torch
-        lines.append("  [ok ] torch %s  CUDA=%s  device=%s"
-                     % (torch.__version__, torch.cuda.is_available(),
-                        torch.cuda.get_device_name(0) if torch.cuda.is_available() else "-"))
+        handler = logging.handlers.RotatingFileHandler(
+            folder / "app.log", maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+        root.addHandler(handler)
+    except Exception:
+        return folder
+    sys.stdout = _LogStream(logging.INFO, sys.__stdout__)
+    sys.stderr = _LogStream(logging.ERROR, sys.__stderr__)
+    log.info("=" * 60)
+    log.info("Automated Tracker %s starting  (frozen=%s, python=%s)",
+             display_version(), bool(getattr(sys, "frozen", False)), sys.version.split()[0])
+    return folder
+
+
+def _write_crash_log(text):
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = logs_dir() / ("error_%s.log" % stamp)
+    try:
+        path.write_text(text, encoding="utf-8")
+    except Exception:
+        path = None
+    return path
+
+
+def _show_crash_dialog(message, path_text):
+    try:
+        box = QMessageBox(QMessageBox.Critical, "Automated Tracker - Unexpected Error",
+                          "Something went wrong. The action you tried may not have completed.\n\n"
+                          "%s\n\nA full report was written to:\n%s\n\n"
+                          "Please send that file with a bug report." % (message, path_text))
+        box.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        box.exec()
     except Exception:
         pass
 
-    lines.append("")
-    lines.append("Launching the external tools")
-    # This is the check that matters most in a frozen build: a windowed exe has no
-    # standard handles to give a child process, so an unredirected subprocess just
-    # fails to start. Importing the tools is not enough - they must actually run.
-    from core.proc import run_hidden
-    for label, cmd in (
-        ("ffmpeg -version", [str(ffmpeg_exe()), "-version"]),
-        ("ffprobe -version", [str(ffprobe_exe()), "-version"]),
-        ("colmap help", [str(colmap_exe()), "help"]),
-    ):
+
+def install_crash_handler():
+    """
+    Catch what would otherwise vanish. In the frozen, windowed build there is
+    no stderr, so an exception raised in a Qt slot just made that button stop
+    working. Now it is logged to error_<timestamp>.log and shown in a dialog.
+    """
+    global _crash_relay
+    _crash_relay = _CrashRelay()
+    _crash_relay.report.connect(_show_crash_dialog)
+
+    def _handle(exc_type, exc_value, exc_tb, where="main thread"):
+        if issubclass(exc_type, KeyboardInterrupt):
+            return
+        tb = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        header = ("Automated Tracker %s  crash in %s\n%s\n\n"
+                  % (display_version(), where, datetime.datetime.now().isoformat()))
         try:
-            r = run_hidden(cmd, capture=True, timeout=30)
-            out = (r.stdout or b"")
-            if isinstance(out, bytes):
-                out = out.decode("utf-8", "replace")
-            first = out.strip().splitlines()[0][:48] if out.strip() else ""
-            row(label, bool(first), first or "no output from the child process")
-        except Exception as e:
-            row(label, False, "%s: %s" % (type(e).__name__, str(e)[:48]))
-
-    # Running a tool with --version proves the handles work. Actually writing files
-    # proves the whole extraction path does, which is what the GUI depends on.
-    lines.append("")
-    lines.append("Real frame extraction")
-    try:
-        import tempfile
-        vids = [f for f in VIDEOS_DIR.glob("*")
-                if f.suffix.lower() in (".mp4", ".mov", ".avi", ".mkv", ".m4v")]
-        if not vids:
-            lines.append("  [skip] no clip in 02 VIDEOS to test with")
-        else:
-            tmp = Path(tempfile.mkdtemp(prefix="attrack_selftest_"))
-            cmd = [str(ffmpeg_exe()), "-y", "-loglevel", "error",
-                   "-i", str(vids[0]), "-vframes", "3", "-q:v", "2",
-                   str(tmp / "f_%03d.jpg")]
-            r = run_hidden(cmd, capture=True, timeout=120)
-            got = len(list(tmp.glob("*.jpg")))
-            err = (r.stdout or b"")
-            if isinstance(err, bytes):
-                err = err.decode("utf-8", "replace")
-            row("extract 3 frames", got == 3,
-                "%d written from %s%s" % (got, vids[0].name,
-                                          ("  | " + err.strip()[:60]) if err.strip() else ""))
-            import shutil as _sh
-            _sh.rmtree(tmp, ignore_errors=True)
-    except Exception as e:
-        row("extract 3 frames", False, "%s: %s" % (type(e).__name__, str(e)[:60]))
-
-    lines.append("")
-    lines.append("Writable locations")
-    for label, d in (("02 VIDEOS", VIDEOS_DIR), ("04 SCENES", SCENES_DIR),
-                     ("cache", writable_cache_dir())):
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-            probe = d / ".write_test"
-            probe.write_text("x", encoding="utf-8")
-            probe.unlink()
-            row(label + " writable", True, str(d))
-        except Exception as e:
-            row(label + " writable", False, str(e)[:60])
-
-    lines.append("")
-    lines.append("=" * 62)
-    lines.append("RESULT: %s" % ("ALL OK" if not problems
-                                 else "%d problem(s): %s" % (len(problems), ", ".join(problems))))
-
-    report = "\n".join(lines)
-
-    # Write the file FIRST. A windowed PyInstaller build has sys.stdout set to
-    # None, so printing would raise and the report would never be saved - which
-    # is exactly the situation this self-test exists to diagnose.
-    written = None
-    for target in (BASE_DIR / "selftest.txt",
-                   writable_cache_dir() / "selftest.txt"):
-        try:
-            target.write_text(report, encoding="utf-8")
-            written = target
-            break
+            log.critical("unhandled exception in %s:\n%s", where, tb)
         except Exception:
-            continue
+            pass
+        path = _write_crash_log(header + tb)
+        summary = "%s: %s" % (exc_type.__name__, str(exc_value)[:300])
+        _crash_relay.report.emit(summary, str(path) if path else "(the log folder is not writable)")
 
-    try:
-        if sys.stdout is not None:
-            print(report)
-            if written is not None:
-                print("\nwritten to: %s" % written)
-    except Exception:
-        pass
+    def excepthook(exc_type, exc_value, exc_tb):
+        _handle(exc_type, exc_value, exc_tb)
 
-    return 1 if problems else 0
+    def thread_hook(args):
+        _handle(args.exc_type, args.exc_value, args.exc_traceback,
+                where="thread %s" % getattr(args.thread, "name", "?"))
+
+    sys.excepthook = excepthook
+    threading.excepthook = thread_hook
 
 
 def main():
     if "--selftest" in sys.argv:
+        # Normally handled at import time above; kept for callers of main().
+        from core.selftest import run_selftest
         sys.exit(run_selftest())
 
+    log_folder = setup_logging()
+
     app = QApplication(sys.argv)
+    app.setOrganizationName(SETTINGS_ORG)
+    app.setApplicationName(SETTINGS_APP)
+    app.setApplicationVersion(APP_VERSION)
+    # PySide6 routes exceptions raised inside slots (and QThread.run) through
+    # sys.excepthook, so one hook covers the Qt side as well.
+    install_crash_handler()
     # Fusion draws its sub-controls from the palette on every platform, which keeps
     # arrows and spin buttons consistent instead of inheriting the Windows look.
     app.setStyle("Fusion")
     apply_dark_palette(app)
     window = TrackerMainWindow()
     window.show()
-    sys.exit(app.exec())
+    window._status("Ready  (logs: %s)" % log_folder)
+    rc = app.exec()
+    logging.shutdown()
+    sys.exit(rc)
 
 
 if __name__ == "__main__":
