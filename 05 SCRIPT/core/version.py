@@ -9,7 +9,7 @@ to pick the matching GitHub release). Keep the assignment on a single line in
 the form  APP_VERSION = "x.y.z"  so the batch parser keeps working.
 """
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 APP_NAME = "Automated Tracker"
 
 

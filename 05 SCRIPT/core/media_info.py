@@ -130,6 +130,15 @@ def probe_frame_count(video_path, fps=None, default=0):
 SEQ_EXTS = {".jpg", ".jpeg", ".png", ".exr", ".tif", ".tiff", ".dpx"}
 
 
+def sequence_files(folder):
+    """Sorted image files of a sequence folder (empty list if it is not one)."""
+    folder = Path(folder)
+    if not folder.is_dir():
+        return []
+    return sorted(f for f in folder.iterdir()
+                  if f.is_file() and f.suffix.lower() in SEQ_EXTS)
+
+
 def detect_sequence_start(folder, default=1):
     """
     First frame number of an image sequence, read from its filenames.

@@ -68,7 +68,7 @@ from core.tracking_layer import TrackingLayer
 from core.workers import TrackerWorker, CoTrackerWorker, FrameExtractorWorker
 from core.hardware import gpu_monitor
 from core.proc import run_hidden, popen_gui
-from core.media_info import probe_fps, probe_frame_count, detect_sequence_start
+from core.media_info import probe_fps, probe_frame_count, detect_sequence_start, sequence_files
 from core.presets import PRESETS, DEFAULT_PRESET
 from core.media_pool import (
     VIDEO_EXTS, scan_media_pool, find_latest_output,
@@ -1046,6 +1046,24 @@ class TrackerMainWindow(QMainWindow):
         self._last_clip = video_name
         self._schedule_settings_save()
 
+        # An image sequence is its own frame cache: preview it straight from the
+        # files, no FFmpeg thumbnail and no extraction pass.
+        if video_path.is_dir():
+            files = sequence_files(video_path)
+            if not files:
+                self._status(f"'{video_path.name}' holds no image sequence.")
+                self.slider_2d_frame.setRange(0, 0)
+                return
+            self.slider_2d_frame.setRange(0, len(files) - 1)
+            self.slider_2d_frame.setValue(0)
+            self._load_frame_preview(files[0], 0, len(files))
+            self._append_log_2d(
+                f"Image sequence: {len(files)} frames ({files[0].suffix.lower()}), "
+                f"timeline {self.spin_start_frame_2d.value()}-"
+                f"{self.spin_start_frame_2d.value() + len(files) - 1}. A sequence "
+                f"carries no frame rate, so {self.current_fps:.3f} fps is assumed.", TEXT_DIM)
+            return
+
         scene_images_dir = SCENES_DIR / video_path.stem / "images"
         if scene_images_dir.exists() and list(scene_images_dir.glob("*.jpg")):
             jpgs = sorted(list(scene_images_dir.glob("*.jpg")))
@@ -1069,6 +1087,8 @@ class TrackerMainWindow(QMainWindow):
         self._start_frame_extractor(video_path, scene_images_dir)
 
     def _thumbnail_for(self, video_path, frame_idx, *seek_args):
+        if Path(video_path).is_dir():
+            return None
         """
         Cached single frame of a clip for scrubbing before its frame cache
         exists (B12). Keyed by path + size + mtime, so a re-imported or renamed
@@ -1190,6 +1210,12 @@ class TrackerMainWindow(QMainWindow):
         if not video_name:
             return
         video_path = VIDEOS_DIR / video_name
+        if video_path.is_dir():
+            files = sequence_files(video_path)
+            if 0 <= val < len(files):
+                self._load_frame_preview(files[val], val, len(files))
+                self._update_keyframe_status()
+            return
         scene_images_dir = SCENES_DIR / video_path.stem / "images"
         if scene_images_dir.exists():
             jpgs = sorted(list(scene_images_dir.glob("*.jpg")))

@@ -13,7 +13,7 @@ from PySide6.QtCore import QThread, Signal
 from mask_animator import AnimatedMask, rasterize_masks_to_png
 from core.media_info import probe_fps
 from core.proc import popen_hidden
-from core.colmap_model import find_best_model
+from core.colmap_model import find_best_model, model_stats
 
 
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.exr', '.tif', '.tiff'}
@@ -409,38 +409,114 @@ class TrackerWorker(QThread):
                 self.video_status_signal.emit(video.name, "Cancelled")
                 return False
 
-        # Step 4.5: Smart Auto-Retry on Low Parallax
-        if solved_model() is None:
-            self.log_signal.emit(
-                "↻ Initial 3D solve found no usable starting pair – retrying with fully "
-                "relaxed parallax and forward-motion limits...", "#e0a000")
-            retry_mapper_cmd = [
-                str(self.colmap_exe), "mapper",
-                "--database_path", str(db_path),
-                "--image_path", str(img_dir),
-                "--output_path", str(sparse_dir),
+        # Step 4.5: retry ladder when the first solve covers too little of the shot.
+        #
+        # Video is a trap for COLMAP's initialiser: the most matches are always
+        # between adjacent frames, which have almost no parallax, so the first
+        # pair it picks triangulates garbage and nothing else registers. That
+        # shows up as a "successful" two-frame camera. Relaxing the angle (the
+        # old retry) makes it worse. A matchmover's answer is the opposite:
+        # force a wide-baseline initial pair. The fully relaxed pass is kept as
+        # the last resort for genuinely low-parallax shots. Each attempt writes
+        # its own folder and the one that registers the most frames wins.
+        extracted = len([f for f in img_dir.iterdir() if f.is_file()]) if img_dir.is_dir() else 0
+        min_coverage = float(self.config.get("min_coverage", 0.5))
+        good_enough = 0.9    # stop retrying once this share of frames is solved
+
+        def best_of(dirs):
+            best, best_st = None, (0, 0)
+            for d in dirs:
+                if not d.is_dir():
+                    continue
+                m = find_best_model(d, log=lambda msg: self.log_signal.emit(msg, "#e0a000"))
+                if m is None:
+                    continue
+                st = model_stats(m)
+                if st > best_st:
+                    best, best_st = m, st
+            return best, best_st
+
+        candidates = [sparse_dir]
+        best_model, (registered, _pts) = best_of(candidates)
+        base_inliers = int(self.config.get("inliers", 40))
+        gpu_ba = "1" if (self.config.get("enable_caspar_ba", True) and self.config.get("use_gpu", True)) else "0"
+        ladder = [
+            ("wide-baseline", sparse_dir.parent / "sparse_wide", [
+                "--Mapper.init_min_tri_angle", "8",
+                "--Mapper.init_min_num_inliers", str(max(60, base_inliers)),
+                "--Mapper.abs_pose_min_num_inliers", "15",
+                "--Mapper.init_max_forward_motion", "1.0",
+                "--Mapper.init_num_trials", "500",
+            ]),
+            ("relaxed", sparse_dir.parent / "sparse_relaxed", [
                 "--Mapper.init_min_tri_angle", "0.5",
                 "--Mapper.init_min_num_inliers", "15",
                 "--Mapper.abs_pose_min_num_inliers", "10",
                 "--Mapper.init_max_forward_motion", "1.0",
                 "--Mapper.init_num_trials", "1000",
                 "--Mapper.filter_min_tri_angle", "0.5",
+            ]),
+        ]
+        for name, out_dir, params in ladder:
+            if extracted and best_model is not None and registered >= good_enough * extracted:
+                break
+            self.log_signal.emit(
+                f"↻ First solve registered {registered} of {extracted} frames - "
+                f"retrying with a {name} initial pair...", "#e0a000")
+            self.progress_signal.emit(78, f"[{idx}/{total_videos}] [4/4] Retry: {name} initial pair...")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            retry_cmd = [
+                str(self.colmap_exe), "mapper",
+                "--database_path", str(db_path),
+                "--image_path", str(img_dir),
+                "--output_path", str(out_dir),
                 "--Mapper.ba_refine_focal_length", refine_flag,
                 "--Mapper.ba_refine_extra_params", refine_flag,
-                "--Mapper.ba_use_gpu", "1" if (self.config.get("enable_caspar_ba", True) and self.config.get("use_gpu", True)) else "0",
-                "--Mapper.num_threads", str(os.cpu_count() or 4)
-            ]
-            self._run_command(retry_mapper_cmd, env, "COLMAP Mapper Smart Retry")
+                "--Mapper.ba_refine_principal_point", "0",
+                "--Mapper.ba_use_gpu", gpu_ba,
+                "--Mapper.num_threads", str(os.cpu_count() or 4),
+            ] + params
+            self._run_command(retry_cmd, env, f"COLMAP Mapper ({name} retry)")
             if self.is_cancelled:
                 self.video_status_signal.emit(video.name, "Cancelled")
                 return False
+            candidates.append(out_dir)
+            new_best, (new_reg, _p) = best_of(candidates)
+            if new_best is not None and new_reg > registered:
+                self.log_signal.emit(
+                    f"✔ {name} retry registered {new_reg} of {extracted} frames "
+                    f"(was {registered}).", "#00ff88")
+            best_model, registered = new_best, new_reg
 
         # Step 5: Convert Best Model to TXT & Multi-Format Exports
-        best_model = solved_model()
         if best_model is None:
             self.log_signal.emit(f"✖ Mapper completed but could not reconstruct camera poses.", "#ffaa00")
             self.video_status_signal.emit(video.name, "No Track Found ✖")
             return False
+
+        # A camera with keys on only some frames is not a usable track: Nuke and
+        # AE would interpolate across the gaps and the plate would swim. Say so
+        # here, in frame counts an artist can act on, instead of reporting
+        # "completed" for a two-image solve.
+        if extracted:
+            coverage = registered / float(extracted)
+            if registered < 3 or coverage < min_coverage:
+                self.log_signal.emit(
+                    f"✖ COLMAP solved only {registered} of {extracted} frames "
+                    f"({coverage:.0%}) even after retries. That is not a usable camera "
+                    f"track, so nothing was exported. Typical causes: too little parallax "
+                    f"(a static or nodal shot), motion blur, or a wrong lens model. Try a "
+                    f"different preset, a smaller Frame Step, or mask moving actors.", "#ff4b4b")
+                self.video_status_signal.emit(video.name, f"Solved {registered}/{extracted} ✖")
+                return False
+            if registered < extracted:
+                self.log_signal.emit(
+                    f"! COLMAP solved {registered} of {extracted} frames ({coverage:.0%}). "
+                    f"The exported camera has keys only on solved frames; the "
+                    f"{extracted - registered} missing frame(s) will be interpolated by "
+                    f"your DCC. Check those frames before relying on the track.", "#e0a000")
+            else:
+                self.log_signal.emit(f"✔ All {extracted} frames registered.", "#00ff88")
 
         self.log_signal.emit(f"▶ Exporting best model to TXT format...", "#ffffff")
         conv_cmd = [

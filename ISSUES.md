@@ -1,5 +1,26 @@
 # Automated Tracker — issue report
 
+**Status (2026-09-22, v1.1.1):** every item below has been fixed and is covered
+by `tests/` (105 tests) plus a headless end-to-end run (`tools/e2e_plate.py`)
+on a 1001-numbered plate through both tabs. Exceptions, still open:
+
+- E: the PlayerController / layer-panel / menus split of `tracker_gui.py` was
+  deliberately not done (presets, self-test, media pool and palette were).
+- USD export runs only when the `pxr` package is present; the matrix maths is
+  unit-tested, the writer itself is not exercised here.
+- Blender reading the PLY colour attribute as "Col", the two `#` comment lines
+  at the top of `.chan`, and the sign of Nuke's `win_translate` are written to
+  the documented conventions but have not been confirmed inside Blender / Nuke.
+
+Found during the end-to-end run and fixed in the same pass: the 2D tab could
+not preview an image-sequence folder (it handed the folder to FFmpeg), and a
+two-frame COLMAP solve was reported as a success. The solver now retries with a
+wide-baseline initial pair (which took the sample footage from 2/60 to 60/60
+registered frames) and refuses to export a camera that covers under half the
+shot.
+
+Original report follows.
+
 Code review of the local project on 2026-09-22, at commit `6443182`.
 Three passes: 2D tracking pipeline, 3D solve and exporters, app shell and
 build. Every item was verified by reading the code; anything not fully
