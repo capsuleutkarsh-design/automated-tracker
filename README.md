@@ -99,8 +99,10 @@ The page is static: `docs/index.html` plus `docs/assets/`. To publish:
    branch**, pick `main` and the `/docs` folder, and save.
 3. Upload `branding/png/banner.png` as the social preview under
    **Settings → General → Social preview** so links unfurl with the banner.
-4. Attach the setup exe and every `.bin` from `build/Output` to a GitHub
-   Release; the site's download button points at the latest release.
+4. Attach the setup exe and every `.bin` from `build/Output`, plus the runtime
+   parts from `build/Runtime`, to a GitHub Release. `RELEASE_NOTES.md` is the
+   text for the release body; the site's download button points at the latest
+   release.
 
 ## Licences
 
