@@ -132,8 +132,20 @@ def test_scene_images_cache_is_only_used_when_it_matches_the_clip(tmp_path, monk
     frames, _ = c2d.load_video_frames(clip, max_dimension=0)
     assert frames.shape[0] == 5
 
-    # count does not match (e.g. extracted with a frame step) -> FFmpeg path, which
-    # surfaces its error instead of hiding it
+
+@pytest.mark.skipif(not c2d.FFMPEG_EXE.exists(), reason="bundled ffmpeg not present")
+def test_scene_images_cache_is_skipped_when_it_does_not_match(tmp_path, monkeypatch):
+    """A cache extracted at a different frame step must not be mistaken for the
+    clip's frames; the loader falls through to FFmpeg and surfaces its error
+    rather than silently tracking the wrong pictures."""
+    monkeypatch.setattr(c2d, "BASE_DIR", tmp_path)
+    clip = tmp_path / "02 VIDEOS" / "shot.mp4"
+    clip.parent.mkdir(parents=True)
+    clip.write_bytes(b"not really a video")
+    _write_sequence(tmp_path / "04 SCENES" / "shot" / "images", 5)
+    for p in (tmp_path / "04 SCENES" / "shot" / "images").glob("*.png"):
+        p.rename(p.with_suffix(".jpg"))
+
     monkeypatch.setattr(c2d, "probe_frame_count", lambda path: 12)
     monkeypatch.setattr(c2d, "_probe_dimensions", lambda path: None)
     with pytest.raises(ValueError, match="FFmpeg could not decode|Could not extract"):
