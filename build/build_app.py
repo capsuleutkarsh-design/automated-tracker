@@ -196,7 +196,7 @@ def freeze(clean):
         "--workpath", str(WORK),
         "--noconfirm",
     ]
-    log("freezing (this takes a while - torch is ~3.6 GB)")
+    log("freezing (a minute or two - torch is ~3.2 GB after the spec's trim)")
     log("  " + " ".join('"%s"' % c if " " in c else c for c in cmd))
     t0 = time.time()
     r = subprocess.run(cmd, cwd=str(ROOT))
@@ -256,7 +256,14 @@ def verify(exe):
         ok = "RESULT: ALL OK" in text
         if not ok:
             log("  self-test reported problems (exit code %d)" % r.returncode)
-        return ok
+            return False
+
+        # The self-test proves torch imports and sees a card. It does not prove
+        # the bundle can still convolve: the spec trims CUDA libraries out, and
+        # a trim too far leaves the self-test green and kills the first layer of
+        # a real track. So track something, on the GPU, from inside the frozen
+        # process, and require its output on disk.
+        return verify_track(exe, app_dir)
     except subprocess.TimeoutExpired:
         log("  self-test timed out")
         return False
@@ -267,14 +274,49 @@ def verify(exe):
         for d in linked:
             subprocess.run(["cmd", "/c", "rmdir", str(d)], capture_output=True)
         for d in made:
-            try:
-                d.rmdir()
-            except Exception:
-                pass
+            # rmtree, not rmdir: the verification track syncs its result into
+            # 04 SCENES/<clip>/, so the folder is no longer empty and leaving it
+            # behind would put a stray scene into the installer.
+            shutil.rmtree(d, ignore_errors=True)
         try:
             (app_dir / "selftest.txt").unlink()
         except Exception:
             pass
+
+
+def verify_track(exe, app_dir):
+    """
+    One real 2D track on the GPU, run by the frozen exe on itself.
+
+    build/rthook_gpu_track.py is a PyInstaller runtime hook that sits dormant in
+    the bundle until this environment variable is set; with it set, the exe
+    tracks the first clip in 02 VIDEOS and exits instead of opening a window.
+    It prints the device, the peak VRAM (zero would mean it quietly fell back to
+    the CPU) and every file it wrote.
+    """
+    log("tracking a real clip on the GPU through the frozen build")
+    env = dict(os.environ, ATRACK_VERIFY_TRACK="1")
+    try:
+        r = subprocess.run([str(exe)], capture_output=True, text=True,
+                           timeout=900, cwd=str(app_dir), env=env)
+    except subprocess.TimeoutExpired:
+        log("  the track timed out")
+        return False
+    # The report file is the reliable channel; a windowed build's stdout is only
+    # there when the bootloader found a usable handle, and then it says the same.
+    report = app_dir / "verify_track.txt"
+    out = report.read_text(encoding="utf-8") if report.exists() \
+        else (r.stdout or "") + (r.stderr or "")
+    for line in out.splitlines():
+        log("  " + line)
+    try:
+        report.unlink()
+    except OSError:
+        pass
+    if "RESULT: TRACK OK" not in out:
+        log("  the frozen build could not complete a GPU track (exit code %d)" % r.returncode)
+        return False
+    return True
 
 
 def write_version_file():

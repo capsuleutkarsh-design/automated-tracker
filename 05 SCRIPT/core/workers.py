@@ -4,7 +4,9 @@ Background Thread Workers for 3D Camera Tracking & 2D AI Tracking
 
 import os
 import json
+import time
 import shutil
+import logging
 import datetime
 import traceback
 from pathlib import Path
@@ -14,7 +16,14 @@ from mask_animator import AnimatedMask, rasterize_masks_to_png
 from core.media_info import probe_fps, probe_pixel_aspect
 from core.proc import popen_hidden
 from core.colmap_model import find_best_model, model_stats, model_error, registered_indices
+from core import project as project_file
 
+
+log = logging.getLogger("core.workers")
+# The engine's own stream. It goes to the rotating app.log through the root
+# handler tracker_gui.setup_logging() installs, and only reaches the console
+# panel when the artist asks for it (2.4).
+engine_log = logging.getLogger("engine")
 
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.exr', '.tif', '.tiff'}
 
@@ -315,6 +324,192 @@ def clear_extracted_frames(img_dir):
         pass
 
 
+# -----------------------------------------------------------------------------
+# One config per shot (2.3)
+# -----------------------------------------------------------------------------
+def _path_key(p):
+    """A video path in the one spelling the config lookup uses."""
+    return os.path.normcase(str(Path(str(p))))
+
+
+def configs_for_videos(video_paths, config):
+    """
+    (shared config, {path key: config}) from whatever the caller passed.
+
+    A single dict of settings is what every caller passed before 2.3 and still
+    means "these settings for the whole run". A batch that wants each shot
+    solved with the settings saved in its own project file passes either a dict
+    keyed by video path or a list parallel to `video_paths`; a shot missing from
+    either falls back to the shared config, so a partial mapping still solves
+    rather than raising halfway through a batch.
+
+    A per-video dict is told apart from a shared one by its keys: every key of a
+    per-video dict is one of the videos, and no set of solver settings is.
+    """
+    paths = list(video_paths or [])
+    keys = {_path_key(p) for p in paths}
+
+    if isinstance(config, (list, tuple)):
+        mapping = {_path_key(p): dict(c or {}) for p, c in zip(paths, config)}
+        return (dict(config[0] or {}) if config else {}), mapping
+
+    if (isinstance(config, dict) and config and keys
+            and all(_path_key(k) in keys for k in config)):
+        mapping = {_path_key(k): dict(v or {}) for k, v in config.items()}
+        return dict(next(iter(mapping.values()))), mapping
+
+    return dict(config or {}), {}
+
+
+# -----------------------------------------------------------------------------
+# Quiet logs (2.4)
+#
+# COLMAP writes its whole INFO stream to stdout - hundreds of lines per stage,
+# one per image - and the app's own stage lines, warnings and summaries used to
+# be lost among them. The raw stream now goes to the app log file and the panel
+# keeps what an artist has to act on.
+# -----------------------------------------------------------------------------
+# Lines the engine prints while it is working. Worth a colour of their own when
+# the artist has asked to see the stream, but nothing to act on.
+ENGINE_PROGRESS_HINTS = (
+    "elapsed time:", "registering image", "triangulated", "features:",
+    "processed file", "matching block",
+)
+
+# What must reach the panel even with the stream hidden: anything the engine
+# calls an error or a warning, a frame it could not register, and any complaint
+# about the database, which is almost always a stale or locked one.
+ENGINE_PROBLEM_HINTS = (
+    "error", "failed", "failure", "fatal", "warning", "cannot", "could not",
+    "unable to", "no good initial image pair", "not registered", "no such file",
+    "does not exist", "out of memory", "corrupt", "invalid", "denied",
+    "database is locked", "database file", "database already", "empty database",
+    "no images in database",
+)
+
+# Phrases that carry one of the words above and mean nothing of the sort. A
+# solve reporting its reprojection error is reporting a result, not a fault,
+# and COLMAP's own dump of the options it was given is full of thresholds with
+# "error" in the name.
+ENGINE_BENIGN_HINTS = (
+    "reprojection error", "0 errors", "no errors", "error threshold",
+    "max_error", "reproj_error", "error=",
+)
+
+
+def engine_line_kind(line):
+    """
+    What one line of the engine's output is: "problem", "progress" or "chatter".
+
+    glog stamps every line with its severity - I, W, E or F followed by the
+    date - so a warning or an error says so before anything else does; COLMAP
+    also prints plain lines with no stamp at all, which is why the wording is
+    read as well. The test is deliberately generous: showing one line too many
+    costs a line, and hiding a real one costs the artist the solve.
+    """
+    text = str(line).strip()
+    if not text:
+        return "chatter"
+    low = text.lower()
+
+    body = low
+    # A glog prefix such as "W20240501 09:15:02.123456 12345 database.cc:52]".
+    if len(text) > 9 and text[0] in "IWEF" and text[1:9].isdigit():
+        severity = text[0]
+        bracket = text.find("] ")
+        body = text[bracket + 2:].lower() if bracket >= 0 else low
+        if severity in "WEF":
+            return "problem"
+
+    if any(hint in body for hint in ENGINE_BENIGN_HINTS):
+        return "progress" if any(h in body for h in ENGINE_PROGRESS_HINTS) else "chatter"
+    if any(hint in body for hint in ENGINE_PROBLEM_HINTS):
+        return "problem"
+    if any(hint in body for hint in ENGINE_PROGRESS_HINTS):
+        return "progress"
+    return "chatter"
+
+
+# -----------------------------------------------------------------------------
+# Progress as an estimate rather than five fixed percentages (2.4)
+# -----------------------------------------------------------------------------
+# What share of a solve each stage is. Measured on a few dozen shots: matching
+# and mapping are two thirds of it between them, and extraction barely shows.
+SOLVE_STAGES = (
+    ("extract", 0.08),
+    ("features", 0.20),
+    ("match", 0.30),
+    ("map", 0.36),
+    ("export", 0.06),
+)
+
+# What to assume a shot will cost before its frames have been counted - the
+# estimate is replaced the moment extraction finishes and the real count is in.
+NOMINAL_SOLVE_SECONDS = 180.0
+
+
+def stage_bounds(stage, stages=SOLVE_STAGES):
+    """(start, span) of a stage as fractions of the whole solve."""
+    start = 0.0
+    for name, span in stages:
+        if name == stage:
+            return start, span
+        start += span
+    return start, 0.0
+
+
+def solve_progress_percent(stage, done_in_stage, stages=SOLVE_STAGES):
+    """Where the bar sits: the stages already behind, plus how far into this one."""
+    start, span = stage_bounds(stage, stages)
+    fraction = min(1.0, max(0.0, float(done_in_stage or 0.0)))
+    return int(round((start + span * fraction) * 100))
+
+
+def stage_fraction(elapsed, expected):
+    """
+    How far through a stage its clock suggests it is, never quite all the way.
+
+    Capped below 1 because an estimate that runs out is not a finished stage,
+    and a bar that sits at the end of a stage it has not left reads as hung.
+    """
+    try:
+        expected = float(expected)
+    except (TypeError, ValueError):
+        return 0.0
+    if expected <= 0.0:
+        return 0.0
+    return min(0.97, max(0.0, float(elapsed) / expected))
+
+
+def batch_progress_percent(idx, total, percent):
+    """One shot's own progress as a share of the whole batch (1-based idx)."""
+    total = max(1, int(total or 1))
+    idx = min(max(1, int(idx or 1)), total)
+    return int(round(((idx - 1) * 100.0 + max(0, min(100, percent))) / total))
+
+
+def human_duration(seconds):
+    """
+    'about 4 min', for a progress label.
+
+    Rounded hard on purpose: it is an estimate, and a bar that promises
+    4 min 37 s is claiming to know something it does not.
+    """
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if seconds <= 45:
+        return "under a minute"
+    minutes = int(round(seconds / 60.0))
+    if minutes < 60:
+        return "about %d min" % max(1, minutes)
+    hours, minutes = divmod(minutes, 60)
+    if minutes:
+        return "about %d h %d min" % (hours, minutes)
+    return "about %d h" % hours
+
+
 class TrackerWorker(QThread):
     log_signal = Signal(str, str)
     progress_signal = Signal(int, str)
@@ -324,7 +519,15 @@ class TrackerWorker(QThread):
     def __init__(self, video_paths, config, base_dir, colmap_dir, colmap_exe, ffmpeg_dir, ffmpeg_exe, scenes_dir):
         super().__init__()
         self.video_paths = video_paths
-        self.config = config
+        # One config per shot (2.3). A caller that hands in a single config for
+        # the whole run gets exactly what it always did.
+        self.base_config, self.configs = configs_for_videos(video_paths, config)
+        # The config of the shot being solved right now. Every step reads it,
+        # and _process_video swaps it for the next shot's.
+        self.config = self.base_config
+        # "Show engine output" (2.4). Read on every line, so the artist can turn
+        # the stream on in the middle of a solve that is going wrong.
+        self.show_engine_output = False
         self.base_dir = Path(base_dir)
         self.colmap_dir = Path(colmap_dir)
         self.colmap_exe = Path(colmap_exe)
@@ -333,6 +536,90 @@ class TrackerWorker(QThread):
         self.scenes_dir = Path(scenes_dir)
         self.is_cancelled = False
         self.process = None
+
+        # Where the bar is and what it is estimating from (2.4): the stage in
+        # hand, when it started, how long the whole shot is expected to take,
+        # and when the bar was last moved - engine output arrives far faster
+        # than a progress bar is worth repainting.
+        self._stage = SOLVE_STAGES[0][0]
+        self._stage_label = ""
+        self._stage_started = 0.0
+        self._eta_total = NOMINAL_SOLVE_SECONDS
+        self._last_tick = 0.0
+        self._shot_percent = 0
+        self._shot_idx = 1
+        self._shot_total = 1
+
+    def config_for(self, video_path):
+        """This shot's settings - its own when the batch gave it any (2.3)."""
+        return self.configs.get(_path_key(video_path), self.base_config)
+
+    # -- progress ------------------------------------------------------------
+    def _begin_stage(self, stage, label):
+        """Move the bar into a new stage and say, in the label, what is happening."""
+        self._stage = stage
+        self._stage_label = label
+        self._stage_started = time.monotonic()
+        self._last_tick = 0.0
+        self._emit_progress(0.0)
+
+    def _stage_note(self, label):
+        """Relabel the stage in hand without sending the bar back to its start."""
+        self._stage_label = label
+        _start, span = stage_bounds(self._stage)
+        self._emit_progress(stage_fraction(time.monotonic() - self._stage_started,
+                                           self._eta_total * span))
+
+    def _emit_progress(self, fraction, label=None):
+        """
+        Put the bar where the clock says it is, with what is left to go.
+
+        The percentage is a share of the whole batch, so five shots fill the bar
+        once rather than five times, and the time left is this shot's estimate
+        scaled by how much of it is still ahead. It never goes backwards within
+        a shot: a mapper that starts again after a failed attempt is still
+        progress, and a bar that retreats reads as something having gone wrong.
+        """
+        percent = max(self._shot_percent, solve_progress_percent(self._stage, fraction))
+        self._shot_percent = percent
+        text = label or self._stage_label
+        left = human_duration(self._eta_total * (1.0 - percent / 100.0))
+        if left:
+            text = "%s  (%s left)" % (text, left)
+        self.progress_signal.emit(
+            batch_progress_percent(self._shot_idx, self._shot_total, percent), text)
+
+    def _tick_progress(self):
+        """
+        Move the bar from the clock, at most once a second.
+
+        Called for every line the engine prints, which is what makes the bar
+        creep through a stage instead of sitting on a fixed number until the
+        stage ends. A stage with no estimate simply does not move.
+        """
+        now = time.monotonic()
+        if now - self._last_tick < 1.0:
+            return
+        self._last_tick = now
+        _start, span = stage_bounds(self._stage)
+        expected = self._eta_total * span
+        self._emit_progress(stage_fraction(now - self._stage_started, expected))
+
+    def _record_solve_timing(self, shot_name, frames, seconds):
+        """
+        Save how long this shot took, so the next bar estimates instead of guessing.
+
+        Written straight into the shot's own project file rather than handed
+        back to the window: a batch solves shots that are not open, and their
+        own files are the only place the timing belongs.
+        """
+        try:
+            path = project_file.project_path(self.scenes_dir, shot_name)
+            data = project_file.load_project(path) or project_file.default_project()
+            project_file.record_solve_timing(data, frames, seconds)
+            project_file.save_project(path, data)
+        except Exception as e:
+            log.warning("could not store the solve timing for %s: %s", shot_name, e)
 
     def run(self):
         total_videos = len(self.video_paths)
@@ -392,6 +679,13 @@ class TrackerWorker(QThread):
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         video = Path(video_path)
         base_name = video.stem
+        # This shot's own settings for every step below (2.3), and its own clock
+        # for the bar (2.4) - the estimate is refined once the frames are counted.
+        self.config = self.config_for(video_path)
+        self._shot_idx, self._shot_total = idx, total_videos
+        self._eta_total = NOMINAL_SOLVE_SECONDS
+        self._shot_percent = 0
+        started_at = time.monotonic()
         shot_dir = self.scenes_dir / base_name
         img_dir = shot_dir / "images"
         track_dir = shot_dir / "3D_CAMERA_TRACK" / timestamp
@@ -433,7 +727,7 @@ class TrackerWorker(QThread):
             extracted_frames = []
         if not extracted_frames:
             if video.is_dir():
-                self.progress_signal.emit(10, f"[{idx}/{total_videos}] [1/4] Loading image sequence frames...")
+                self._begin_stage("extract", f"[{idx}/{total_videos}] [1/4] Loading image sequence frames...")
                 self.log_signal.emit(f"▶ [1/4] Importing image sequence from folder...", "#ffffff")
                 plan = sequence_import_plan(video, img_dir, self.ffmpeg_exe,
                                             frame_step=frame_step, pixel_aspect=pixel_aspect)
@@ -467,7 +761,7 @@ class TrackerWorker(QThread):
                 extracted_frames = list_extracted_frames(img_dir)
                 self._log_desqueeze(extracted_frames, pixel_aspect, aspect_note)
             else:
-                self.progress_signal.emit(10, f"[{idx}/{total_videos}] [1/4] Extracting frames...")
+                self._begin_stage("extract", f"[{idx}/{total_videos}] [1/4] Extracting frames...")
                 self.log_signal.emit(f"▶ [1/4] Extracting frames with FFmpeg...", "#ffffff")
 
                 ffmpeg_cmd = ffmpeg_extract_command(
@@ -490,6 +784,21 @@ class TrackerWorker(QThread):
             self.video_status_signal.emit(video.name, "No Frames ✖")
             return False
         self.log_signal.emit(f"✔ Extracted {len(extracted_frames)} frames.", "#00ff88")
+
+        # Now that the frames are counted, the bar can estimate from what a solve
+        # of this size actually took on this machine last time (2.4).
+        frame_count = len(extracted_frames)
+        try:
+            saved = project_file.load_project(
+                project_file.project_path(self.scenes_dir, base_name))
+            timings = (saved or {}).get("solve_timings") or []
+        except Exception:
+            timings = []
+        self._eta_total = project_file.estimate_solve_seconds(frame_count, timings)
+        self.log_signal.emit(
+            f"   Estimated solve time: {human_duration(self._eta_total)}"
+            + (" (from a previous solve of this shot)." if timings else
+               " (no previous solve of this shot to go on)."), "#a0a0b0")
 
         # Step 1.5: Automatic Dynamic Mask Generation for COLMAP
         masks_dir = None
@@ -521,15 +830,15 @@ class TrackerWorker(QThread):
             rasterize_masks_to_png(
                 mask_objs, w, h, masks_dir,
                 len(extracted_frames), sorted_frame_names,
-                progress_callback=lambda cur, tot: self.progress_signal.emit(
-                    int(30 + (cur / tot) * 5), f"Generating 3D Masks ({cur}/{tot})..."
+                progress_callback=lambda cur, tot: self._emit_progress(
+                    1.0, f"[{idx}/{total_videos}] Generating 3D Masks ({cur}/{tot})..."
                 ),
                 frame_step=frame_step,
             )
             self.log_signal.emit(f"✔ Generated {len(extracted_frames)} binary masks in 04 SCENES/{video.stem}/masks/ (Excluding moving actors from 3D solve)!", "#00ff88")
 
         # Step 2: Feature Extraction
-        self.progress_signal.emit(35, f"[{idx}/{total_videos}] [2/4] Feature Extraction...")
+        self._begin_stage("features", f"[{idx}/{total_videos}] [2/4] Feature Extraction...")
         self.log_signal.emit(f"▶ [2/4] Extracting SIFT features...", "#ffffff")
         feat_cmd = [
             str(self.colmap_exe), "feature_extractor",
@@ -550,7 +859,7 @@ class TrackerWorker(QThread):
 
         # Step 3: Sequential Matching (Local Vocab Tree Support)
         overlap = self.config.get("overlap", 35)
-        self.progress_signal.emit(60, f"[{idx}/{total_videos}] [3/4] Sequential Matching...")
+        self._begin_stage("match", f"[{idx}/{total_videos}] [3/4] Sequential Matching...")
         self.log_signal.emit(f"▶ [3/4] Matching sequential features (overlap={overlap})...", "#ffffff")
 
         vocab_tree_path = self.colmap_dir / "vocab_tree_faiss_flickr100K_words256K.bin"
@@ -602,7 +911,7 @@ class TrackerWorker(QThread):
         model_0 = sparse_dir / "0"
 
         if is_global_solver:
-            self.progress_signal.emit(80, f"[{idx}/{total_videos}] [4/4] Fast Hierarchical / Global Structure-from-Motion...")
+            self._begin_stage("map", f"[{idx}/{total_videos}] [4/4] Fast Hierarchical / Global Structure-from-Motion...")
             self.log_signal.emit(f"▶ [4/4] Executing Fast Hierarchical Multi-Cluster Mapper (Parallel Sub-Cluster Solving)...", "#00d2ff")
 
             hier_cmd = [
@@ -646,7 +955,7 @@ class TrackerWorker(QThread):
         init_trials = str(self.config.get("init_num_trials", 500))
 
         if solved_model() is None:
-            self.progress_signal.emit(80, f"[{idx}/{total_videos}] [4/4] Sparse Reconstruction (Incremental Mapper)...")
+            self._begin_stage("map", f"[{idx}/{total_videos}] [4/4] Sparse Reconstruction (Incremental Mapper)...")
             self.log_signal.emit(f"▶ [4/4] Reconstructing 3D camera track with BA Lens Distortion Refinement...", "#ffffff")
             mapper_cmd = [
                 str(self.colmap_exe), "mapper",
@@ -723,7 +1032,7 @@ class TrackerWorker(QThread):
             self.log_signal.emit(
                 f"↻ First solve registered {registered} of {extracted} frames - "
                 f"retrying with a {name} initial pair...", "#e0a000")
-            self.progress_signal.emit(78, f"[{idx}/{total_videos}] [4/4] Retry: {name} initial pair...")
+            self._stage_note(f"[{idx}/{total_videos}] [4/4] Retry: {name} initial pair...")
             out_dir.mkdir(parents=True, exist_ok=True)
             retry_cmd = [
                 str(self.colmap_exe), "mapper",
@@ -794,6 +1103,7 @@ class TrackerWorker(QThread):
             else:
                 self.log_signal.emit(f"✔ All {extracted} frames registered.", "#00ff88")
 
+        self._begin_stage("export", f"[{idx}/{total_videos}] Exporting the solved camera...")
         self.log_signal.emit(f"▶ Exporting best model to TXT format...", "#ffffff")
         conv_cmd = [
             str(self.colmap_exe), "model_converter",
@@ -986,7 +1296,13 @@ class TrackerWorker(QThread):
             self.video_status_signal.emit(video.name, "Export Failed ✖")
             return False
 
+        took = time.monotonic() - started_at
         self.log_signal.emit(f"✔ Successfully tracked and exported '{base_name}'! (Results in 3D_CAMERA_TRACK/{timestamp}/)", "#00ff88")
+        self.log_signal.emit(
+            f"   {frame_count} frames solved in {human_duration(took).replace('about ', '')}"
+            f" — remembered, so the next estimate for a shot this size is closer.",
+            "#a0a0b0")
+        self._record_solve_timing(base_name, frame_count, took)
         self.video_status_signal.emit(video.name, "Completed ✔")
         return True
 
@@ -1041,7 +1357,7 @@ class TrackerWorker(QThread):
         out_dir = track_dir / "sparse_registered"
         self.log_signal.emit(
             f"▶ Trying to register the {missing} frame(s) the mapper skipped...", "#ffffff")
-        self.progress_signal.emit(85, f"Registering {missing} skipped frame(s)...")
+        self._emit_progress(0.9, f"Registering {missing} skipped frame(s)...")
         out_dir.mkdir(parents=True, exist_ok=True)
 
         reg_cmd = [
@@ -1115,6 +1431,25 @@ class TrackerWorker(QThread):
                 pass
             self.process = None
 
+    def _handle_engine_line(self, line_str):
+        """
+        Where one line of the engine's own output goes (2.4).
+
+        COLMAP prints hundreds of INFO lines per stage - one per image - and a
+        real warning between them is invisible, so the whole raw stream goes to
+        the rotating app log and the panel is left for what the artist has to
+        act on. "Show engine output" puts the stream back on screen for a run
+        that needs diagnosing; an error, a frame that would not register or a
+        complaint about the database reaches the panel either way.
+        """
+        kind = engine_line_kind(line_str)
+        (engine_log.warning if kind == "problem" else engine_log.info)("%s", line_str)
+        if kind == "problem":
+            self.log_signal.emit(f"   {line_str}", "#ff7878")
+        elif self.show_engine_output:
+            self.log_signal.emit(f"   {line_str}",
+                                 "#a0d8ef" if kind == "progress" else "#708090")
+
     def _run_command(self, cmd, env, step_name):
         if self.is_cancelled:
             return False
@@ -1138,12 +1473,10 @@ class TrackerWorker(QThread):
                     return False
                 line_str = line.strip()
                 if line_str:
-                    if "Elapsed time:" in line_str or "Registering image" in line_str or "Triangulated" in line_str or "Features:" in line_str:
-                        self.log_signal.emit(f"   {line_str}", "#a0d8ef")
-                    elif "error" in line_str.lower() or "failed" in line_str.lower():
-                        self.log_signal.emit(f"   {line_str}", "#ff7878")
-                    else:
-                        self.log_signal.emit(f"   {line_str}", "#708090")
+                    self._handle_engine_line(line_str)
+                # The engine prints continuously, which is what lets the bar
+                # creep through a stage instead of waiting for the next one.
+                self._tick_progress()
 
             self.process.stdout.close()
             returncode = self.process.wait()

@@ -411,6 +411,18 @@ def build_3d_tab(win, tab, presets):
 
     # ---- Console --------------------------------------------------------
     log_card, lbody = card("Solver Console")
+    # COLMAP's INFO stream is hundreds of lines a stage and used to bury the
+    # app's own warnings, so it now goes to the log file and this puts it back
+    # on screen when a run needs diagnosing (2.4).
+    win.chk_show_engine_output = QCheckBox("Show engine output")
+    win.chk_show_engine_output.setToolTip(
+        "Print COLMAP's own output in this console as well.\n"
+        "It is always written to the app log file; off, the console keeps the\n"
+        "stage lines, warnings, errors and summaries this app writes - and any\n"
+        "engine line that reports a real problem still comes through.")
+    win.chk_show_engine_output.toggled.connect(win._on_show_engine_output)
+    log_card.header_layout.addWidget(win.chk_show_engine_output)
+
     btn_clear_3d_log = make_button("Clear", "Empty the console", "compact")
     btn_clear_3d_log.setFixedWidth(64)
     log_card.header_layout.addWidget(btn_clear_3d_log)
@@ -430,6 +442,18 @@ def build_3d_tab(win, tab, presets):
     # ---- Actions --------------------------------------------------------
     act_card, abody = card(None)
     abody.setSpacing(7)
+
+    # Every shot carries its own saved settings now, and a batch uses them
+    # (2.3). This is the exception: the artist who really does want one lens
+    # model or one frame step across the whole selection.
+    win.chk_force_current_3d = QCheckBox("Apply the settings on screen to every selected shot")
+    win.chk_force_current_3d.setToolTip(
+        "Off, each selected shot is solved with the settings saved in its own\n"
+        "project file, and only a shot that has never been saved uses what is\n"
+        "on screen.\n"
+        "On, this ignores the shots' saved settings and solves all of them with\n"
+        "the settings in these controls.")
+    abody.addWidget(win.chk_force_current_3d)
 
     run_row = QHBoxLayout()
     run_row.setSpacing(7)

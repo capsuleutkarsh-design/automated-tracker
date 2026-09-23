@@ -66,6 +66,7 @@ from gui.theme import (
 )
 from gui.tab_3d import build_3d_tab
 from gui.tab_2d import build_2d_tab
+from gui import shortcuts as shortcut_table
 from core.tracking_layer import TrackingLayer
 from core.workers import TrackerWorker, CoTrackerWorker, FrameExtractorWorker
 from core.hardware import gpu_monitor
@@ -386,6 +387,10 @@ class TrackerMainWindow(QMainWindow):
         self.loaded_video_frames = None
         self.current_play_frame = 0
         self.is_playing = False
+        # J/K/L shuttle (2.5): which way playback is running and how many
+        # frames it moves per tick. 1 forward at 1x is ordinary play.
+        self.play_direction = 1
+        self.play_speed = 1
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self._on_play_timer_tick)
 
@@ -551,6 +556,9 @@ class TrackerMainWindow(QMainWindow):
 
         # Help Menu
         help_menu = menubar.addMenu("&Help")
+        act_keys = help_menu.addAction("Keyboard Shortcuts...")
+        act_keys.triggered.connect(self._show_shortcuts_dialog)
+        help_menu.addSeparator()
         act_about = help_menu.addAction("About Automated Tracker")
         act_about.triggered.connect(self._show_about_dialog)
         self.act_updates = help_menu.addAction("Check for Updates on Start")
@@ -631,6 +639,13 @@ class TrackerMainWindow(QMainWindow):
         self.status_msg.setStyleSheet("padding-left: 6px;")
         statusbar.addWidget(self.status_msg, 1)
 
+        # What Ctrl+Z would take back, kept quietly at the end of the status
+        # bar: an undo the artist cannot name is an undo they are afraid of.
+        self.status_undo = QLabel("Nothing to undo")
+        self.status_undo.setObjectName("statusChip")
+        self.status_undo.setToolTip("Ctrl+Z undoes this. Ctrl+Y (or Ctrl+Shift+Z) redoes it.")
+        statusbar.addPermanentWidget(self.status_undo)
+
         self.status_gpu = QLabel("GPU: Checking...")
         self.status_gpu.setObjectName("statusChip")
 
@@ -647,6 +662,101 @@ class TrackerMainWindow(QMainWindow):
         statusbar.addPermanentWidget(self.status_blender)
         statusbar.addPermanentWidget(self.status_colmap)
         statusbar.addPermanentWidget(self.status_ver)
+
+        # The keys, and the stack they drive, last: both need the 2D tab's
+        # canvas and transport, which the tab builders have just made.
+        self._install_shortcuts()
+        self.canvas_2d.undo_stack.indexChanged.connect(self._on_undo_index_changed)
+        self._refresh_undo_status()
+
+    # =========================================================================
+    # KEYBOARD SHORTCUTS AND UNDO (roadmap 2.5)
+    # =========================================================================
+    def _install_shortcuts(self):
+        """
+        Bind gui/shortcuts.py to this window.
+
+        Every handler is named in that table, so a key that does nothing is a
+        missing entry here rather than a binding hidden somewhere in a widget's
+        keyPressEvent.
+        """
+        handlers = {
+            "play_pause": self._toggle_playback,
+            "shuttle_back": lambda: self._shuttle(-1),
+            "pause": self._pause_playback,
+            "shuttle_fwd": lambda: self._shuttle(1),
+            "step_back": lambda: self._step_frames(-1),
+            "step_fwd": lambda: self._step_frames(1),
+            "step_back_10": lambda: self._step_frames(-10),
+            "step_fwd_10": lambda: self._step_frames(10),
+            "go_start": lambda: self._go_to_frame(0),
+            "go_end": lambda: self._go_to_frame(self.slider_2d_frame.maximum()),
+            "set_in": lambda: self._set_in_point(self.slider_2d_frame.value()),
+            "set_out": lambda: self._set_out_point(self.slider_2d_frame.value()),
+            "clear_in": self._clear_in_point,
+            "clear_out": self._clear_out_point,
+            "prev_key": self._jump_prev_keyframe,
+            "next_key": self._jump_next_keyframe,
+            "del_key": self._delete_mask_keyframe_on_current,
+            "del_mask": self.canvas_2d.delete_selected_mask,
+            "toggle_matte": self.btn_toggle_matte.toggle,
+            "toggle_alpha": self.btn_toggle_alpha.toggle,
+            "undo": self._undo,
+            "redo": self._redo,
+        }
+        # Every one of these drives the 2D viewport, so none of them may fire
+        # from the 3D tab: Del pressed in the media table must not quietly
+        # take a roto keyframe out of a shot the artist is not even looking at.
+        wired = {name: self._only_on_2d_tab(fn) for name, fn in handlers.items()}
+        wired["help"] = self._show_shortcuts_dialog
+        shortcut_table.install(self, wired)
+
+    def _only_on_2d_tab(self, fn):
+        def run():
+            if self.tabs.currentWidget() is self.tab_2d:
+                fn()
+        return run
+
+    def _show_shortcuts_dialog(self):
+        shortcut_table.show_dialog(self)
+
+    def _undo(self):
+        """Ctrl+Z, and say in the status bar what it took back."""
+        stack = self.canvas_2d.undo_stack
+        if not stack.canUndo():
+            self._status("Nothing to undo.")
+            return
+        what = stack.undoText()
+        stack.undo()
+        self._status("Undid: %s" % (what or "the last edit"))
+
+    def _redo(self):
+        stack = self.canvas_2d.undo_stack
+        if not stack.canRedo():
+            self._status("Nothing to redo.")
+            return
+        what = stack.redoText()
+        stack.redo()
+        self._status("Redid: %s" % (what or "the last edit"))
+
+    def _on_undo_index_changed(self, _index):
+        """
+        Anything on the stack moved: the shot's file is now out of date.
+
+        This is the one place that covers both directions - an undo is an edit
+        like any other, and a shot whose roto was just put back must be written
+        again or the next launch restores the version the artist rejected.
+        """
+        self._refresh_undo_status()
+        self._schedule_project_save()
+
+    def _refresh_undo_status(self):
+        stack = self.canvas_2d.undo_stack
+        self.status_undo.setText(
+            ("↶ %s" % stack.undoText()) if stack.canUndo() else "Nothing to undo")
+        # "ok" is the status bar's own green; the roto chips use "key" for the
+        # same colour, but a statusChip only knows these four states.
+        self._set_chip_state(self.status_undo, "ok" if stack.canUndo() else "idle")
 
     def _open_colmap_gui(self):
         if COLMAP_BAT.exists():
@@ -935,6 +1045,11 @@ class TrackerMainWindow(QMainWindow):
             QMessageBox.warning(self, "No Videos Found", f"Please add at least one video or image sequence into:\n{VIDEOS_DIR}")
             return
 
+        # Cleared here rather than just before the worker starts: what the batch
+        # decided about each shot is written below, and clearing after it wiped
+        # the very lines the artist needs to read.
+        self.log_text.clear()
+
         # Only solve what is selected in the media table. Selecting nothing means
         # 'all of them', which is what the button used to do unconditionally.
         selected_names = set()
@@ -998,13 +1113,37 @@ class TrackerMainWindow(QMainWindow):
             "pixel_aspect": float(self.spin_pixel_aspect.value()),
         }
 
+        # Each shot is solved with the settings saved in its own project file
+        # (2.3): a batch is several shots that were each set up on their own
+        # day, and handing all of them whatever the controls happen to show is
+        # handing them the settings of the shot that was open last. The shot in
+        # view may have edits the debounce has not written yet, and the plan is
+        # read from disk, so it is flushed first.
+        self._flush_project_save()
+        force_current = bool(self.chk_force_current_3d.isChecked())
+        shot_names = [Path(v).stem for v in videos]
+        saved = {name: project_file.load_project(
+            project_file.project_path(SCENES_DIR, name)) for name in shot_names}
+        plan = project_file.batch_settings_plan(saved, shot_names, force_current)
+        self._append_log_3d(project_file.batch_summary(plan), ACCENT)
+        if plan["saved"] and plan["current"]:
+            self._append_log_3d(
+                f"   Saved settings: {', '.join(plan['saved'])}. "
+                f"On-screen settings: {', '.join(plan['current'])}.", TEXT_DIM)
+
+        with_own = set(plan["saved"])
+        configs = {
+            str(video): (project_file.solve_config_from_project(config, saved[name], PRESETS)
+                         if name in with_own else dict(config))
+            for video, name in zip(videos, shot_names)
+        }
+
         self._pause_playback()
         self.btn_start_3d.setEnabled(False)
         self.btn_stop_3d.setEnabled(True)
-        self.log_text.clear()
 
         self.worker_3d = TrackerWorker(
-            videos, config,
+            videos, configs,
             base_dir=BASE_DIR,
             colmap_dir=COLMAP_DIR,
             colmap_exe=COLMAP_EXE,
@@ -1012,6 +1151,10 @@ class TrackerMainWindow(QMainWindow):
             ffmpeg_exe=FFMPEG_EXE,
             scenes_dir=SCENES_DIR
         )
+        # The engine's own stream only reaches the console when it is asked for
+        # (2.4); the worker reads this on every line, so it can be turned on
+        # halfway through a solve that is going wrong.
+        self.worker_3d.show_engine_output = bool(self.chk_show_engine_output.isChecked())
         self.worker_3d.log_signal.connect(self._append_log_3d)
         self.worker_3d.progress_signal.connect(self._update_progress_3d)
         self.worker_3d.video_status_signal.connect(self._update_video_status)
@@ -1034,6 +1177,24 @@ class TrackerMainWindow(QMainWindow):
         self._clear_scene_picks()
         self._load_solve_for_shot(self._current_shot_name())
         self._refresh_scene_setup()
+
+    def _on_show_engine_output(self, on):
+        """
+        The 'Show engine output' toggle (2.4).
+
+        A running solve picks it up on its next line, because the moment you
+        want COLMAP's own output is the moment the solve is already going wrong
+        - waiting for the next run to see it would mean solving twice.
+        """
+        on = bool(on)
+        if self.worker_3d is not None:
+            self.worker_3d.show_engine_output = on
+        self._append_log_3d(
+            "Engine output is now shown in this console."
+            if on else
+            "Engine output is hidden; it is still written to the app log file. "
+            "Warnings and errors from the engine always appear here.", TEXT_DIM)
+        self._schedule_settings_save()
 
     def _append_log_3d(self, text, color=TEXT_DIM):
         self.log_text.append(f'<span style="color: {color};">{text}</span>')
@@ -1593,10 +1754,12 @@ class TrackerMainWindow(QMainWindow):
             return
         cur_f = self.slider_2d_frame.value()
         target_masks = [m for m in layer.animated_masks if m.id == self.canvas_2d.selected_mask_id] if self.canvas_2d.selected_mask_id else layer.animated_masks
+        before = self.canvas_2d.mask_snapshot()
         for m in target_masks:
             geom = m.get_interpolated_geometry(cur_f)
             if geom:
                 m.set_keyframe(cur_f, geom["points"], "poly")
+        self.canvas_2d.push_mask_edit("Set a mask keyframe", before)
         self.canvas_2d.masks_changed.emit()
         self.canvas_2d.update()
         self._update_keyframe_status()
@@ -1608,11 +1771,13 @@ class TrackerMainWindow(QMainWindow):
             return
         cur_f = self.slider_2d_frame.value()
         target_masks = [m for m in layer.animated_masks if m.id == self.canvas_2d.selected_mask_id] if self.canvas_2d.selected_mask_id else layer.animated_masks
+        before = self.canvas_2d.mask_snapshot()
         deleted = False
         for m in target_masks:
             if m.delete_keyframe(cur_f):
                 deleted = True
         if deleted:
+            self.canvas_2d.push_mask_edit("Delete a mask keyframe", before)
             self.canvas_2d.masks_changed.emit()
             self.canvas_2d.update()
             self._update_keyframe_status()
@@ -1639,28 +1804,68 @@ class TrackerMainWindow(QMainWindow):
         else:
             self._start_playback()
 
-    def _start_playback(self):
+    def _start_playback(self, direction=1, speed=1):
         self.is_playing = True
-        self.btn_play_pause.setText("⏸ Pause")
+        self.play_direction = 1 if int(direction) >= 0 else -1
+        self.play_speed = max(1, int(speed))
+        self._update_transport_button()
         fps = self.current_fps if self.current_fps and self.current_fps > 0 else 24.0
         self.play_timer.start(max(10, int(round(1000.0 / fps))))
 
     def _pause_playback(self):
         self.is_playing = False
-        self.btn_play_pause.setText("▶ Play")
+        self.play_direction = 1
+        self.play_speed = 1
+        self._update_transport_button()
         self.play_timer.stop()
 
+    def _update_transport_button(self):
+        """The play button says which way and how fast, the way a deck does."""
+        if not self.is_playing:
+            self.btn_play_pause.setText("▶  Play")
+            return
+        arrow = "▶" if self.play_direction > 0 else "◀"
+        self.btn_play_pause.setText(
+            "⏸ Pause" if self.play_speed == 1 and self.play_direction > 0
+            else "⏸ %s %dx" % (arrow, self.play_speed))
+
+    def _shuttle(self, direction):
+        """
+        J and L, the way an editorial timeline shuttles.
+
+        Pressing the key for the way it is already going doubles the speed;
+        pressing the other one stops first, because an artist hammering J to
+        crawl backwards out of a forward play expects the plate to stop, not to
+        lurch straight into reverse.
+        """
+        direction = 1 if int(direction) >= 0 else -1
+        if not self.is_playing:
+            self._start_playback(direction, 1)
+        elif self.play_direction == direction:
+            self._start_playback(direction, min(16, self.play_speed * 2))
+        else:
+            self._pause_playback()
+
     def _step_back_frame(self):
-        self._pause_playback()
-        cur = self.slider_2d_frame.value()
-        if cur > 0:
-            self.slider_2d_frame.setValue(cur - 1)
+        self._step_frames(-1)
 
     def _step_fwd_frame(self):
+        self._step_frames(1)
+
+    def _step_frames(self, offset):
+        """Step by N frames, clamped to the clip. Stepping always stops playback."""
         self._pause_playback()
         cur = self.slider_2d_frame.value()
-        if cur < self.slider_2d_frame.maximum():
-            self.slider_2d_frame.setValue(cur + 1)
+        target = max(0, min(self.slider_2d_frame.maximum(), cur + int(offset)))
+        if target != cur:
+            self.slider_2d_frame.setValue(target)
+
+    def _go_to_frame(self, frame_idx):
+        """Home and End. Also stops playback - a jump is a decision to look."""
+        self._pause_playback()
+        target = max(0, min(self.slider_2d_frame.maximum(), int(frame_idx)))
+        if target != self.slider_2d_frame.value():
+            self.slider_2d_frame.setValue(target)
 
     def _on_play_timer_tick(self):
         max_f = self.slider_2d_frame.maximum()
@@ -1669,47 +1874,46 @@ class TrackerMainWindow(QMainWindow):
             return
 
         cur = self.slider_2d_frame.value()
-        if cur >= max_f:
-            if self.chk_loop.isChecked():
-                self.slider_2d_frame.setValue(0)
-            else:
-                self._pause_playback()
+        step = self.play_direction * self.play_speed
+        nxt = cur + step
+        if 0 <= nxt <= max_f:
+            self.slider_2d_frame.setValue(nxt)
+        elif self.chk_loop.isChecked():
+            # Wrap to the far end, so a looping reverse play runs the shot
+            # backwards over and over instead of stopping dead at the head.
+            self.slider_2d_frame.setValue(max_f if step < 0 else 0)
         else:
-            self.slider_2d_frame.setValue(cur + 1)
-
-    def _step_frame_by_offset(self, offset):
-        if offset > 0:
-            self._step_fwd_frame()
-        else:
-            self._step_back_frame()
-
-    def _nav_keyframe_by_offset(self, offset):
-        if offset > 0:
-            self._jump_next_keyframe()
-        else:
-            self._jump_prev_keyframe()
+            self.slider_2d_frame.setValue(max(0, min(max_f, nxt)))
+            self._pause_playback()
 
     def _set_in_point(self, frame_idx):
-        self.canvas_2d.in_point = int(frame_idx)
-        out_p = self.canvas_2d.out_point if self.canvas_2d.out_point >= 0 else self.slider_2d_frame.maximum()
-        self.lbl_range_status.setText(f"{self.canvas_2d.in_point+1} – {out_p+1}")
-        self._set_chip_state(self.lbl_range_status, "key")
-        self._append_log_2d(f"📍 Set Tracking In-Point to Frame {self.canvas_2d.in_point+1}.", ACCENT)
+        # Through the undo stack, because trimming the range is a decision the
+        # artist can want back - and the chip redraws from range_changed.
+        if self.canvas_2d.push_range(in_point=int(frame_idx),
+                                     text="Set the tracking in-point"):
+            self._append_log_2d(
+                f"📍 Set Tracking In-Point to Frame {self.canvas_2d.in_point+1}.", ACCENT)
 
     def _set_out_point(self, frame_idx):
-        self.canvas_2d.out_point = int(frame_idx)
-        in_p = self.canvas_2d.in_point
-        self.lbl_range_status.setText(f"{in_p+1} – {self.canvas_2d.out_point+1}")
-        self._set_chip_state(self.lbl_range_status, "key")
-        self._append_log_2d(f"📍 Set Tracking Out-Point to Frame {self.canvas_2d.out_point+1}.", ACCENT)
+        if self.canvas_2d.push_range(out_point=int(frame_idx),
+                                     text="Set the tracking out-point"):
+            self._append_log_2d(
+                f"📍 Set Tracking Out-Point to Frame {self.canvas_2d.out_point+1}.", ACCENT)
+
+    def _clear_in_point(self):
+        """Alt+I: track from the head again."""
+        if self.canvas_2d.push_range(in_point=0, text="Clear the in-point"):
+            self._append_log_2d("↺ Cleared the tracking in-point.", ACCENT)
+
+    def _clear_out_point(self):
+        """Alt+O: track to the tail again."""
+        if self.canvas_2d.push_range(out_point=-1, text="Clear the out-point"):
+            self._append_log_2d("↺ Cleared the tracking out-point.", ACCENT)
 
     def _reset_tracking_range(self):
-        self.canvas_2d.in_point = 0
-        self.canvas_2d.out_point = -1
-        self.lbl_range_status.setText("Full")
-        self._set_chip_state(self.lbl_range_status, "idle")
-        self._append_log_2d("↺ Reset Tracking Range to full sequence.", ACCENT)
-        self._schedule_project_save()
+        if self.canvas_2d.push_range(in_point=0, out_point=-1,
+                                     text="Reset the tracking range"):
+            self._append_log_2d("↺ Reset Tracking Range to full sequence.", ACCENT)
 
     def _toggle_canvas_matte_overlay(self, checked):
         self.canvas_2d.show_mask_overlay = checked
@@ -2123,9 +2327,10 @@ class TrackerMainWindow(QMainWindow):
                 "The result does not cover frame %d, so there is nothing to correct there."
                 % (int(frame) + 1), WARN)
             return
-        import cotracker_2d as c2d
-        layer.set_correction(point_index, frame, x, y)
-        c2d.set_corrected_sample(block, point_index, t, x, y)
+        # The canvas owns this edit now, so that one Ctrl+Z takes back both the
+        # mark on the layer and the sample it wrote into the loaded result.
+        self.canvas_2d.push_correction(layer_name, int(point_index), int(frame),
+                                       int(t), float(x), float(y))
         self._last_correction = (layer_name, int(point_index), int(frame))
         self._append_log_2d(
             "◈ Corrected [%s] point #%d on frame %d to (%.1f, %.1f). Re-track ▶ to carry "
@@ -2136,8 +2341,7 @@ class TrackerMainWindow(QMainWindow):
 
     def _on_correction_cleared(self, layer_name, point_index, frame):
         """Forget one correction. The spliced positions stay - only the mark goes."""
-        layer = self._layer_named(layer_name)
-        if layer is not None and layer.clear_correction(point_index, frame):
+        if self.canvas_2d.push_clear_correction(layer_name, int(point_index), int(frame)):
             self._append_log_2d(
                 "Forgot the correction on [%s] point #%d, frame %d."
                 % (layer_name, int(point_index) + 1, int(frame) + 1), TEXT_DIM)
@@ -2843,6 +3047,14 @@ class TrackerMainWindow(QMainWindow):
         # Scale, ground and origin live at the top level, not in settings_3d:
         # they describe the shot's world, not a control on a tab.
         data["scene_transform"] = self._scene_transform
+        # Solve timings (2.4) are written by the solver thread, into shots this
+        # window may not even have open, so they are carried over from the file
+        # rather than from anything on screen - otherwise the next autosave of
+        # the shot in view would quietly throw away the timing it just earned.
+        if self._project_shot:
+            on_disk = project_file.load_project(
+                project_file.project_path(SCENES_DIR, self._project_shot))
+            data["solve_timings"] = (on_disk or {}).get("solve_timings") or []
         return data
 
     def _apply_project(self, data):
@@ -3191,10 +3403,13 @@ class TrackerMainWindow(QMainWindow):
         # moving carries the other with it before the project is written.
         for w in (self.spin_start_frame_2d, self.spin_start_frame_3d):
             w.valueChanged.connect(self._on_timeline_start_changed)
-        # Roto, points and the in/out range are the work itself.
+        # Roto, points and the in/out range are the work itself. Everything
+        # that edits them now goes through the undo stack, so its index moving
+        # is the one signal that means "this shot changed" - in either
+        # direction, since an undo has to be written to disk too.
         self.canvas_2d.masks_changed.connect(p)
-        self.canvas_2d.in_point_requested.connect(lambda _f: p())
-        self.canvas_2d.out_point_requested.connect(lambda _f: p())
+        self.canvas_2d.range_changed.connect(p)
+        self.canvas_2d.corrections_changed.connect(p)
 
     def _schedule_settings_save(self):
         if not self._closing:
@@ -3230,6 +3445,10 @@ class TrackerMainWindow(QMainWindow):
             st.setValue("track2d/last_fps", float(self._last_user_fps))
             st.setValue("media/last_clip", self.combo_2d_video.currentText() or self._last_clip)
             st.setValue("updates/check_on_start", bool(self._check_updates))
+            # Whether COLMAP's own stream is shown is a way of working, not a
+            # property of a shot, so it belongs here rather than in a project.
+            st.setValue("logs/show_engine_output",
+                        bool(self.chk_show_engine_output.isChecked()))
             st.sync()
         except Exception as e:
             log.warning("saving settings failed: %s", e)
@@ -3260,6 +3479,12 @@ class TrackerMainWindow(QMainWindow):
 
             self._check_updates = val("updates/check_on_start", False, bool)
             self.act_updates.setChecked(self._check_updates)
+
+            # Restored quietly: announcing the setting in the console on every
+            # launch would be the first noise in a panel that is now quiet.
+            self.chk_show_engine_output.blockSignals(True)
+            self.chk_show_engine_output.setChecked(val("logs/show_engine_output", False, bool))
+            self.chk_show_engine_output.blockSignals(False)
 
             # Everything else the solver tabs hold is per shot and comes from
             # 04 SCENES/<shot>/project.json when the clip is selected.

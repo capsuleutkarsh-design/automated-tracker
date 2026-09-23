@@ -3,10 +3,11 @@
 **Progress (2026-09-23).** Phase 1 is complete: per-shot project files, the
 frame-rate control, registering the frames COLMAP skipped, scale/ground/origin,
 lens distortion delivery and pixel aspect. From phase 2: track correction and
-confidence in Nuke's error column (2.1, 2.2) and the update check (2.6). From
-phase 3: the DCC verification scripts and the continuous test run (3.2, 3.4).
-Remaining: 2.3 per-shot batch settings, 2.4 quiet logs, 2.5 undo and shortcuts,
-3.1 the window split and 3.3 the installer trim.
+confidence in Nuke's error column (2.1, 2.2), per-shot settings in batch and
+quiet logs (2.3, 2.4), undo with a keyboard scheme (2.5) and the update check
+(2.6). Phase 3 is done except the window split: the DCC verification scripts,
+the installer trim and the continuous test run are in (3.2, 3.3, 3.4).
+Remaining: 3.1, splitting the main window.
 
 Three things were found by testing rather than by reading, and fixed on the way
 through. A solve at Frame Step above 1 put camera keys on consecutive frames

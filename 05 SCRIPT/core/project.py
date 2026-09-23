@@ -137,6 +137,10 @@ def default_project():
         # {"scale", "rotation", "translation"} - or null for "leave the solve
         # in COLMAP's own arbitrary world".
         "scene_transform": None,
+        # How long finished solves of this shot took, newest first (2.4), as
+        # {"frames": n, "seconds": s, "at": iso}. The progress bar reads them so
+        # its estimate is this machine's own speed rather than a guess.
+        "solve_timings": [],
     }
 
 
@@ -249,6 +253,21 @@ def migrate(data):
     if not (isinstance(st, dict) and "scale" in st and "rotation" in st and "translation" in st):
         out["scene_transform"] = None
 
+    # A timing the progress bar cannot do arithmetic on is worse than none at
+    # all, so anything that is not a positive pair of numbers is dropped.
+    timings = []
+    for entry in (out.get("solve_timings") if isinstance(out.get("solve_timings"), list) else []):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            frames, seconds = int(entry.get("frames", 0)), float(entry.get("seconds", 0))
+        except (TypeError, ValueError):
+            continue
+        if frames > 0 and seconds > 0:
+            timings.append({"frames": frames, "seconds": seconds,
+                            "at": str(entry.get("at", ""))})
+    out["solve_timings"] = timings
+
     try:
         out["fps"] = float(out.get("fps") or 0) or 24.0
     except (TypeError, ValueError):
@@ -260,3 +279,210 @@ def migrate(data):
             out[key] = default
 
     return out
+
+
+# -----------------------------------------------------------------------------
+# Batch solving (2.3)
+#
+# Selecting five shots and pressing Start used to hand all five whatever the
+# controls happened to be showing - which is the settings of the sixth shot, the
+# one the artist last had open. Now that every shot carries its own file, a
+# batch uses each shot's own settings and only falls back to the controls for a
+# shot that has never been saved. The plan is worked out here, away from the
+# window, so what the artist is told and what the solver is handed can never
+# disagree.
+# -----------------------------------------------------------------------------
+def batch_settings_plan(saved, shots, force_current=False):
+    """
+    Which of `shots` solve with their own saved settings and which with the controls.
+
+    `saved` maps shot name to that shot's loaded project (or to None, or to
+    nothing at all, for a shot that has never been saved); `shots` is the
+    selection, in the order it will be solved. `force_current` is the artist
+    saying they really do want one setting everywhere, which puts every shot in
+    "current".
+
+    Returns {"saved": [...], "current": [...], "forced": bool} - two lists of
+    shot names that together are `shots`, in the order given.
+    """
+    saved = saved or {}
+    plan = {"saved": [], "current": [], "forced": bool(force_current)}
+    for name in shots:
+        key = str(name)
+        if not force_current and isinstance(saved.get(key), dict):
+            plan["saved"].append(key)
+        else:
+            plan["current"].append(key)
+    return plan
+
+
+def batch_summary(plan):
+    """
+    The sentence the artist reads before a batch starts.
+
+    Plain counts, because the one thing they need to know is whether the shot
+    they just set up is about to be solved with the settings they set up, or
+    with something else.
+    """
+    n_saved, n_current = len(plan.get("saved") or []), len(plan.get("current") or [])
+    total = n_saved + n_current
+    if total == 0:
+        return "No shots to solve."
+    shots = "shot" if total == 1 else "shots"
+    own = "its own saved settings" if n_saved == 1 else "their own saved settings"
+    if plan.get("forced"):
+        return ("Solving %d %s with the settings on screen - each shot's saved settings "
+                "are ignored." % (total, shots))
+    if not n_current:
+        return "Solving %d %s with %s." % (total, shots, own)
+    if not n_saved:
+        return "Solving %d %s with the settings on screen." % (total, shots)
+    return ("Solving %d %s: %d with %s, %d with the settings on screen."
+            % (total, shots, n_saved, own, n_current))
+
+
+def solve_config_from_project(base, data, presets=None):
+    """
+    The solve config for one shot: the controls, overlaid with its saved file.
+
+    `base` is what the 3D tab currently holds - the one config every shot used
+    to get - and `data` is that shot's project. The settings that belong to the
+    shot (its lens model, its step, where it sits on the timeline, its rate and
+    pixel shape, its scene transform, its delivery choices) come from the file;
+    the things that belong to the run rather than to the shot (the roto masks,
+    the executables, the working image size) are left exactly as `base` has
+    them. Masks in particular stay put: they were drawn on one clip, and the
+    worker still refuses to apply them to any other.
+
+    `presets` is the preset table, so a saved preset name can bring back the one
+    value that lives only there - how much forward motion the initialiser will
+    accept. Passing None keeps whatever `base` has.
+    """
+    cfg = dict(base or {})
+    data = migrate(data if isinstance(data, dict) else {})
+    s3 = data.get("settings_3d") or {}
+
+    preset_name = (s3.get("preset") or "").strip()
+    if presets and preset_name in presets:
+        cfg["init_max_forward_motion"] = presets[preset_name].get(
+            "init_max_forward_motion", cfg.get("init_max_forward_motion", 1.0))
+
+    if s3.get("solver_engine"):
+        cfg["solver_engine"] = s3["solver_engine"]
+    # The combo stores the whole label; COLMAP only ever sees the first token,
+    # which is what the window passes it too.
+    cam = str(s3.get("camera_model") or "").split()
+    if cam:
+        cfg["camera_model"] = cam[0]
+
+    cfg["tri_angle"] = float(s3.get("tri_angle", cfg.get("tri_angle", 2.5)))
+    cfg["overlap"] = int(s3.get("overlap", cfg.get("overlap", 35)))
+    cfg["inliers"] = int(s3.get("inliers", cfg.get("inliers", 40)))
+    cfg["frame_step"] = max(1, int(s3.get("frame_step", cfg.get("frame_step", 1))))
+    cfg["single_camera"] = bool(s3.get("single_camera", True))
+    cfg["ba_refine_distortion"] = bool(s3.get("ba_refine_distortion", True))
+    cfg["use_gpu"] = bool(s3.get("use_gpu", True))
+    cfg["enable_caspar_ba"] = bool(s3.get("caspar_ba", True))
+    cfg["generate_mesh"] = bool(s3.get("generate_mesh", False))
+    cfg["write_undistort"] = bool(s3.get("write_undistort", False))
+    cfg["overscan"] = float(s3.get("overscan", 0.0))
+    cfg["pixel_aspect"] = float(s3.get("pixel_aspect", 1.0))
+
+    # An empty Blender path means "find it yourself", which is what the window
+    # sends as None - an empty string would be read as a path that is not there.
+    blender = (s3.get("blender_path") or "").strip()
+    if blender:
+        cfg["blender_path"] = blender
+
+    cfg["fps"] = float(data.get("fps") or 0) or cfg.get("fps")
+    cfg["timeline_start"] = int(data.get("timeline_start", cfg.get("timeline_start", 1)))
+    # Each shot's own floor and scale, rather than those of the shot that
+    # happens to be open in the window.
+    cfg["scene_transform"] = data.get("scene_transform")
+    return cfg
+
+
+# -----------------------------------------------------------------------------
+# How long a solve takes (2.4)
+# -----------------------------------------------------------------------------
+# What to assume before anything has been timed. A hundred-frame shot lands
+# around three minutes end to end on a mid-range GPU; it is only the opening
+# guess, and the first finished solve of a similar size replaces it with the
+# truth about this machine.
+DEFAULT_SECONDS_PER_FRAME = 1.8
+MIN_SOLVE_SECONDS = 20.0
+
+# How different in length a stored solve may be and still be worth scaling from.
+SIMILAR_SIZE_RATIO = 2.0
+
+# How many timings a shot keeps. Enough to cover a re-solve at another frame
+# step without the file growing for ever.
+KEEP_SOLVE_TIMINGS = 6
+
+
+def estimate_solve_seconds(frame_count, timings=None):
+    """
+    How long a solve of `frame_count` frames is likely to take, in seconds.
+
+    A time measured on this machine beats any formula, because it already
+    carries the GPU, the disk and the kind of plate. "Similar size" is generous
+    - between half and twice the frames - and the stored time is scaled by the
+    ratio of frame counts, since a solve costs close enough to linearly in
+    frames over that range. With nothing stored, or nothing near enough in
+    length, the default rate is used; either way the answer never drops below
+    MIN_SOLVE_SECONDS, so a very short shot still gets a bar that moves rather
+    than one that reaches the end and then waits.
+    """
+    try:
+        frames = int(frame_count)
+    except (TypeError, ValueError):
+        frames = 0
+    frames = max(1, frames)
+
+    best = None
+    for entry in (timings or []):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            n, seconds = int(entry.get("frames", 0)), float(entry.get("seconds", 0))
+        except (TypeError, ValueError):
+            continue
+        if n <= 0 or seconds <= 0:
+            continue
+        ratio = frames / float(n)
+        if ratio > SIMILAR_SIZE_RATIO or ratio < 1.0 / SIMILAR_SIZE_RATIO:
+            continue
+        # The closest in length wins; a tie keeps the newer one, which is first.
+        distance = abs(ratio - 1.0)
+        if best is None or distance < best[0]:
+            best = (distance, seconds * ratio)
+
+    if best is not None:
+        return max(MIN_SOLVE_SECONDS, best[1])
+    return max(MIN_SOLVE_SECONDS, frames * DEFAULT_SECONDS_PER_FRAME)
+
+
+def record_solve_timing(data, frame_count, seconds, keep=KEEP_SOLVE_TIMINGS):
+    """
+    Add a finished solve's timing to a project dict, newest first.
+
+    Mutates and returns `data`, so the caller can save it straight back. A
+    nonsense measurement (no frames, or a solve that took no time at all
+    because it failed immediately) is ignored rather than stored to mislead the
+    next estimate.
+    """
+    if not isinstance(data, dict):
+        return data
+    try:
+        frames, secs = int(frame_count), float(seconds)
+    except (TypeError, ValueError):
+        return data
+    if frames <= 0 or secs <= 0:
+        return data
+    timings = data.get("solve_timings")
+    if not isinstance(timings, list):
+        timings = []
+    timings.insert(0, {"frames": frames, "seconds": round(secs, 2),
+                       "at": datetime.datetime.now().isoformat(timespec="seconds")})
+    data["solve_timings"] = timings[:max(1, int(keep))]
+    return data

@@ -13,10 +13,13 @@ Double-click **`BUILD.bat`**. It runs two steps:
    `AutomatedTracker_Setup_<version>-1.bin`, `-2.bin`, ...
 
 The installer is the exe *plus* every `.bin` beside it. The payload (PyTorch,
-the CoTracker model, COLMAP, FFmpeg) compresses to more than 2 GB, and Inno
-Setup cannot write a single setup exe that large, so it splits the data into
-`.bin` slices and leaves a small exe that reads them. Ship the whole `Output`
-folder together — the exe on its own installs nothing.
+the CoTracker model, COLMAP, FFmpeg) compresses to around 2 GB, and Inno Setup
+cannot write a single setup exe past 2,097,152,000 bytes, so it splits the data
+into `.bin` slices and leaves a small exe that reads them. Ship the whole
+`Output` folder together — the exe on its own installs nothing. The 1.1.1
+installer was 2.1 GB across three files; trimming PyTorch took 375 MB off the
+frozen build, so the next one will be smaller, but the layout does not change —
+`DiskSpanning=yes` produces the slices either way.
 
 ```
 BUILD.bat              full build (exe + installer)
@@ -27,7 +30,7 @@ BUILD.bat check        verify prerequisites only, build nothing
 
 extra words, combinable with the above in any order:
 BUILD.bat ... console  debug exe with a console window (build_app.py --console)
-BUILD.bat ... noverify skip the built exe's self-test     (build_app.py --no-verify)
+BUILD.bat ... noverify skip the built exe's self-test and test track (--no-verify)
 ```
 
 Run `BUILD.bat check` first if you are unsure — it reports every missing piece
@@ -41,15 +44,16 @@ at once instead of failing part way through.
 | PyInstaller | installed automatically on first build |
 | Inno Setup | 5 or 6, from <https://jrsoftware.org/isdl.php> |
 | Disk | ~12 GB free during the build; the installer (exe + `.bin` slices) is several GB |
-| Time | 10–25 minutes for a clean build (PyTorch is ~3.6 GB) |
+| Time | 2–4 minutes for the exe, 10–25 for a clean build with the installer |
 
 ## Files here
 
 | File | Purpose |
 |---|---|
 | `BUILD.bat` | the orchestrator — run this |
-| `build_app.py` | the Python step: PyInstaller, icon, version stamp |
-| `automated_tracker.spec` | PyInstaller configuration |
+| `build_app.py` | the Python step: PyInstaller, icon, version stamp, verification |
+| `automated_tracker.spec` | PyInstaller configuration, including what is trimmed |
+| `rthook_gpu_track.py` | lets the frozen exe track one clip so the build can check it |
 | `installer.iss` | Inno Setup configuration |
 | `app_icon.ico` | generated on first build |
 | `dist/`, `work/`, `Output/` | build products (git-ignored) |
@@ -89,6 +93,41 @@ the app writes into them and whoever runs it will not be an administrator.
 The result is `build/dist/Automated_Tracker/Automated_Tracker.exe`. To test it
 before making an installer, copy the whole `Automated_Tracker` folder's contents
 to the tracker root so the exe sits beside `01 COLMAP`, then run it.
+
+## What gets left out, and how we know it can be
+
+`build/dist/Automated_Tracker` is 3.5 GB, of which 3.1 GB is PyTorch's CUDA
+libraries. Four of them are dropped by `TRIM_BINARIES` in
+`automated_tracker.spec` — cuDNN's recurrent-network engines, the multi-GPU
+cuSOLVER, the host cuRAND and the CUDA profiler — along with `torch/bin`, the
+wheel's build tools. That is 375 MB, and the comments in the spec say why each
+one is there.
+
+Most of what looks droppable is not. `tools/measure_loaded_modules.py` is what
+settles it: it runs the self-test and a real GPU track, reads the process's own
+loaded-module list, walks the import tables in `torch/lib`, and will re-run the
+whole workload with any candidate renamed aside.
+
+```
+"00 PYTHON\python.exe" tools\measure_loaded_modules.py
+"00 PYTHON\python.exe" tools\measure_loaded_modules.py --probe curand64_10.dll
+```
+
+Read its output before adding anything to the list. Two traps it catches:
+torch loads every DLL in `torch/lib` on import whether or not anything uses it,
+so "the process loaded it" means nothing there; and the biggest candidates —
+the 562 MB precompiled cuDNN engine library, cuBLASLt — turn out to be
+load-bearing, the first for every convolution and the second as a static import
+of `torch_cuda.dll`.
+
+`tools/pack_runtime.py` drops the same four for the source runtime, and must
+keep doing so: the zips and the installer have to ship the same PyTorch.
+
+Every build verifies the result twice — the self-test, then one real 2D track
+on the GPU run by the frozen exe on itself through `rthook_gpu_track.py`, which
+reports the device, the peak VRAM and the files it wrote. The self-test alone
+is not enough: a trim too far leaves it green and dies on the first
+convolution. `noverify` skips both.
 
 ## Building just the installer
 

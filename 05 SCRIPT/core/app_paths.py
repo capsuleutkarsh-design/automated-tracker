@@ -65,6 +65,21 @@ def ffprobe_exe():
     return _first_existing(FFMPEG_DIR / "bin" / "ffprobe.exe", FFMPEG_DIR / "ffprobe.exe")
 
 
+def use_bundled_ffmpeg_for_imageio():
+    """
+    Point imageio at the FFmpeg we already ship.
+
+    imageio-ffmpeg carries its own 84 MB copy, which is the same tool we bundle
+    in 03 FFMPEG and the only thing the overlay writer needs it for. Naming ours
+    in the environment lets the build leave that duplicate out.
+    """
+    exe = ffmpeg_exe()
+    if exe and Path(exe).exists():
+        os.environ.setdefault("IMAGEIO_FFMPEG_EXE", str(exe))
+        return str(exe)
+    return None
+
+
 def colmap_bat():
     """The COLMAP.bat wrapper that sets up COLMAP's own Qt plugin path."""
     return COLMAP_DIR / "COLMAP.bat"

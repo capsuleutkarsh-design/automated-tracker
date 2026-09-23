@@ -21,6 +21,15 @@ from PIL import Image, ImageDraw
 
 import torch
 
+# CoTracker is transformer-heavy; its convolutional backbone is small enough
+# that cuDNN buys nothing here, and cuDNN's own libraries are about 990 MB of
+# the installer. Measured on an RTX 4080 SUPER over a 200-frame 12x12 grid at
+# 720p: 9.87 s and 10.7 GB peak VRAM with cuDNN, 9.91 s and 8.8 GB without. So
+# turning it off costs nothing measurable, frees nearly 2 GB of VRAM for longer
+# chunks, and lets the build drop the libraries entirely. Set before any model
+# runs, because the choice is read when a convolution is first dispatched.
+torch.backends.cudnn.enabled = False
+
 _here = Path(__file__).resolve().parent
 if not getattr(sys, 'frozen', False) and str(_here) not in sys.path:
     sys.path.insert(0, str(_here))
@@ -1386,6 +1395,9 @@ def _render_overlay(proc_frames_np, layers, out_mp4_path, fps=24, trail_len=15):
     picked out of the window with numpy rather than a Python loop per sample.
     """
     import imageio
+    # Use the FFmpeg we ship rather than imageio's own copy of it.
+    from core.app_paths import use_bundled_ffmpeg_for_imageio
+    use_bundled_ffmpeg_for_imageio()
 
     T = proc_frames_np.shape[0]
     prepared = []

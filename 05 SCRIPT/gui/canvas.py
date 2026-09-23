@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QLabel, QMenu
 from PySide6.QtCore import Qt, Signal, QPointF, QRectF
 from PySide6.QtGui import (
     QFont, QColor, QPixmap, QPainter, QPen, QBrush, QPainterPath, QPolygonF,
-    QDragEnterEvent, QDropEvent
+    QDragEnterEvent, QDropEvent, QUndoCommand, QUndoStack
 )
 
 from gui.theme import WARN, TEXT, OK, ACCENT
@@ -27,6 +27,19 @@ SOLVED_PICK_RADIUS_PX = 8.0
 # Larger, because it is a drag rather than a click and a marker sits under the
 # cursor's own tip.
 TRACK_GRAB_RADIUS_PX = 10.0
+
+# A tracking point the artist placed by hand, and a roto vertex, are grabbed
+# the same way and at the same size on screen.
+POINT_GRAB_RADIUS_PX = 10.0
+VERTEX_GRAB_RADIUS_PX = 9.0
+
+# How near an edge a right-click has to land to offer inserting a vertex there.
+EDGE_PICK_RADIUS_PX = 10.0
+
+# How many canvas edits the undo stack remembers. Each one carries a snapshot
+# of the masks or points it touched, which is kilobytes at worst, so this is
+# about keeping the history readable rather than about memory.
+UNDO_LIMIT = 200
 
 
 def project_solved_points(points_world, center, r_cam_to_world, cam):
@@ -81,6 +94,98 @@ def project_solved_points(points_world, center, r_cam_to_world, cam):
     return xy, visible
 
 
+class _CanvasCommand(QUndoCommand):
+    """
+    Base for every undoable canvas edit (roadmap 2.5).
+
+    A command carries the BEFORE and the AFTER state of the one thing it
+    touched, and applying it is simply writing that state back. Replaying an
+    edit in reverse instead would mean every operation needed an exact
+    inverse, and dragging a roto vertex around for two seconds has no such
+    thing - only the numbers it started and ended on.
+
+    Both snapshots are plain data (dicts, lists, tuples), never references
+    into the live model, so a later edit cannot rewrite this command's idea of
+    the past from underneath it.
+    """
+
+    def __init__(self, canvas, text, before, after):
+        super().__init__(text)
+        self.canvas = canvas
+        self.before = before
+        self.after = after
+
+    def _apply(self, state):
+        raise NotImplementedError
+
+    def redo(self):
+        self._apply(self.after)
+
+    def undo(self):
+        self._apply(self.before)
+
+
+class MaskStateCommand(_CanvasCommand):
+    """
+    Every mask on one layer, before and after.
+
+    One class covers drawing a mask, moving it, adding, moving and deleting a
+    vertex, setting, moving and deleting a keyframe, and deleting the mask -
+    because all of them are the same thing to the model: the layer's list of
+    shapes changed. Keeping the whole list means a vertex insert, which has to
+    touch every keyframe of the mask to keep the point counts matching, still
+    undoes in one press.
+    """
+
+    def __init__(self, canvas, layer_index, before, after, text):
+        super().__init__(canvas, text, before, after)
+        self.layer_index = int(layer_index)
+
+    def _apply(self, state):
+        self.canvas.restore_mask_state(self.layer_index, state)
+
+
+class LayerPointsCommand(_CanvasCommand):
+    """The hand-placed tracking points of one layer: add, move, delete, clear."""
+
+    def __init__(self, canvas, layer_index, before, after, text):
+        super().__init__(canvas, text, before, after)
+        self.layer_index = int(layer_index)
+
+    def _apply(self, state):
+        self.canvas.restore_points(self.layer_index, state)
+
+
+class CorrectionCommand(_CanvasCommand):
+    """
+    A hand correction to a solved 2D track (roadmap 2.1), made undoable.
+
+    Two things move together and so must come back together: the layer's list
+    of corrections, which is what the project file and the timeline ticks
+    read, and the sample in the loaded result, which is what the overlay draws
+    and the exports are written from.
+    """
+
+    def __init__(self, canvas, layer_index, layer_name, point_index, t_index,
+                 before, after, text):
+        super().__init__(canvas, text, before, after)
+        self.layer_index = int(layer_index)
+        self.layer_name = layer_name
+        self.point_index = int(point_index)
+        self.t_index = t_index
+
+    def _apply(self, state):
+        self.canvas.restore_corrections(
+            self.layer_index, self.layer_name, self.point_index, self.t_index, state)
+
+
+class RangeCommand(_CanvasCommand):
+    """The in and out points. A trimmed range is a decision like any other."""
+
+    def _apply(self, state):
+        self.canvas.restore_range(state)
+
+
 class VideoPointPickerCanvas(QLabel):
     point_added = Signal(int, float, float)
     solved_point_picked = Signal(int)
@@ -92,15 +197,14 @@ class VideoPointPickerCanvas(QLabel):
     retrack_requested = Signal(str, int, int, bool)
     # The context menu asked to forget a correction: (layer name, point, frame).
     correction_cleared = Signal(str, int, int)
+    # "The active layer's contents changed, relist it and save the project."
+    # Masks, points and everything an undo puts back go through this one.
     masks_changed = Signal()
     file_dropped = Signal(str)
-    playback_toggle_requested = Signal()
-    step_frame_requested = Signal(int)
-    keyframe_nav_requested = Signal(int)
-    in_point_requested = Signal(int)
-    out_point_requested = Signal(int)
-    mask_overlay_toggled = Signal(bool)
-    alpha_mode_toggled = Signal(bool)
+    # An undoable edit changed the corrections, or the in/out range (2.5), so
+    # the chips that report them can redraw without knowing who did it.
+    corrections_changed = Signal()
+    range_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -173,6 +277,20 @@ class VideoPointPickerCanvas(QLabel):
         self.is_dragging_shape = False
         self.is_dragging_vertex = False
         self._mask_drag_dirty = False
+        # A hand-placed tracking point being dragged: its index, and the whole
+        # list as it was when the drag started - the undo command's "before".
+        self.point_drag_idx = None
+        self._points_before = None
+        # The masks as they were when the current drag started, for the same
+        # reason: a drag is one edit however many mouse-move events it took.
+        self._mask_edit_before = None
+
+        # One undo stack behind every canvas edit (roadmap 2.5). It belongs to
+        # the canvas rather than the window because a clip change has to clear
+        # it - undoing onto a different plate would put a mask back on a shot
+        # it was never drawn for.
+        self.undo_stack = QUndoStack(self)
+        self.undo_stack.setUndoLimit(UNDO_LIMIT)
 
     @property
     def active_layer(self):
@@ -210,16 +328,20 @@ class VideoPointPickerCanvas(QLabel):
 
     def clear_active_layer_points(self):
         if self.active_layer:
+            before = self.points_snapshot()
             self.active_layer.points.clear()
+            self.push_points_edit("Clear the tracking points", before)
             self.update()
 
     def clear_active_layer_masks(self):
         if self.active_layer:
+            before = self.mask_snapshot()
             self.active_layer.animated_masks.clear()
             self.current_poly.clear()
             self.drag_start = None
             self.drag_current = None
             self.selected_mask_id = None
+            self.push_mask_edit("Clear the masks", before)
             self.masks_changed.emit()
             self.update()
 
@@ -260,6 +382,10 @@ class VideoPointPickerCanvas(QLabel):
         self.in_point = int(in_point)
         self.out_point = int(out_point)
         self.invalidate_frame_cache()
+        # This is the one place a clip change reaches the canvas, so it is
+        # where the history has to go: an undo that reached back past it would
+        # put the previous shot's roto onto this plate.
+        self.reset_undo_history()
         self.masks_changed.emit()
         self.update()
         return len(layers)
@@ -267,6 +393,361 @@ class VideoPointPickerCanvas(QLabel):
     def invalidate_frame_cache(self):
         """Drop every cached scaled frame. Call when a different clip is loaded."""
         self._scaled_cache.clear()
+
+    # -- Undo (roadmap 2.5) -------------------------------------------------
+    def reset_undo_history(self):
+        """Forget every undoable edit. Called when the clip changes."""
+        self.undo_stack.clear()
+
+    def _layer_index(self, layer=None):
+        """Index of a layer in the stack; the active one by default, or None."""
+        layer = layer if layer is not None else self.active_layer
+        if layer is None:
+            return None
+        for i, l in enumerate(self.layers):
+            if l is layer:
+                return i
+        return None
+
+    # -- masks
+    def mask_snapshot(self, layer_index=None):
+        """
+        Every mask on a layer as plain data, plus which one is selected.
+
+        AnimatedMask.to_dict already deep-copies its keyframes, which is
+        exactly what a snapshot needs: the artist carries on dragging the live
+        shape the moment this returns.
+        """
+        idx = self._layer_index() if layer_index is None else int(layer_index)
+        if idx is None or not (0 <= idx < len(self.layers)):
+            return None
+        return {"masks": [m.to_dict() for m in self.layers[idx].animated_masks],
+                "selected": self.selected_mask_id}
+
+    def restore_mask_state(self, layer_index, state):
+        """Put a mask snapshot back. The undo commands' one way in."""
+        if state is None or not (0 <= int(layer_index) < len(self.layers)):
+            return
+        layer = self.layers[int(layer_index)]
+        layer.animated_masks = [AnimatedMask.from_dict(d) for d in state["masks"]]
+        ids = {m.id for m in layer.animated_masks}
+        self.selected_mask_id = state["selected"] if state["selected"] in ids else None
+        # A vertex index only means something for the shape it was picked on.
+        self.selected_vertex_idx = None
+        self.masks_changed.emit()
+        self.update()
+
+    def push_mask_edit(self, text, before, layer_index=None):
+        """
+        Record a finished mask edit. True if anything actually changed.
+
+        The edit has already been made on the live model by the time this is
+        called: the command's redo() simply writes the same state again, which
+        is what makes the first push a no-op and every later redo exact.
+        """
+        idx = self._layer_index() if layer_index is None else int(layer_index)
+        if idx is None or before is None:
+            return False
+        after = self.mask_snapshot(idx)
+        if after is None or after == before:
+            return False
+        self.undo_stack.push(MaskStateCommand(self, idx, before, after, text))
+        return True
+
+    # -- hand-placed tracking points
+    def points_snapshot(self, layer_index=None):
+        """One layer's (frame, x, y) clicks, copied."""
+        idx = self._layer_index() if layer_index is None else int(layer_index)
+        if idx is None or not (0 <= idx < len(self.layers)):
+            return None
+        return [tuple(p) for p in self.layers[idx].points]
+
+    def restore_points(self, layer_index, state):
+        if state is None or not (0 <= int(layer_index) < len(self.layers)):
+            return
+        self.layers[int(layer_index)].points = [tuple(p) for p in state]
+        self.masks_changed.emit()
+        self.update()
+
+    def push_points_edit(self, text, before, layer_index=None):
+        idx = self._layer_index() if layer_index is None else int(layer_index)
+        if idx is None or before is None:
+            return False
+        after = self.points_snapshot(idx)
+        if after is None or after == before:
+            return False
+        self.undo_stack.push(LayerPointsCommand(self, idx, before, after, text))
+        self.masks_changed.emit()
+        return True
+
+    def add_point(self, frame_idx, ox, oy):
+        """Place a tracking point on the active layer, undoably."""
+        layer = self.active_layer
+        if layer is None:
+            return False
+        before = self.points_snapshot()
+        layer.points.append((int(frame_idx), float(ox), float(oy)))
+        return self.push_points_edit("Add a tracking point", before)
+
+    def delete_point(self, index):
+        """Remove one hand-placed point from the active layer."""
+        layer = self.active_layer
+        if layer is None or not (0 <= int(index) < len(layer.points)):
+            return False
+        before = self.points_snapshot()
+        del layer.points[int(index)]
+        ok = self.push_points_edit("Delete a tracking point", before)
+        self.update()
+        return ok
+
+    def nearest_point_index(self, ox, oy, radius_px=POINT_GRAB_RADIUS_PX):
+        """
+        The active layer's point nearest a click on THIS frame, or None.
+
+        Only points keyed on the frame in view are grabbable: the faint ghosts
+        of points placed on other frames are there to be seen, not moved, and
+        dragging one from the wrong frame is a correction nobody asked for.
+        """
+        layer = self.active_layer
+        if layer is None or not layer.points:
+            return None
+        sx, sy = self._screen_scale()
+        if sx is None:
+            return None
+        best, best_d = None, float("inf")
+        for i, (f_num, px, py) in enumerate(layer.points):
+            if int(f_num) != int(self.current_frame):
+                continue
+            d = np.hypot((px - ox) * sx, (py - oy) * sy)
+            if d < best_d:
+                best, best_d = i, d
+        return best if best_d <= float(radius_px) else None
+
+    # -- mask vertices and keyframes
+    def _mask_by_id(self, mask_id, layer=None):
+        layer = layer or self.active_layer
+        if layer is None:
+            return None
+        return next((m for m in layer.animated_masks if m.id == mask_id), None)
+
+    def insert_mask_vertex(self, mask_id, edge_index):
+        """
+        Add a vertex in the middle of one edge, on EVERY keyframe of the mask.
+
+        The keyframes interpolate vertex for vertex, so a shape with four
+        points on one key and five on the next cannot be interpolated at all -
+        get_interpolated_geometry gives up and snaps to the nearer key. Adding
+        the point everywhere, at the midpoint of the same edge, keeps every
+        keyframe looking exactly as it did and leaves the artist a handle to
+        pull.
+        """
+        mask = self._mask_by_id(mask_id)
+        if mask is None or not mask.keyframes:
+            return False
+        before = self.mask_snapshot()
+        for kf in mask.keyframes.values():
+            pts = list(kf.data)
+            if len(pts) < 2:
+                continue
+            i = int(edge_index) % len(pts)
+            j = (i + 1) % len(pts)
+            mid = ((pts[i][0] + pts[j][0]) / 2.0, (pts[i][1] + pts[j][1]) / 2.0)
+            pts.insert(i + 1, mid)
+            kf.data = pts
+        ok = self.push_mask_edit("Add a mask vertex", before)
+        self.masks_changed.emit()
+        self.update()
+        return ok
+
+    def delete_mask_vertex(self, mask_id, vertex_index):
+        """Remove one vertex from every keyframe, for the same 1:1 reason."""
+        mask = self._mask_by_id(mask_id)
+        if mask is None or not mask.keyframes:
+            return False
+        if any(len(kf.data) <= 3 for kf in mask.keyframes.values()):
+            # Three points is the smallest thing that is still a shape.
+            return False
+        before = self.mask_snapshot()
+        for kf in mask.keyframes.values():
+            pts = list(kf.data)
+            if 0 <= int(vertex_index) < len(pts):
+                del pts[int(vertex_index)]
+                kf.data = pts
+        ok = self.push_mask_edit("Delete a mask vertex", before)
+        self.masks_changed.emit()
+        self.update()
+        return ok
+
+    def move_mask_keyframe(self, mask_id, from_frame, to_frame):
+        """Retime one keyframe. The shape is unchanged; only its frame moves."""
+        mask = self._mask_by_id(mask_id)
+        from_frame, to_frame = int(from_frame), int(to_frame)
+        if mask is None or from_frame == to_frame or not mask.has_keyframe(from_frame):
+            return False
+        before = self.mask_snapshot()
+        data = list(mask.keyframes[from_frame].data)
+        mask.delete_keyframe(from_frame)
+        mask.set_keyframe(to_frame, data, "poly")
+        ok = self.push_mask_edit("Move a mask keyframe", before)
+        self.masks_changed.emit()
+        self.update()
+        return ok
+
+    def _selected_geometry(self):
+        """The selected mask and its points on this frame, or (None, None)."""
+        mask = self._selected_mask()
+        if mask is None:
+            return None, None
+        geom = mask.get_interpolated_geometry(self.current_frame)
+        pts = (geom or {}).get("points") or []
+        return (mask, pts) if len(pts) >= 3 else (None, None)
+
+    def nearest_mask_vertex(self, ox, oy, radius_px=VERTEX_GRAB_RADIUS_PX):
+        """(mask, vertex index) of the selected mask's nearest vertex, or None."""
+        mask, pts = self._selected_geometry()
+        sx, sy = self._screen_scale()
+        if mask is None or sx is None:
+            return None
+        best, best_d = None, float("inf")
+        for i, (px, py) in enumerate(pts):
+            d = np.hypot((px - ox) * sx, (py - oy) * sy)
+            if d < best_d:
+                best, best_d = i, d
+        return (mask, best) if best_d <= float(radius_px) else None
+
+    def nearest_mask_edge(self, ox, oy, radius_px=EDGE_PICK_RADIUS_PX):
+        """(mask, edge index) of the selected mask's nearest edge, or None."""
+        mask, pts = self._selected_geometry()
+        sx, sy = self._screen_scale()
+        if mask is None or sx is None:
+            return None
+        best, best_d = None, float("inf")
+        for i in range(len(pts)):
+            ax, ay = pts[i]
+            bx, by = pts[(i + 1) % len(pts)]
+            # Distance to the segment, measured in screen pixels so the target
+            # is the same size however far the plate is zoomed out.
+            vx, vy = (bx - ax) * sx, (by - ay) * sy
+            wx, wy = (ox - ax) * sx, (oy - ay) * sy
+            span = vx * vx + vy * vy
+            t = 0.0 if span <= 1e-9 else max(0.0, min(1.0, (wx * vx + wy * vy) / span))
+            d = np.hypot(wx - t * vx, wy - t * vy)
+            if d < best_d:
+                best, best_d = i, d
+        return (mask, best) if best_d <= float(radius_px) else None
+
+    def _screen_scale(self):
+        """Plate pixels -> screen pixels for the frame as it is shown, or None."""
+        scaled = self._scaled_pixmap()
+        if scaled is None or scaled.width() == 0 or scaled.height() == 0:
+            return None, None
+        return (scaled.width() / float(self.orig_w or 1),
+                scaled.height() / float(self.orig_h or 1))
+
+    # -- track corrections (roadmap 2.1) made undoable
+    def _tracked_sample(self, layer_name, point_index, t_index):
+        """One sample of the loaded result as plain numbers, or None."""
+        block = (self.tracked_layers or {}).get(layer_name)
+        if block is None or t_index is None:
+            return None
+        tracks = block["tracks"]
+        t, n = int(t_index), int(point_index)
+        if not (0 <= t < tracks.shape[0] and 0 <= n < tracks.shape[1]):
+            return None
+        vis = block.get("vis")
+        conf = block.get("conf")
+        return (float(tracks[t, n, 0]), float(tracks[t, n, 1]),
+                bool(vis[t, n]) if vis is not None else None,
+                float(conf[t, n]) if conf is not None else None)
+
+    def _write_tracked_sample(self, layer_name, point_index, t_index, sample):
+        """Write a sample back into the loaded result, in place."""
+        block = (self.tracked_layers or {}).get(layer_name)
+        if block is None or sample is None or t_index is None:
+            return False
+        tracks = block["tracks"]
+        t, n = int(t_index), int(point_index)
+        if not (0 <= t < tracks.shape[0] and 0 <= n < tracks.shape[1]):
+            return False
+        x, y, vis, conf = sample
+        tracks[t, n, 0] = float(x)
+        tracks[t, n, 1] = float(y)
+        if vis is not None and block.get("vis") is not None:
+            block["vis"][t, n] = bool(vis)
+        if conf is not None and block.get("conf") is not None:
+            block["conf"][t, n] = float(conf)
+        return True
+
+    def _corrections_snapshot(self, layer, layer_name, point_index, t_index):
+        return {"corrections": [dict(c) for c in layer.corrections],
+                "sample": self._tracked_sample(layer_name, point_index, t_index)}
+
+    def restore_corrections(self, layer_index, layer_name, point_index, t_index, state):
+        if state is None or not (0 <= int(layer_index) < len(self.layers)):
+            return
+        layer = self.layers[int(layer_index)]
+        layer.corrections = [dict(c) for c in state["corrections"]]
+        self._write_tracked_sample(layer_name, point_index, t_index, state["sample"])
+        self.corrections_changed.emit()
+        self.update()
+
+    def push_correction(self, layer_name, point_index, frame, t_index, x, y):
+        """
+        Record a dragged marker as the artist's correction, undoably.
+
+        The sample in the loaded result is marked visible and fully confident,
+        because a position placed by hand is the most reliable sample in the
+        track - the same rule the engine's own set_corrected_sample follows.
+        """
+        layer = self._layer_by_name(layer_name)
+        idx = self._layer_index(layer)
+        if layer is None or idx is None:
+            return False
+        before = self._corrections_snapshot(layer, layer_name, point_index, t_index)
+        layer.set_correction(point_index, frame, x, y)
+        self._write_tracked_sample(layer_name, point_index, t_index,
+                                   (float(x), float(y), True, 1.0))
+        after = self._corrections_snapshot(layer, layer_name, point_index, t_index)
+        self.undo_stack.push(CorrectionCommand(
+            self, idx, layer_name, point_index, t_index, before, after,
+            "Correct a tracked point"))
+        return True
+
+    def push_clear_correction(self, layer_name, point_index, frame):
+        """
+        Forget one correction, undoably.
+
+        The spliced positions stay exactly where they are - only the mark
+        goes - so there is no sample to put back and none to take away.
+        """
+        layer = self._layer_by_name(layer_name)
+        idx = self._layer_index(layer)
+        if layer is None or idx is None:
+            return False
+        before = self._corrections_snapshot(layer, layer_name, point_index, None)
+        if not layer.clear_correction(point_index, frame):
+            return False
+        after = self._corrections_snapshot(layer, layer_name, point_index, None)
+        self.undo_stack.push(CorrectionCommand(
+            self, idx, layer_name, point_index, None, before, after,
+            "Forget a correction"))
+        return True
+
+    # -- in and out points
+    def restore_range(self, state):
+        self.in_point, self.out_point = int(state[0]), int(state[1])
+        self.range_changed.emit()
+        self.update()
+
+    def push_range(self, in_point=None, out_point=None, text="Set the tracking range"):
+        """Change the in/out range through the undo stack. True if it moved."""
+        before = (int(self.in_point), int(self.out_point))
+        after = (int(self.in_point if in_point is None else in_point),
+                 int(self.out_point if out_point is None else out_point))
+        if after == before:
+            return False
+        self.undo_stack.push(RangeCommand(self, text, before, after))
+        return True
 
     # -- Solved-point overlay (roadmap 1.4) ---------------------------------
     def set_solved_points(self, xy, visible=None, src_size=None):
@@ -565,6 +1046,17 @@ class VideoPointPickerCanvas(QLabel):
                 return
 
             if self.active_layer:
+                # A point the artist placed on this frame is grabbed before
+                # the roto underneath it: it is the smaller, more precise
+                # thing, and a mis-clicked point is the commonest thing to
+                # want to nudge.
+                p_idx = self.nearest_point_index(ox, oy)
+                if p_idx is not None:
+                    self.point_drag_idx = p_idx
+                    self._points_before = self.points_snapshot()
+                    self.drag_start = (ox, oy)
+                    return
+
                 if self.selected_mask_id:
                     for m in self.active_layer.animated_masks:
                         if m.id == self.selected_mask_id:
@@ -576,6 +1068,10 @@ class VideoPointPickerCanvas(QLabel):
                                         self.selected_vertex_idx = i
                                         self.is_dragging_vertex = True
                                         self.drag_start = (ox, oy)
+                                        # Captured before the first mouse-move:
+                                        # a drag is one undo however many
+                                        # events it took to make.
+                                        self._mask_edit_before = self.mask_snapshot()
                                         return
                 masks_at_f = self.active_layer.get_masks_at_frame(self.current_frame)
                 for minfo in reversed(masks_at_f):
@@ -583,6 +1079,7 @@ class VideoPointPickerCanvas(QLabel):
                         self.selected_mask_id = minfo["mask_obj"].id
                         self.is_dragging_shape = True
                         self.drag_start = (ox, oy)
+                        self._mask_edit_before = self.mask_snapshot()
                         self.update()
                         return
                 self.selected_mask_id = None
@@ -590,7 +1087,7 @@ class VideoPointPickerCanvas(QLabel):
 
         elif self.interaction_mode == "point":
             if self.active_layer:
-                self.active_layer.points.append((self.current_frame, ox, oy))
+                self.add_point(self.current_frame, ox, oy)
                 self.point_added.emit(self.current_frame, ox, oy)
                 self.update()
 
@@ -618,10 +1115,14 @@ class VideoPointPickerCanvas(QLabel):
 
     def _finish_current_poly(self):
         if len(self.current_poly) >= 3 and self.active_layer:
+            before = self.mask_snapshot()
             category = "inclusion" if self.interaction_mode == "inclusion_poly" else "exclusion"
             target_mask = self._find_or_create_mask(category, "Poly", "poly")
             target_mask.set_keyframe(self.current_frame, list(self.current_poly), "poly")
             self.current_poly.clear()
+            # Creating the shape and keying it is one action to the artist, so
+            # it is one press of Ctrl+Z.
+            self.push_mask_edit("Draw a polygon mask", before)
             self.masks_changed.emit()
             self.update()
 
@@ -635,6 +1136,14 @@ class VideoPointPickerCanvas(QLabel):
             # The marker follows the cursor; nothing is committed until release,
             # so a grab the artist changes their mind about costs nothing.
             self.tracked_drag_pos = (ox, oy)
+            self.update()
+            return
+
+        if self.point_drag_idx is not None and self.active_layer:
+            pts = self.active_layer.points
+            if 0 <= self.point_drag_idx < len(pts):
+                f_num = pts[self.point_drag_idx][0]
+                pts[self.point_drag_idx] = (f_num, ox, oy)
             self.update()
             return
 
@@ -685,14 +1194,27 @@ class VideoPointPickerCanvas(QLabel):
             self.update()
             return
 
+        if self.point_drag_idx is not None:
+            self.push_points_edit("Move a tracking point", self._points_before)
+            self.point_drag_idx = None
+            self._points_before = None
+            self.drag_start = None
+            self.update()
+            return
+
         if self.interaction_mode == "select":
+            was_vertex = self.is_dragging_vertex
             self.is_dragging_shape = False
             self.is_dragging_vertex = False
             self.drag_start = None
             self.selected_vertex_idx = None
             if self._mask_drag_dirty:
                 self._mask_drag_dirty = False
+                self.push_mask_edit(
+                    "Move a mask vertex" if was_vertex else "Move a mask",
+                    self._mask_edit_before)
                 self.masks_changed.emit()
+            self._mask_edit_before = None
             self.update()
 
         elif self.drag_start and self.interaction_mode in ("inclusion_box", "exclusion_box"):
@@ -700,9 +1222,11 @@ class VideoPointPickerCanvas(QLabel):
             x1, y1 = self.drag_start
             x2, y2 = ox, oy
             if abs(x2 - x1) > 5 and abs(y2 - y1) > 5 and self.active_layer:
+                before = self.mask_snapshot()
                 category = "inclusion" if self.interaction_mode == "inclusion_box" else "exclusion"
                 target_mask = self._find_or_create_mask(category, "Box", "rect")
                 target_mask.set_keyframe(self.current_frame, [x1, y1, x2, y2], "rect")
+                self.push_mask_edit("Draw a box mask", before)
                 self.masks_changed.emit()
 
             self.drag_start = None
@@ -754,6 +1278,45 @@ class VideoPointPickerCanvas(QLabel):
             menu.exec(self.mapToGlobal(QPointF(pos.x(), pos.y()).toPoint()))
             return
 
+        # A right-click on a point the artist placed is about that point.
+        p_idx = self.nearest_point_index(ox, oy)
+        if p_idx is not None:
+            act_del_pt = menu.addAction(f"🗑 Delete tracking point #{p_idx + 1}")
+            act_del_pt.triggered.connect(lambda: self.delete_point(p_idx))
+            menu.addSeparator()
+
+        # Vertex editing is offered on the SELECTED mask only: the artist has
+        # already said which shape they are working on, and adding a point to
+        # whichever mask happens to lie under the cursor is a way to ruin the
+        # wrong roto.
+        vhit = self.nearest_mask_vertex(ox, oy)
+        if vhit is not None:
+            v_mask, v_idx = vhit
+            act_del_v = menu.addAction(f"✂ Delete vertex #{v_idx + 1} of '{v_mask.name}'")
+            act_del_v.triggered.connect(
+                lambda: self.delete_mask_vertex(v_mask.id, v_idx))
+            menu.addSeparator()
+        else:
+            ehit = self.nearest_mask_edge(ox, oy)
+            if ehit is not None:
+                e_mask, e_idx = ehit
+                act_add_v = menu.addAction(f"➕ Add a vertex to '{e_mask.name}' here")
+                act_add_v.triggered.connect(
+                    lambda: self.insert_mask_vertex(e_mask.id, e_idx))
+                menu.addSeparator()
+
+        # Retiming a key: offered on the selected mask when the playhead is
+        # somewhere that has no key of its own to overwrite.
+        sel = self._selected_mask()
+        if sel is not None and not sel.has_keyframe(self.current_frame) and sel.keyframes:
+            sub = menu.addMenu(f"⏱ Move a keyframe of '{sel.name}' to frame {self.current_frame + 1}")
+            for f in sel.get_keyframe_frames():
+                act_mv = sub.addAction(f"from frame {f + 1}")
+                act_mv.triggered.connect(
+                    lambda _checked=False, src=f: self.move_mask_keyframe(
+                        sel.id, src, self.current_frame))
+            menu.addSeparator()
+
         clicked_mask_info = None
         if self.active_layer:
             masks_at_f = self.active_layer.get_masks_at_frame(self.current_frame)
@@ -789,66 +1352,41 @@ class VideoPointPickerCanvas(QLabel):
         menu.exec(self.mapToGlobal(QPointF(pos.x(), pos.y()).toPoint()))
 
     def _set_keyframe_on_mask(self, mask_obj, frame_idx, mask_info):
+        before = self.mask_snapshot()
         mask_obj.set_keyframe(frame_idx, mask_info["points"], "poly")
+        self.push_mask_edit("Set a mask keyframe", before)
         self.masks_changed.emit()
         self.update()
 
     def _delete_keyframe_on_mask(self, mask_obj, frame_idx):
+        before = self.mask_snapshot()
         mask_obj.delete_keyframe(frame_idx)
+        self.push_mask_edit("Delete a mask keyframe", before)
         self.masks_changed.emit()
         self.update()
 
     def _delete_entire_mask(self, mask_obj):
         if self.active_layer and mask_obj in self.active_layer.animated_masks:
+            before = self.mask_snapshot()
             self.active_layer.animated_masks.remove(mask_obj)
             if self.selected_mask_id == mask_obj.id:
                 self.selected_mask_id = None
+            self.push_mask_edit("Delete a mask", before)
             self.masks_changed.emit()
             self.update()
 
     def keyPressEvent(self, event):
-        key = event.key()
-        if key in (Qt.Key_Space, Qt.Key_K):
-            self.playback_toggle_requested.emit()
-            event.accept()
-        elif key in (Qt.Key_Left, Qt.Key_J):
-            self.step_frame_requested.emit(-1)
-            event.accept()
-        elif key in (Qt.Key_Right, Qt.Key_L):
-            self.step_frame_requested.emit(1)
-            event.accept()
-        elif key in (Qt.Key_Up, Qt.Key_BracketRight):
-            self.keyframe_nav_requested.emit(1)
-            event.accept()
-        elif key in (Qt.Key_Down, Qt.Key_BracketLeft):
-            self.keyframe_nav_requested.emit(-1)
-            event.accept()
-        elif key == Qt.Key_I:
-            self.in_point = self.current_frame
-            self.in_point_requested.emit(self.current_frame)
-            self.update()
-            event.accept()
-        elif key == Qt.Key_O:
-            self.out_point = self.current_frame
-            self.out_point_requested.emit(self.current_frame)
-            self.update()
-            event.accept()
-        elif key == Qt.Key_M:
-            self.show_mask_overlay = not self.show_mask_overlay
-            self.mask_overlay_toggled.emit(self.show_mask_overlay)
-            self.update()
-            event.accept()
-        elif key == Qt.Key_A:
-            self.view_alpha_mode = not self.view_alpha_mode
-            self.alpha_mode_toggled.emit(self.view_alpha_mode)
-            self.update()
-            event.accept()
-        elif key == Qt.Key_Control:
+        # Every named shortcut now lives in gui/shortcuts.py and is bound on the
+        # window, so there is exactly one list of them and the Help dialog is
+        # generated from it. What stays here is the loupe, because holding a
+        # bare modifier is not a shortcut Qt can fire - it is a press and a
+        # release - and Backspace, which reads as "delete" on a keyboard whose
+        # Del key is somewhere inconvenient.
+        if event.key() == Qt.Key_Control:
             self.show_loupe = True
             self.update()
             event.accept()
-        elif key in (Qt.Key_Delete, Qt.Key_Backspace):
-            # Del removes only the keyframe under the playhead; Shift+Del the whole mask.
+        elif event.key() == Qt.Key_Backspace:
             if event.modifiers() & Qt.ShiftModifier:
                 self.delete_selected_mask()
             else:

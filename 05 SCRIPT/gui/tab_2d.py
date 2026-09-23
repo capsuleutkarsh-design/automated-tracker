@@ -284,11 +284,12 @@ def build_2d_tab(win, tab):
     win.canvas_2d.file_dropped.connect(win._import_dropped_video)
     win.canvas_2d.point_added.connect(win._on_point_added_on_canvas)
     win.canvas_2d.masks_changed.connect(win._refresh_layer_list)
-    win.canvas_2d.playback_toggle_requested.connect(win._toggle_playback)
-    win.canvas_2d.step_frame_requested.connect(win._step_frame_by_offset)
-    win.canvas_2d.keyframe_nav_requested.connect(win._nav_keyframe_by_offset)
-    win.canvas_2d.in_point_requested.connect(win._set_in_point)
-    win.canvas_2d.out_point_requested.connect(win._set_out_point)
+    # An undo puts masks, points, corrections or the range back without going
+    # through any of the handlers that normally redraw the chips, so the canvas
+    # says what changed and the chips follow it.
+    win.canvas_2d.masks_changed.connect(win._update_keyframe_status)
+    win.canvas_2d.corrections_changed.connect(win._refresh_correction_ui)
+    win.canvas_2d.range_changed.connect(win._sync_range_status)
     win.canvas_2d.tracked_point_moved.connect(win._on_tracked_point_moved)
     win.canvas_2d.retrack_requested.connect(win._on_retrack_requested)
     win.canvas_2d.correction_cleared.connect(win._on_correction_cleared)
@@ -297,13 +298,13 @@ def build_2d_tab(win, tab):
     # ---- Transport ------------------------------------------------------
     t_frame, tbar = strip(spacing=7)
 
-    win.btn_step_back = make_button("◀", "Step back one frame  (← / J)", "transport")
+    win.btn_step_back = make_button("◀", "Step back one frame  (←, or Shift+← for ten)", "transport")
     win.btn_step_back.clicked.connect(win._step_back_frame)
 
-    win.btn_play_pause = make_button("▶  Play", "Play / pause  (Space / K)", "transportPlay")
+    win.btn_play_pause = make_button("▶  Play", "Play / pause  (Space, or J / K / L to shuttle)", "transportPlay")
     win.btn_play_pause.clicked.connect(win._toggle_playback)
 
-    win.btn_step_fwd = make_button("▶", "Step forward one frame  (→ / L)", "transport")
+    win.btn_step_fwd = make_button("▶", "Step forward one frame  (→, or Shift+→ for ten)", "transport")
     win.btn_step_fwd.clicked.connect(win._step_fwd_frame)
 
     win.slider_2d_frame = MarkedSlider(Qt.Horizontal)
@@ -345,13 +346,13 @@ def build_2d_tab(win, tab):
 
     # cluster 1 - keyframes
     kbar.addWidget(_cluster_label("Keys"))
-    win.btn_prev_key = make_button("◀ Prev", "Previous mask keyframe  ( [ )", "compact")
+    win.btn_prev_key = make_button("◀ Prev", "Previous mask keyframe  ( , or [ )", "compact")
     win.btn_prev_key.clicked.connect(win._jump_prev_keyframe)
     win.btn_set_key = make_button("Set", "Create or update a keyframe here", "compact")
     win.btn_set_key.clicked.connect(win._set_mask_keyframe_on_current)
     win.btn_del_key = make_button("Del", "Delete the keyframe here  (Del)", "compact")
     win.btn_del_key.clicked.connect(win._delete_mask_keyframe_on_current)
-    win.btn_next_key = make_button("Next ▶", "Next mask keyframe  ( ] )", "compact")
+    win.btn_next_key = make_button("Next ▶", "Next mask keyframe  ( . or ] )", "compact")
     win.btn_next_key.clicked.connect(win._jump_next_keyframe)
     win.btn_del_mask = make_button(
         "Del Mask", "Delete the selected mask with all its keyframes  (Shift+Del)", "compact")
@@ -370,9 +371,9 @@ def build_2d_tab(win, tab):
 
     # cluster 2 - tracking range
     kbar.addWidget(_cluster_label("Range"))
-    win.btn_set_in = make_button("In", "Set the tracking in-point  (I)", "compact")
+    win.btn_set_in = make_button("In", "Set the tracking in-point  (I, Alt+I clears it)", "compact")
     win.btn_set_in.clicked.connect(lambda: win._set_in_point(win.canvas_2d.current_frame))
-    win.btn_set_out = make_button("Out", "Set the tracking out-point  (O)", "compact")
+    win.btn_set_out = make_button("Out", "Set the tracking out-point  (O, Alt+O clears it)", "compact")
     win.btn_set_out.clicked.connect(lambda: win._set_out_point(win.canvas_2d.current_frame))
     win.btn_reset_range = make_button("Reset", "Track the whole clip again", "compact")
     win.btn_reset_range.clicked.connect(win._reset_tracking_range)
