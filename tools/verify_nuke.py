@@ -103,9 +103,15 @@ def report(scene):
     for rd in reads:
         print("\nRead '%s'" % rd.name())
         print(INFO + "file = %s" % rd["file"].value())
-        for k in ("first", "last", "origfirst", "origlast", "frame_mode", "frame", "pixel_aspect"):
+        for k in ("first", "last", "origfirst", "origlast", "frame_mode", "frame"):
             if k in rd.knobs():
                 print(INFO + "%s = %s" % (k, rd[k].value()))
+        # The pipeline de-squeezes before solving, so every plate it hands over
+        # has square pixels. A Read that came back with a pixel aspect would
+        # mean something squeezed it a second time.
+        if "pixel_aspect" in rd.knobs():
+            pa = rd["pixel_aspect"].value()
+            print((OK if abs(pa - 1.0) < 1e-6 else BAD) + "pixel_aspect = %s" % pa)
         try:
             resolved = rd["file"].evaluate(start) if hasattr(rd["file"], "evaluate") else None
         except Exception:

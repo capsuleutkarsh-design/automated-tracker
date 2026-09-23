@@ -27,9 +27,12 @@ def _read(p):
 
 
 # ----------------------------------------------------------------- Nuke Tracker4
+# Column 9 is the error curve. With no confidence handed in, every sample counts
+# as certain, so the error is a flat 0 - one key per frame, not a single key.
 TRACKER4_ROW_1 = (
     '{ {curve K x1001 1} "track_001" {curve x1001 10.00 x1002 11.00} {curve x1001 80.00 x1002 79.00} '
-    '{curve K x1001 0} {curve K x1001 0} 1 0 0 {curve x1001 0} 0 0 -15 -15 15 15 -25 -25 25 25 '
+    '{curve K x1001 0} {curve K x1001 0} 1 0 0 {curve x1001 0.0000 x1002 0.0000} 0 1 '
+    '-15 -15 15 15 -25 -25 25 25 '
     '{} {} {} {} {} {} {} {} {} {} {} }'
 )
 
@@ -49,6 +52,30 @@ def test_tracker4_golden(tmp_path):
     assert text.startswith(expected_head)
     assert text.endswith(" }\n }\n name CoTracker2D_Tracker\n selected true\n xpos 0\n ypos 0\n}\n")
     assert text.count('"track_0') == 4
+
+
+def test_tracker4_error_column_is_one_minus_confidence(tmp_path):
+    """Roadmap 2.2: a soft section of a track has to show in Nuke's curve editor."""
+    conf = np.array([[0.98, 0.5, 1.0, 0.0], [0.25, 0.5, 1.0, 0.0]])
+    out = tmp_path / "t.nk"
+    c2d.export_2d_nuke_tracker(TRACKS, VIS, W, H, FPS, out, start_frame=1001, conf=conf)
+    text = _read(out)
+    # Track 1 goes soft on the second frame: error 0.02 then 0.75.
+    assert "1 0 0 {curve x1001 0.0200 x1002 0.7500} 0 1 " in text
+    # A confidence of exactly 1 is error 0, and 0 is error 1 - the two ends.
+    assert "1 0 0 {curve x1001 0.0000 x1002 0.0000} 0 1 " in text
+    assert "1 0 0 {curve x1001 1.0000 x1002 1.0000} 0 1 " in text
+
+    # Multi-layer nodes carry each layer's own confidence.
+    multi = tmp_path / "m.nk"
+    c2d.export_multi_layer_nuke_tracker(
+        [{"name": "Wall A", "tracks": TRACKS[:, :1], "vis": VIS[:, :1], "conf": conf[:, :1]},
+         {"name": "Floor", "tracks": TRACKS[:, 1:2], "vis": VIS[:, 1:2]}],
+        W, H, FPS, multi, start_frame=1001)
+    mtext = _read(multi)
+    assert '"Wall_A_001"' in mtext and "{curve x1001 0.0200 x1002 0.7500}" in mtext
+    # The layer with no confidence keeps the old flat-zero error.
+    assert "{curve x1001 0.0000 x1002 0.0000}" in mtext
 
 
 def test_tracker4_flips_y_to_nuke_bottom_left_origin(tmp_path):
@@ -271,7 +298,31 @@ def test_json_and_csv_use_timeline_frames(tmp_path):
     cp = tmp_path / "t.csv"
     c2d.export_2d_csv(TRACKS, VIS, W, H, cp, start_frame=1001, frame_step=2)
     lines = _read(cp).splitlines()
-    assert lines[0] == "frame,track_id,x,y,norm_x,norm_y,visible"
+    assert lines[0] == "frame,track_id,x,y,norm_x,norm_y,visible,confidence"
     assert lines[1].startswith("1001,1,10.00,20.00,")
     assert lines[5].startswith("1003,1,11.00,21.00,")
-    assert re.match(r"^1003,4,11\.00,91\.00,0\.05500,0\.91000,1$", lines[8])
+    assert re.match(r"^1003,4,11\.00,91\.00,0\.05500,0\.91000,1,1\.0000$", lines[8])
+
+
+def test_json_and_csv_carry_confidence_and_layer_name(tmp_path):
+    """Roadmap 2.2, and what the correction pass reads back out of the JSON."""
+    import json
+    conf = np.array([[0.9, 0.8, 0.7, 0.6], [0.5, 0.4, 0.3, 0.2]])
+    jp = tmp_path / "t.json"
+    c2d.export_2d_json(TRACKS, VIS, W, H, jp, start_frame=1001, conf=conf,
+                       layer_name="Wall A")
+    data = json.loads(_read(jp))
+    assert data["layer"] == "Wall_A"          # spaces become underscores, as in every writer
+    assert [f["confidence"] for f in data["tracks"][0]["frames"]] == [0.9, 0.5]
+    assert [f["confidence"] for f in data["tracks"][3]["frames"]] == [0.6, 0.2]
+
+    cp = tmp_path / "t.csv"
+    c2d.export_2d_csv(TRACKS, VIS, W, H, cp, start_frame=1001, conf=conf)
+    rows = [l.split(",") for l in _read(cp).splitlines()[1:]]
+    assert [r[-1] for r in rows[:4]] == ["0.9000", "0.8000", "0.7000", "0.6000"]
+
+    # No confidence given: the files still carry the column, as a flat 1.
+    c2d.export_2d_json(TRACKS, VIS, W, H, jp, start_frame=1001)
+    plain = json.loads(_read(jp))
+    assert plain["layer"] is None
+    assert all(f["confidence"] == 1.0 for f in plain["tracks"][0]["frames"])

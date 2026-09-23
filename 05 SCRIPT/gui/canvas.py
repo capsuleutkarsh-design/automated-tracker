@@ -8,16 +8,90 @@ from pathlib import Path
 from PySide6.QtWidgets import QLabel, QMenu
 from PySide6.QtCore import Qt, Signal, QPointF, QRectF
 from PySide6.QtGui import (
-    QFont, QColor, QPixmap, QPainter, QPen, QBrush, QPainterPath,
+    QFont, QColor, QPixmap, QPainter, QPen, QBrush, QPainterPath, QPolygonF,
     QDragEnterEvent, QDropEvent
 )
 
+from gui.theme import WARN, TEXT, OK, ACCENT
+
 from mask_animator import AnimatedMask
 from core.tracking_layer import TrackingLayer, point_in_poly
+from core import lens
+
+# How close to a projected solved point a click has to land to select it, in
+# SCREEN pixels - so the feel is the same whether the plate is shown at full
+# size or scaled into a small window.
+SOLVED_PICK_RADIUS_PX = 8.0
+
+# The same idea for a tracked marker the artist is about to grab and drag.
+# Larger, because it is a drag rather than a click and a marker sits under the
+# cursor's own tip.
+TRACK_GRAB_RADIUS_PX = 10.0
+
+
+def project_solved_points(points_world, center, r_cam_to_world, cam):
+    """
+    Solved 3D points -> pixels in one solved frame. Returns (xy, visible).
+
+    Pure numpy, no Qt, so the reprojection the overlay draws is the one the
+    tests pin down. `points_world` is (N, 3) in COLMAP's own world - the same
+    space scene_transform works in - `center` and `r_cam_to_world` are the
+    "center" and "R_world" of that frame's parsed COLMAP image, and `cam` is its
+    entry from cameras (focal_x/focal_y/cx/cy/width/height/model/params).
+
+    THE ROTATION. COLMAP's parsed images store the camera-TO-world rotation in
+    R_world (it is R_world_to_camera transposed - see parse_colmap_images and
+    the note in scene_transform.apply_to_camera), so the camera-space point is
+    R_world.T @ (X - C), written here as the row-wise (X - C) @ R_world. Using
+    R_world the other way round reprojects to the wrong pixel by hundreds of
+    pixels, which is exactly the kind of mistake that looks plausible on screen.
+
+    Then x/z, y/z lands on COLMAP's normalised plane (y DOWN), lens.distort_points
+    bends it the way the solved lens did, and fx/fy/cx/cy put it on the sensor -
+    the same chain COLMAP itself uses, so the dot sits on the feature it came from.
+
+    `visible` is False for a point behind the camera or off the frame; the
+    overlay draws only those, because a dot clamped to the frame edge would be
+    pickable and would mean nothing.
+    """
+    P = np.asarray(points_world, dtype=float).reshape(-1, 3)
+    C = np.asarray(center, dtype=float).reshape(3)
+    R = np.asarray(r_cam_to_world, dtype=float).reshape(3, 3)
+
+    cam_space = (P - C) @ R
+    z = cam_space[:, 2]
+    in_front = z > 1e-6
+    # A point behind the camera still has to go through the maths (the arrays
+    # stay aligned with the cloud), so divide by a harmless 1 and mask it after.
+    safe_z = np.where(in_front, z, 1.0)
+    normalised = np.stack([cam_space[:, 0] / safe_z, cam_space[:, 1] / safe_z], axis=-1)
+    distorted = lens.distort_points(cam, normalised)
+
+    fx = float(cam.get("focal_x", cam.get("fx", 0.0)))
+    fy = float(cam.get("focal_y", cam.get("fy", fx)) or fx)
+    width = float(cam.get("width", 0.0))
+    height = float(cam.get("height", 0.0))
+    cx = float(cam.get("cx", width / 2.0))
+    cy = float(cam.get("cy", height / 2.0))
+
+    xy = np.stack([fx * distorted[:, 0] + cx, fy * distorted[:, 1] + cy], axis=-1)
+    inside = ((xy[:, 0] >= 0.0) & (xy[:, 0] <= width)
+              & (xy[:, 1] >= 0.0) & (xy[:, 1] <= height))
+    visible = in_front & inside & np.isfinite(xy).all(axis=1)
+    return xy, visible
 
 
 class VideoPointPickerCanvas(QLabel):
     point_added = Signal(int, float, float)
+    solved_point_picked = Signal(int)
+    # A solved 2D track was dragged to a new place on a frame (roadmap 2.1):
+    # (layer name, point index, clip frame, plate x, plate y).
+    tracked_point_moved = Signal(str, int, int, float, float)
+    # The context menu asked to re-track one point from a frame:
+    # (layer name, point index, clip frame, also backwards).
+    retrack_requested = Signal(str, int, int, bool)
+    # The context menu asked to forget a correction: (layer name, point, frame).
+    correction_cleared = Signal(str, int, int)
     masks_changed = Signal()
     file_dropped = Signal(str)
     playback_toggle_requested = Signal()
@@ -65,6 +139,29 @@ class VideoPointPickerCanvas(QLabel):
         self.layers = [TrackingLayer("Layer 1 (Wall)", "#38bdf8", "grid")]
         self.active_layer_idx = 0
         self.selected_mask_id = None
+
+        # Solved 3D points reprojected onto this frame (roadmap 1.4). They are
+        # only held while the Scene setup panel is picking, so the ordinary
+        # tracking view keeps the plate and the roto to itself.
+        self.solved_xy = None            # (N, 2) pixels in the SOLVE's raster
+        self.solved_visible = None       # (N,) bool: in front of the camera and on frame
+        self.solved_src_size = None      # (width, height) that raster, which may
+                                         # differ from the preview's own size
+        self.solved_selection = ()       # indices the artist has picked, in pick order
+        self.show_solved_points = False
+        self.scene_pick_active = False
+
+        # The last 2D result, drawn over the plate so the artist can see what
+        # the solve produced and drag a drifting marker back onto its feature
+        # (roadmap 2.1). `tracked_layers` maps a layer NAME to
+        # {"tracks": [T, N, 2] plate px, "vis": [T, N]}; the clip's frame index
+        # maps to a sample index through the range the track was made on.
+        self.tracked_layers = None
+        self.tracked_in_point = 0
+        self.tracked_step = 1
+        self.show_tracked_points = False
+        self.tracked_drag = None         # (layer name, point index) while dragging
+        self.tracked_drag_pos = None     # (ox, oy) the marker is being held at
 
         self.interaction_mode = "select"  # "select", "point", "inclusion_box", "inclusion_poly", "exclusion_box", "exclusion_poly"
         self.drag_start = None
@@ -170,6 +267,167 @@ class VideoPointPickerCanvas(QLabel):
     def invalidate_frame_cache(self):
         """Drop every cached scaled frame. Call when a different clip is loaded."""
         self._scaled_cache.clear()
+
+    # -- Solved-point overlay (roadmap 1.4) ---------------------------------
+    def set_solved_points(self, xy, visible=None, src_size=None):
+        """
+        Show the solve's points reprojected onto the current frame.
+
+        `xy` is (N, 2) in the raster the solve was made at; `src_size` is that
+        raster, so a solve made on half-size frames still lands on the plate.
+        Passing None for `xy` is the same as clear_solved_points().
+        """
+        if xy is None:
+            self.clear_solved_points()
+            return
+        self.solved_xy = np.asarray(xy, dtype=float).reshape(-1, 2)
+        if visible is None:
+            self.solved_visible = np.ones(len(self.solved_xy), dtype=bool)
+        else:
+            self.solved_visible = np.asarray(visible, dtype=bool).reshape(-1)
+        self.solved_src_size = tuple(src_size) if src_size else (self.orig_w, self.orig_h)
+        self.update()
+
+    def clear_solved_points(self):
+        """Forget the reprojected points; the overlay stops being drawn."""
+        self.solved_xy = None
+        self.solved_visible = None
+        self.solved_src_size = None
+        self.update()
+
+    def set_solved_selection(self, indices):
+        """Which reprojected points are drawn as picked, in the order picked."""
+        self.solved_selection = tuple(int(i) for i in (indices or ()))
+        self.update()
+
+    def _solved_in_plate_coords(self):
+        """The reprojected points in the preview's own pixel space, or None."""
+        if self.solved_xy is None or not len(self.solved_xy):
+            return None
+        src_w, src_h = self.solved_src_size or (self.orig_w, self.orig_h)
+        if not src_w or not src_h:
+            return None
+        return self.solved_xy * np.array([self.orig_w / float(src_w),
+                                          self.orig_h / float(src_h)])
+
+    def nearest_solved_point(self, ox, oy, radius_px=SOLVED_PICK_RADIUS_PX):
+        """
+        Index of the visible reprojected point nearest (ox, oy), or None.
+
+        (ox, oy) is in plate coordinates, but the radius is in screen pixels:
+        the artist is aiming with a mouse, so the target has to be the same size
+        on screen however far the plate is zoomed out.
+        """
+        plate = self._solved_in_plate_coords()
+        if plate is None:
+            return None
+        scaled = self._scaled_pixmap()
+        if scaled is None or scaled.width() == 0 or scaled.height() == 0:
+            return None
+        sx = scaled.width() / float(self.orig_w or 1)
+        sy = scaled.height() / float(self.orig_h or 1)
+
+        dx = (plate[:, 0] - ox) * sx
+        dy = (plate[:, 1] - oy) * sy
+        dist = np.hypot(dx, dy)
+        if self.solved_visible is not None and len(self.solved_visible) == len(dist):
+            dist = np.where(self.solved_visible, dist, np.inf)
+        idx = int(np.argmin(dist))
+        return idx if dist[idx] <= float(radius_px) else None
+
+    # -- Solved 2D tracks (roadmap 2.1) -------------------------------------
+    def set_tracked_result(self, layers, in_point=0, frame_step=1, show=True):
+        """
+        Show the last 2D result on the plate. `layers` maps layer name -> arrays.
+
+        `in_point` and `frame_step` are the range the track was made on, which
+        is how a clip frame becomes a sample index: a frame the track does not
+        cover simply draws nothing. Passing None takes the overlay away, which
+        is what happens on a shot with no result.
+        """
+        if not layers:
+            self.clear_tracked_result()
+            return
+        self.tracked_layers = dict(layers)
+        self.tracked_in_point = max(0, int(in_point))
+        self.tracked_step = max(1, int(frame_step))
+        self.show_tracked_points = bool(show)
+        self.update()
+
+    def clear_tracked_result(self):
+        """Forget the loaded result; the overlay stops being drawn."""
+        self.tracked_layers = None
+        self.tracked_drag = None
+        self.tracked_drag_pos = None
+        self.show_tracked_points = False
+        self.update()
+
+    def has_tracked_result(self):
+        return bool(self.tracked_layers)
+
+    def tracked_index_for_frame(self, frame_idx=None):
+        """
+        The sample index of a clip frame in the loaded result, or None.
+
+        A solve made with a frame step only holds every Nth frame, and the
+        frames in between belong to no sample - drawing an interpolated marker
+        there would invite the artist to correct a frame that does not exist.
+        """
+        if not self.tracked_layers:
+            return None
+        frame_idx = self.current_frame if frame_idx is None else int(frame_idx)
+        offset = frame_idx - self.tracked_in_point
+        if offset < 0 or offset % self.tracked_step:
+            return None
+        t = offset // self.tracked_step
+        first = next(iter(self.tracked_layers.values()))
+        return t if 0 <= t < int(first["tracks"].shape[0]) else None
+
+    def _layer_by_name(self, name):
+        return next((l for l in self.layers if l.name == name), None)
+
+    def tracked_points_at(self, frame_idx=None):
+        """
+        Every visible tracked marker on a frame: (layer name, point index, ox, oy).
+
+        Plate coordinates, the same space clicks arrive in, so the caller can
+        measure distance without knowing how the frame is scaled on screen.
+        """
+        out = []
+        t = self.tracked_index_for_frame(frame_idx)
+        if t is None:
+            return out
+        for l_name, block in self.tracked_layers.items():
+            layer = self._layer_by_name(l_name)
+            if layer is not None and not layer.visible:
+                continue
+            tracks, vis = block["tracks"], block.get("vis")
+            for n in range(int(tracks.shape[1])):
+                if vis is not None and not bool(vis[t, n]):
+                    continue
+                out.append((l_name, n, float(tracks[t, n, 0]), float(tracks[t, n, 1])))
+        return out
+
+    def nearest_tracked_point(self, ox, oy, radius_px=TRACK_GRAB_RADIUS_PX):
+        """
+        The tracked marker nearest a click, or None. Radius is in SCREEN pixels.
+        """
+        if not self.show_tracked_points:
+            return None
+        candidates = self.tracked_points_at()
+        if not candidates:
+            return None
+        scaled = self._scaled_pixmap()
+        if scaled is None or scaled.width() == 0 or scaled.height() == 0:
+            return None
+        sx = scaled.width() / float(self.orig_w or 1)
+        sy = scaled.height() / float(self.orig_h or 1)
+        best, best_d = None, float("inf")
+        for l_name, n, px, py in candidates:
+            d = np.hypot((px - ox) * sx, (py - oy) * sy)
+            if d < best_d:
+                best, best_d = (l_name, n, px, py), d
+        return best if best_d <= float(radius_px) else None
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -284,7 +542,28 @@ class VideoPointPickerCanvas(QLabel):
 
         ox, oy = self._view_to_orig_coords(event.position())
 
+        # While the Scene setup panel is armed the click belongs to it, hit or
+        # miss. Letting a miss fall through would drop a 2D tracking point onto
+        # the layer the artist is not even looking at.
+        if self.scene_pick_active:
+            idx = self.nearest_solved_point(ox, oy)
+            if idx is not None:
+                self.solved_point_picked.emit(idx)
+            return
+
         if self.interaction_mode == "select":
+            # A tracked marker under the cursor is grabbed before anything else:
+            # while the result is on screen, dragging it is what the artist came
+            # here to do, and the roto underneath is not moving.
+            hit = self.nearest_tracked_point(ox, oy)
+            if hit is not None:
+                l_name, n, px, py = hit
+                self.tracked_drag = (l_name, n)
+                self.tracked_drag_pos = (px, py)
+                self.drag_start = (ox, oy)
+                self.update()
+                return
+
             if self.active_layer:
                 if self.selected_mask_id:
                     for m in self.active_layer.animated_masks:
@@ -352,6 +631,13 @@ class VideoPointPickerCanvas(QLabel):
         ox, oy = self._view_to_orig_coords(event.position())
         self.hover_pos = (ox, oy)
 
+        if self.tracked_drag is not None:
+            # The marker follows the cursor; nothing is committed until release,
+            # so a grab the artist changes their mind about costs nothing.
+            self.tracked_drag_pos = (ox, oy)
+            self.update()
+            return
+
         if self.interaction_mode == "select" and self.drag_start and self.selected_mask_id and self.active_layer:
             m = next((mask for mask in self.active_layer.animated_masks if mask.id == self.selected_mask_id), None)
             if m:
@@ -386,6 +672,17 @@ class VideoPointPickerCanvas(QLabel):
 
     def mouseReleaseEvent(self, event):
         if not self.current_pixmap or event.button() != Qt.LeftButton:
+            return
+
+        if self.tracked_drag is not None:
+            l_name, n = self.tracked_drag
+            ox, oy = self._view_to_orig_coords(event.position())
+            self.tracked_drag = None
+            self.tracked_drag_pos = None
+            self.drag_start = None
+            self.tracked_point_moved.emit(l_name, int(n), int(self.current_frame),
+                                          float(ox), float(oy))
+            self.update()
             return
 
         if self.interaction_mode == "select":
@@ -433,6 +730,29 @@ class VideoPointPickerCanvas(QLabel):
                 font-weight: bold;
             }
         """)
+
+        # A right-click on a tracked marker is about that track, not the roto.
+        hit = self.nearest_tracked_point(ox, oy)
+        if hit is not None:
+            l_name, n, _px, _py = hit
+            frame = int(self.current_frame)
+            layer = self._layer_by_name(l_name)
+            corrected = layer is not None and layer.correction_at(frame, n) is not None
+
+            menu.addAction(f"◈ {l_name}  ·  point #{n + 1}  ·  frame {frame + 1}").setEnabled(False)
+            menu.addSeparator()
+            act_fwd = menu.addAction(f"Re-track this point from frame {frame + 1} forward")
+            act_fwd.triggered.connect(
+                lambda: self.retrack_requested.emit(l_name, int(n), frame, False))
+            act_both = menu.addAction(f"Re-track forward and backwards from frame {frame + 1}")
+            act_both.triggered.connect(
+                lambda: self.retrack_requested.emit(l_name, int(n), frame, True))
+            if corrected:
+                act_clear = menu.addAction(f"Forget the correction on frame {frame + 1}")
+                act_clear.triggered.connect(
+                    lambda: self.correction_cleared.emit(l_name, int(n), frame))
+            menu.exec(self.mapToGlobal(QPointF(pos.x(), pos.y()).toPoint()))
+            return
 
         clicked_mask_info = None
         if self.active_layer:
@@ -661,6 +981,84 @@ class VideoPointPickerCanvas(QLabel):
                         painter.setFont(QFont("Segoe UI", 8))
                         painter.drawText(int(disp_x + 6), int(disp_y - 3), f"#{idx} @ f{f_num+1}")
 
+        # The last 2D result (roadmap 2.1). Squares, so they read as something
+        # the solve produced rather than as the round un-solved points the
+        # artist placed; a corrected frame is filled and ringed in the OK
+        # colour, and the marker being dragged trails a line from where the
+        # solve had put it.
+        if self.show_tracked_points and self.tracked_layers and not self.is_overlay_active:
+            t_idx = self.tracked_index_for_frame()
+            if t_idx is not None:
+                sx, sy = pw / float(self.orig_w or 1), ph / float(self.orig_h or 1)
+                painter.setFont(QFont("Segoe UI", 8))
+                for l_name, n, px, py in self.tracked_points_at():
+                    layer = self._layer_by_name(l_name)
+                    col = QColor(layer.color if layer is not None else ACCENT)
+                    corrected = layer is not None and layer.correction_at(self.current_frame, n)
+                    dx = offset_x + px * sx
+                    dy = offset_y + py * sy
+
+                    if corrected:
+                        painter.setPen(QPen(QColor(OK), 1.6))
+                        painter.setBrush(QBrush(QColor(OK)))
+                        painter.drawRect(QRectF(dx - 3.5, dy - 3.5, 7, 7))
+                        painter.setBrush(Qt.NoBrush)
+                        painter.drawEllipse(QPointF(dx, dy), 7, 7)
+                    else:
+                        painter.setPen(QPen(col, 1.4))
+                        painter.setBrush(Qt.NoBrush)
+                        painter.drawRect(QRectF(dx - 3.5, dy - 3.5, 7, 7))
+                        painter.setPen(QPen(QColor(col.red(), col.green(), col.blue(), 200), 1))
+                        painter.drawPoint(QPointF(dx, dy))
+
+                    # Numbering only while there are few enough to read; a dense
+                    # grid would be a wall of text over the plate.
+                    if len(self.tracked_layers) and self.tracked_layers[l_name]["tracks"].shape[1] <= 24:
+                        painter.setPen(QColor(TEXT))
+                        painter.drawText(int(dx + 7), int(dy - 5), f"#{n + 1}")
+
+                    if self.tracked_drag == (l_name, n) and self.tracked_drag_pos:
+                        hx = offset_x + self.tracked_drag_pos[0] * sx
+                        hy = offset_y + self.tracked_drag_pos[1] * sy
+                        painter.setPen(QPen(QColor(WARN), 1, Qt.DotLine))
+                        painter.drawLine(QPointF(dx, dy), QPointF(hx, hy))
+                        painter.setPen(QPen(QColor(WARN), 1.8))
+                        painter.drawLine(int(hx - 8), int(hy), int(hx + 8), int(hy))
+                        painter.drawLine(int(hx), int(hy - 8), int(hx), int(hy + 8))
+
+        # Solved 3D points, drawn only while the Scene setup panel is picking so
+        # the ordinary tracking view is not buried under thousands of dots.
+        if self.show_solved_points:
+            plate = self._solved_in_plate_coords()
+            if plate is not None:
+                vis = self.solved_visible
+                if vis is None or len(vis) != len(plate):
+                    vis = np.ones(len(plate), dtype=bool)
+                sx, sy = pw / float(self.orig_w or 1), ph / float(self.orig_h or 1)
+                shown = plate[vis]
+                # One drawPoints call rather than thousands of drawEllipse: a
+                # sparse cloud is routinely 10,000 points and this is repainted
+                # on every frame step.
+                pen = QPen(QColor(WARN), 3.0)
+                pen.setCapStyle(Qt.RoundCap)
+                painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawPoints(QPolygonF(
+                    [QPointF(offset_x + x * sx, offset_y + y * sy) for x, y in shown]))
+
+                # The picked ones are numbered in the order they were picked -
+                # scale wants to know which two, ground which three.
+                painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+                for order, idx in enumerate(self.solved_selection, start=1):
+                    if not (0 <= idx < len(plate)) or not vis[idx]:
+                        continue
+                    cx_sel = offset_x + plate[idx][0] * sx
+                    cy_sel = offset_y + plate[idx][1] * sy
+                    painter.setPen(QPen(QColor(TEXT), 1.6))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawEllipse(QPointF(cx_sel, cy_sel), 6, 6)
+                    painter.drawText(int(cx_sel + 8), int(cy_sel - 6), str(order))
+
         # Draw Active Drag Rectangle preview
         if self.drag_start and self.drag_current:
             x1, y1 = self.drag_start
@@ -703,6 +1101,11 @@ class VideoPointPickerCanvas(QLabel):
 
         # Top-Left HUD Info Pill
         alpha_tag = "  |  ALPHA MATTE" if self.view_alpha_mode else ""
+        # Say when the solved result is on screen, and when this frame is not
+        # one the result covers - an artist dragging at nothing deserves to know.
+        if self.show_tracked_points and self.tracked_layers:
+            alpha_tag += ("  |  RESULT" if self.tracked_index_for_frame() is not None
+                          else "  |  RESULT (not on this frame)")
         hud_text = f"{self.orig_w}x{self.orig_h}  |  {self.fps:.1f} FPS  |  Frame {self.current_frame+1:04d} / {max(1, self.total_frames):04d}{alpha_tag}"
         hud_font = QFont("Consolas", 9.5, QFont.Bold)
         painter.setFont(hud_font)

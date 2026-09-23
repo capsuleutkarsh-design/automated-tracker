@@ -20,8 +20,16 @@ from PySide6.QtCore import Qt
 from gui.ui_kit import (
     tame_combos,
     card, form_row, button_row, checkbox_grid, inspector_scroll,
-    make_button, hint_label,
+    make_button, hint_label, group_label, divider,
 )
+
+
+def _wrap_row(layout):
+    """A layout as a widget, so a pair of fields can share one form_row label."""
+    holder = QWidget()
+    holder.setLayout(layout)
+    layout.setContentsMargins(0, 0, 0, 0)
+    return holder
 
 
 def build_3d_tab(win, tab, presets):
@@ -142,6 +150,24 @@ def build_3d_tab(win, tab, presets):
         "Common rates: 23.976, 24, 25, 29.97, 30, 48, 50, 60.")
     form_row(sbody, "Frame rate", win.spin_fps_3d)
 
+    # Pixel aspect belongs to the plate, like the frame rate, so it sits with
+    # the other things read off the clip rather than with the delivery options.
+    win.spin_pixel_aspect = QDoubleSpinBox()
+    win.spin_pixel_aspect.setRange(0.1, 4.0)
+    win.spin_pixel_aspect.setDecimals(4)
+    win.spin_pixel_aspect.setSingleStep(0.01)
+    win.spin_pixel_aspect.setValue(1.0)
+    win.spin_pixel_aspect.setToolTip(
+        "Shape of one pixel: width divided by height. Leave it at 1.0 for any\n"
+        "ordinary plate.\n"
+        "An anamorphic or otherwise squeezed plate has non-square pixels - a 2x\n"
+        "anamorphic delivered as 1920x1080 is really a 3840x1080 image squeezed\n"
+        "sideways - and if the tool is not told, the solve fits a lens that does\n"
+        "not exist and the exported camera is wrong in both focal length and\n"
+        "framing. Read from the file for a video; type it for a sequence.\n"
+        "Common values: 1.0 square, 2.0 anamorphic scope, 1.333 HDV, 0.91 NTSC D1.")
+    form_row(sbody, "Pixel aspect", win.spin_pixel_aspect)
+
     sbody.addWidget(hint_label(
         "Auto-filled from the file numbering when you select an image sequence."))
     ins.addWidget(solver_card)
@@ -181,6 +207,141 @@ def build_3d_tab(win, tab, presets):
         win.chk_mesh_gen,
     ], columns=2)
     ins.addWidget(opt_card)
+
+    # ---- Scene setup: scale, ground, origin ------------------------------
+    # Everything here works by picking the solve's own 3D points on the 2D
+    # tab's canvas, so the card stays disabled until there is a solve to pick
+    # from and _refresh_scene_setup() says why.
+    win.scene_setup_card, scbody = card("Scene Setup")
+    win.scene_setup_card.setEnabled(False)
+
+    win.lbl_scene_points = hint_label("Solve this shot first.")
+    scbody.addWidget(win.lbl_scene_points)
+
+    # --- scale
+    scbody.addWidget(group_label("Scale"))
+    win.btn_pick_scale = make_button(
+        "Pick 2 points", "Arm picking, then click two solved points on the 2D tab whose\n"
+                         "real distance apart you know.", "compact", checkable=True)
+    win.btn_pick_scale.toggled.connect(lambda on: win._on_scene_pick_toggled("scale", on))
+    win.lbl_scale_picks = QLabel("0 / 2")
+    win.lbl_scale_picks.setObjectName("valueChip")
+    win.lbl_scale_picks.setAlignment(Qt.AlignCenter)
+    win.lbl_scale_picks.setMinimumWidth(56)
+    form_row(scbody, "Pick", win.btn_pick_scale, hint=win.lbl_scale_picks)
+
+    dist_row = QHBoxLayout()
+    dist_row.setSpacing(6)
+    win.spin_scale_distance = QDoubleSpinBox()
+    win.spin_scale_distance.setRange(0.0, 100000.0)
+    win.spin_scale_distance.setDecimals(4)
+    win.spin_scale_distance.setSingleStep(0.1)
+    win.spin_scale_distance.setValue(1.0)
+    win.spin_scale_distance.setToolTip(
+        "The real distance between the two picked points, measured on set.\n"
+        "Leave it at zero to leave the solve's arbitrary scale alone.")
+    win.combo_scale_unit = QComboBox()
+    win.combo_scale_unit.addItems(["metres", "centimetres", "feet", "inches"])
+    win.combo_scale_unit.setToolTip(
+        "Unit of the distance above. The scene itself is always built in metres,\n"
+        "which is what every DCC's units default to.")
+    win.combo_scale_unit.setFixedWidth(116)
+    dist_row.addWidget(win.spin_scale_distance, 1)
+    dist_row.addWidget(win.combo_scale_unit)
+    form_row(scbody, "Real distance", _wrap_row(dist_row))
+
+    # --- ground
+    scbody.addWidget(group_label("Ground"))
+    win.btn_pick_ground = make_button(
+        "Pick 3+ points", "Arm picking, then click three or more solved points that lie\n"
+                          "on the floor. They end up level, on Y = 0.", "compact", checkable=True)
+    win.btn_pick_ground.toggled.connect(lambda on: win._on_scene_pick_toggled("ground", on))
+    win.lbl_ground_picks = QLabel("0 / 3")
+    win.lbl_ground_picks.setObjectName("valueChip")
+    win.lbl_ground_picks.setAlignment(Qt.AlignCenter)
+    win.lbl_ground_picks.setMinimumWidth(56)
+    form_row(scbody, "Pick", win.btn_pick_ground, hint=win.lbl_ground_picks)
+
+    win.chk_auto_ground = QCheckBox("Use the auto-fitted plane")
+    win.chk_auto_ground.setToolTip(
+        "Level the floor on the dominant plane the solver already found in the\n"
+        "point cloud, instead of on points you pick. Quick, and right whenever\n"
+        "the floor is the biggest flat thing in the shot.")
+    scbody.addWidget(win.chk_auto_ground)
+
+    # --- origin
+    scbody.addWidget(group_label("Origin"))
+    win.btn_pick_origin = make_button(
+        "Pick 1 point", "Arm picking, then click the solved point that should become\n"
+                        "0, 0, 0 in your scene.", "compact", checkable=True)
+    win.btn_pick_origin.toggled.connect(lambda on: win._on_scene_pick_toggled("origin", on))
+    win.lbl_origin_picks = QLabel("0 / 1")
+    win.lbl_origin_picks.setObjectName("valueChip")
+    win.lbl_origin_picks.setAlignment(Qt.AlignCenter)
+    win.lbl_origin_picks.setMinimumWidth(56)
+    form_row(scbody, "Pick", win.btn_pick_origin, hint=win.lbl_origin_picks)
+
+    win.chk_origin_under_camera = QCheckBox("Ground under the camera on this frame")
+    win.chk_origin_under_camera.setToolTip(
+        "Put the origin on the floor directly below the camera on the frame the\n"
+        "2D tab is showing - the usual choice when there is no obvious feature\n"
+        "to build on. Needs a ground plane, picked or auto-fitted.")
+    scbody.addWidget(win.chk_origin_under_camera)
+
+    divider(scbody)
+
+    win.lbl_scene_status = hint_label("No scene transform: the solve is in COLMAP's own units.")
+    scbody.addWidget(win.lbl_scene_status)
+
+    win.btn_scene_clear = make_button(
+        "Clear Picks", "Forget the points picked so far", "compact")
+    win.btn_scene_clear.clicked.connect(win._clear_scene_picks)
+    win.btn_scene_apply = make_button(
+        "Apply", "Build the transform from what is set above and save it with the shot", "compact")
+    win.btn_scene_apply.clicked.connect(win._apply_scene_transform)
+    win.btn_scene_reset = make_button(
+        "Reset", "Drop the transform and go back to COLMAP's arbitrary world", "compact")
+    win.btn_scene_reset.clicked.connect(win._reset_scene_transform)
+    button_row(scbody, [win.btn_scene_clear, win.btn_scene_apply, win.btn_scene_reset])
+    ins.addWidget(win.scene_setup_card)
+
+    # ---- Lens delivery ---------------------------------------------------
+    lens_card, lnbody = card("Lens & Delivery")
+
+    win.chk_write_undistort = QCheckBox("Write undistorted plate and STMaps")
+    win.chk_write_undistort.setToolTip(
+        "Comp cannot use k1 and k2 in a text file, so this writes what it can use:\n"
+        "  • an undistorted plate sequence, straight-lined by the solved lens\n"
+        "  • a pinhole camera that matches that plate exactly\n"
+        "  • two 32-bit STMaps - undistort to work on, redistort to hand back -\n"
+        "    so the render lands back on the original plate, pixel for pixel.\n"
+        "Costs a full image sequence of disk and a minute or two of writing.")
+    lnbody.addWidget(win.chk_write_undistort)
+
+    win.spin_overscan = QSpinBox()
+    win.spin_overscan.setRange(0, 50)
+    win.spin_overscan.setValue(0)
+    win.spin_overscan.setSuffix("  %")
+    win.spin_overscan.setToolTip(
+        "Extra canvas around the undistorted plate, as a percentage of its size.\n"
+        "Straightening a barrel lens pushes the corners of the frame OUTWARDS, and\n"
+        "whatever falls outside the undistorted frame is simply lost. A mild lens\n"
+        "needs 5-10 %; a strong wide-angle barrel needs nearer 40 % before its\n"
+        "corners fit, which is why this goes to 50 rather than offering presets.\n"
+        "The same value is used for both STMaps, so they stay a matched pair.")
+    form_row(lnbody, "Overscan", win.spin_overscan)
+
+    lnbody.addWidget(hint_label(
+        "Both are written by the next solve, or by Re-export below on a solve you already have."))
+
+    win.btn_reexport = make_button(
+        "Re-export This Solve",
+        "Write a fresh export folder from the existing solve using the scene transform,\n"
+        "overscan, undistortion and pixel aspect set here - without solving again.",
+        "compact")
+    win.btn_reexport.clicked.connect(win._reexport_current_solve)
+    lnbody.addWidget(win.btn_reexport)
+    ins.addWidget(lens_card)
 
     # ---- Blender --------------------------------------------------------
     blend_card, bbody = card("Blender Integration")

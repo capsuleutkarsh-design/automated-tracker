@@ -609,6 +609,58 @@ def run_cotracker_chunked(model, video_tensor, queries_tensor, chunk_size=120, o
         capture.remove()
 
 
+def run_cotracker_reversed(model, video_tensor, queries_tensor, **kwargs):
+    """
+    Run the tracker over the clip backwards and hand the result back in shot order.
+
+    For a shot whose only clean reference is at the end - the actor walks into
+    frame, the feature is only sharp on the last twenty frames - tracking from
+    frame 1 is tracking from the worst frame in the shot. This flips the clip,
+    tracks it, and flips the result back, so the arrays the exporters and the
+    canvas see are still frame 0 first.
+
+    Query frames are mirrored with the clip (t -> T-1-t), so a point clicked on
+    frame 700 of a 708-frame shot is still queried on the frame it was clicked.
+    """
+    T = int(video_tensor.shape[1])
+    rev_video = torch.flip(video_tensor, dims=[1])
+    q = queries_tensor.clone()
+    q[0, :, 0] = (T - 1) - q[0, :, 0].clamp(0, max(0, T - 1))
+    tracks, vis, conf = run_cotracker_chunked(model, rev_video, q, **kwargs)
+    # numpy reverse views are negative-strided; copy so torch/np downstream is happy.
+    return (tracks[:, ::-1].copy(), vis[:, ::-1].copy(), conf[:, ::-1].copy())
+
+
+def run_retrack_segment(model, video_tensor, start_t, x, y, backwards=False, **kwargs):
+    """
+    Re-track ONE point from `start_t` to one end of the clip.
+
+    Forwards runs start_t..T-1, backwards runs start_t..0; either way the
+    returned arrays are in ascending frame order and `first_t` says which frame
+    the first sample belongs to. (x, y) is the corrected position at start_t in
+    PROCESSING pixels, and it becomes the query, so the new track leaves exactly
+    where the artist put it.
+
+    Only the frames of the segment are sent to the GPU, and only one point -
+    fixing one drifting marker over the last 300 frames must not re-run the
+    whole grid over the whole shot.
+
+    Returns (first_t, xy [M, 2], vis [M], conf [M]).
+    """
+    T = int(video_tensor.shape[1])
+    start_t = max(0, min(int(start_t), T - 1))
+    if backwards:
+        sub = torch.flip(video_tensor[:, :start_t + 1], dims=[1])
+    else:
+        sub = video_tensor[:, start_t:]
+    q = torch.tensor([[[0.0, float(x), float(y)]]], dtype=torch.float32)
+    tracks, vis, conf = run_cotracker_chunked(model, sub, q, **kwargs)
+    xy, v, c = tracks[0, :, 0], vis[0, :, 0], conf[0, :, 0]
+    if backwards:
+        return 0, xy[::-1].copy(), v[::-1].copy(), c[::-1].copy()
+    return start_t, xy, v, c
+
+
 # Default jump threshold as a fraction of the frame diagonal at processing resolution.
 # 0.18 of the diagonal is what the old fixed 150 px meant at 720x400; as a fraction it
 # now means the same thing at 512p and at 4K.
@@ -683,7 +735,35 @@ def frame_number(t, start_frame=1, frame_step=1):
     return int(start_frame) + int(t) * max(1, int(frame_step))
 
 
-def export_2d_json(tracks_rescaled, vis, orig_w, orig_h, out_path, start_frame=1, frame_step=1):
+def export_layer_name(name):
+    """
+    The layer name as every export writes it: spaces become underscores.
+
+    Node names, Blender collections and the folder per layer all go through
+    this, and the correction pass reads the name back out of tracks_2d.json to
+    find the layer it belongs to - so there is one spelling, in one place.
+    """
+    return str(name).replace(" ", "_")
+
+
+def _conf_at(conf, t, n, default=1.0):
+    """One confidence sample, or `default` when the caller passed no confidence."""
+    if conf is None:
+        return float(default)
+    return float(conf[t, n])
+
+
+def export_2d_json(tracks_rescaled, vis, orig_w, orig_h, out_path, start_frame=1, frame_step=1,
+                   conf=None, layer_name=None):
+    """
+    The tracks as JSON, one record per point per frame.
+
+    `conf` is the model's per-sample confidence in 0..1; it is written next to
+    the position because a weak section of a track is invisible in a list of
+    coordinates, and because the correction pass reads this file back and needs
+    to know how good each sample was. `layer_name` is written so that reading
+    the file back can tell which layer the tracks belong to.
+    """
     T, N, _ = tracks_rescaled.shape
     tracks_data = []
 
@@ -703,12 +783,14 @@ def export_2d_json(tracks_rescaled, vis, orig_w, orig_h, out_path, start_frame=1
                 "y": round(y, 2),
                 "norm_x": round(x / orig_w, 5),
                 "norm_y": round(y / orig_h, 5),
-                "visible": v
+                "visible": v,
+                "confidence": round(_conf_at(conf, t, n), 4)
             })
         tracks_data.append(pt_track)
 
     output = {
         "resolution": {"width": orig_w, "height": orig_h},
+        "layer": export_layer_name(layer_name) if layer_name else None,
         "start_frame": int(start_frame),
         "frame_step": max(1, int(frame_step)),
         "frame_count": T,
@@ -720,21 +802,24 @@ def export_2d_json(tracks_rescaled, vis, orig_w, orig_h, out_path, start_frame=1
         json.dump(output, f, indent=2)
 
 
-def export_2d_csv(tracks_rescaled, vis, orig_w, orig_h, out_path, start_frame=1, frame_step=1):
+def export_2d_csv(tracks_rescaled, vis, orig_w, orig_h, out_path, start_frame=1, frame_step=1,
+                  conf=None):
     T, N, _ = tracks_rescaled.shape
-    lines = ["frame,track_id,x,y,norm_x,norm_y,visible\n"]
+    lines = ["frame,track_id,x,y,norm_x,norm_y,visible,confidence\n"]
     for t in range(T):
         for n in range(N):
             x = float(tracks_rescaled[t, n, 0])
             y = float(tracks_rescaled[t, n, 1])
             v = 1 if vis[t, n] else 0
-            lines.append(f"{frame_number(t, start_frame, frame_step)},{n+1},{x:.2f},{y:.2f},{x/orig_w:.5f},{y/orig_h:.5f},{v}\n")
+            c = _conf_at(conf, t, n)
+            lines.append(f"{frame_number(t, start_frame, frame_step)},{n+1},{x:.2f},{y:.2f},"
+                         f"{x/orig_w:.5f},{y/orig_h:.5f},{v},{c:.4f}\n")
 
     with open(out_path, 'w', encoding='utf-8') as f:
         f.writelines(lines)
 
 
-def _tracker4_rows(tracks, orig_h, name_prefix, start_frame=1, frame_step=1):
+def _tracker4_rows(tracks, orig_h, name_prefix, start_frame=1, frame_step=1, conf=None):
     """
     One Tracker4 `tracks` row per point.
 
@@ -748,9 +833,15 @@ def _tracker4_rows(tracks, orig_h, name_prefix, start_frame=1, frame_step=1):
       Col 6: T             — 1 (use translate)
       Col 7: R             — 0 (use rotate)
       Col 8: S             — 0 (use scale)
-      Col 9: error         — {curve x<start> 0} or 0
+      Col 9: error         — {curve x<start> e1 x<start+1> e2 ...}
       Col 10: error_min    — 0
-      Col 11: error_max    — 0
+      Col 11: error_max    — 1
+
+    THE ERROR COLUMN. Nuke shows it per track in the curve editor, which is
+    where a matchmover looks to find the frames a track went soft. It used to
+    be a flat zero, so every track claimed to be perfect and the weak sections
+    had to be spotted by eye. It now carries 1 - confidence from the solve:
+    0 where the tracker was certain, towards 1 where it was guessing.
       Col 12-15: pattern   — -15 -15 15 15  (pattern bbox)
       Col 16-19: search    — -25 -25 25 25  (search bbox)
       Col 20-30: reserved  — {} {} {} {} {} {} {} {} {} {} {}  (11 empty)
@@ -765,15 +856,18 @@ def _tracker4_rows(tracks, orig_h, name_prefix, start_frame=1, frame_step=1):
         track_name = f"{name_prefix}{n+1:03d}"
         x_curve_parts = []
         y_curve_parts = []
+        err_curve_parts = []
         for t in range(T):
             x = tracks[t, n, 0]
             y = orig_h - tracks[t, n, 1]  # Nuke Y is bottom-up
             fno = frame_number(t, start_frame, frame_step)
             x_curve_parts.append(f"x{fno} {x:.2f}")
             y_curve_parts.append(f"x{fno} {y:.2f}")
+            err_curve_parts.append(f"x{fno} {1.0 - _conf_at(conf, t, n):.4f}")
 
         x_curve = " ".join(x_curve_parts)
         y_curve = " ".join(y_curve_parts)
+        err_curve = " ".join(err_curve_parts)
         # Correct Nuke Tracker4 row: 31 fields in exact order
         row = (
             f'{{ {{curve K x{start_frame} 1}} '     # Col 0: enable
@@ -783,8 +877,8 @@ def _tracker4_rows(tracks, orig_h, name_prefix, start_frame=1, frame_step=1):
             f'{{curve K x{start_frame} 0}} '          # Col 4: offset_x
             f'{{curve K x{start_frame} 0}} '          # Col 5: offset_y
             f'1 0 0 '                                 # Col 6,7,8: T R S
-            f'{{curve x{start_frame} 0}} '            # Col 9: error
-            f'0 0 '                                   # Col 10,11: error_min/max
+            f'{{curve {err_curve}}} '                 # Col 9: error = 1 - confidence
+            f'0 1 '                                   # Col 10,11: error_min/max
             f'-15 -15 15 15 '                         # Col 12-15: pattern bbox
             f'-25 -25 25 25 '                         # Col 16-19: search bbox
             f'{empty_slots} }}'                       # Col 20-30: 11 reserved
@@ -794,10 +888,10 @@ def _tracker4_rows(tracks, orig_h, name_prefix, start_frame=1, frame_step=1):
 
 
 def _tracker4_node(tracks, orig_h, name_prefix, node_name, start_frame=1, frame_step=1,
-                   xpos=0, ypos=0, label=None):
+                   xpos=0, ypos=0, label=None, conf=None):
     """A complete Tracker4 node (with its `push`), ready to append to a .nk script."""
     T, N, _ = tracks.shape
-    rows = _tracker4_rows(tracks, orig_h, name_prefix, start_frame, frame_step)
+    rows = _tracker4_rows(tracks, orig_h, name_prefix, start_frame, frame_step, conf=conf)
     label_line = f' label "{label}"\n' if label else ""
     return (
         f'push $cut_paste_input\n'
@@ -817,10 +911,11 @@ def _tracker4_node(tracks, orig_h, name_prefix, node_name, start_frame=1, frame_
 NK_HEADER = "set cut_paste_input [stack 0]\nversion 14.0 v1\n"
 
 
-def export_2d_nuke_tracker(tracks_rescaled, vis, orig_w, orig_h, fps, out_path, node_name="CoTracker2D_Tracker", xpos=0, ypos=0, start_frame=1, frame_step=1):
+def export_2d_nuke_tracker(tracks_rescaled, vis, orig_w, orig_h, fps, out_path, node_name="CoTracker2D_Tracker", xpos=0, ypos=0, start_frame=1, frame_step=1, conf=None):
     """Generates a native Nuke Tracker4 node with all tracks keyframed."""
     script = NK_HEADER + _tracker4_node(tracks_rescaled, orig_h, "track_", node_name,
-                                        start_frame, frame_step, xpos=xpos, ypos=ypos)
+                                        start_frame, frame_step, xpos=xpos, ypos=ypos,
+                                        conf=conf)
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(script)
     return True
@@ -834,10 +929,10 @@ def export_multi_layer_nuke_tracker(layers_data, orig_w, orig_h, fps, out_path, 
     script = NK_HEADER
     x_offset = 0
     for idx, ldata in enumerate(layers_data):
-        l_name = ldata.get("name", f"Layer_{idx+1}").replace(" ", "_")
+        l_name = export_layer_name(ldata.get("name", f"Layer_{idx+1}"))
         script += _tracker4_node(ldata["tracks"], orig_h, f"{l_name}_", f"Tracker_{l_name}",
                                  start_frame, frame_step, xpos=x_offset, ypos=0,
-                                 label=f"Layer: {l_name}")
+                                 label=f"Layer: {l_name}", conf=ldata.get("conf"))
         x_offset += 150
 
     with open(out_path, 'w', encoding='utf-8') as f:
@@ -1346,6 +1441,203 @@ def render_multi_layer_overlay_video(proc_frames_np, layer_results, out_mp4_path
 
 
 # =============================================================================
+# TRACK CORRECTION: READ A RESULT BACK AND SPLICE INTO IT  (roadmap 2.1)
+#
+# A drifting track is fixed by hand on the frame it goes wrong, not by solving
+# the shot again. Everything here is pure - no Qt, no GPU - so the arithmetic
+# that decides which frames a correction replaces is the arithmetic the tests
+# pin down. tracks_2d.json is the record: it is what the tracker wrote, and it
+# is what the window loads back when the shot is picked again days later.
+# =============================================================================
+def _arrays_from_point_lists(point_lists):
+    """
+    (tracks [T, N, 2], vis [T, N], conf [T, N], frames [T]) from the JSON records.
+
+    `point_lists` is one list of {frame, x, y, visible, confidence} per point,
+    in track order. A file written before confidence was carried simply lacks
+    the key, and those samples read as fully confident rather than as zero -
+    an old export must not look like a shot full of bad frames.
+    """
+    if not point_lists:
+        return None
+    T = min(len(pl) for pl in point_lists)
+    N = len(point_lists)
+    tracks = np.zeros((T, N, 2), dtype=np.float32)
+    vis = np.zeros((T, N), dtype=bool)
+    conf = np.ones((T, N), dtype=np.float32)
+    frames = [int(point_lists[0][t].get("frame", t)) for t in range(T)]
+    for n, pl in enumerate(point_lists):
+        for t in range(T):
+            rec = pl[t]
+            tracks[t, n, 0] = float(rec.get("x", 0.0))
+            tracks[t, n, 1] = float(rec.get("y", 0.0))
+            vis[t, n] = bool(rec.get("visible", True))
+            conf[t, n] = float(rec.get("confidence", 1.0))
+    return tracks, vis, conf, frames
+
+
+def load_tracks_2d(path):
+    """
+    A written tracks_2d.json back as arrays, or None when it is not one.
+
+    Handles both shapes the exporters write: the flat single-layer file (which
+    names its layer) and the multi-layer master file (one entry per layer). The
+    layer key of a single-layer file written before the name was recorded is
+    None, and match_result_to_layers decides what that may be attached to.
+
+    Returns {"path", "width", "height", "start_frame", "frame_step",
+             "frame_count", "layers": {name: {"tracks", "vis", "conf", "frames"}}}.
+    """
+    path = Path(path)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    layers = {}
+    if isinstance(data.get("layers"), dict):
+        meta = data.get("metadata") or {}
+        width = int(meta.get("width", 0) or 0)
+        height = int(meta.get("height", 0) or 0)
+        start_frame = int(meta.get("start_frame", 1) or 1)
+        step = max(1, int(meta.get("frame_step", 1) or 1))
+        for l_name, lblock in data["layers"].items():
+            pts = (lblock or {}).get("points") or {}
+            built = _arrays_from_point_lists([pts[k] for k in sorted(pts)])
+            if built:
+                layers[str(l_name)] = dict(zip(("tracks", "vis", "conf", "frames"), built))
+    elif isinstance(data.get("tracks"), list):
+        res = data.get("resolution") or {}
+        width = int(res.get("width", 0) or 0)
+        height = int(res.get("height", 0) or 0)
+        start_frame = int(data.get("start_frame", 1) or 1)
+        step = max(1, int(data.get("frame_step", 1) or 1))
+        built = _arrays_from_point_lists([t.get("frames") or [] for t in data["tracks"]])
+        if built:
+            layers[data.get("layer") or None] = dict(
+                zip(("tracks", "vis", "conf", "frames"), built))
+    else:
+        return None
+
+    if not layers:
+        return None
+    first = next(iter(layers.values()))
+    return {
+        "path": str(path),
+        "width": width,
+        "height": height,
+        "start_frame": start_frame,
+        "frame_step": step,
+        "frame_count": int(first["tracks"].shape[0]),
+        "layers": layers,
+    }
+
+
+def match_result_to_layers(result, layer_names):
+    """
+    Which loaded layer belongs to which layer in the window: (mapping, problem).
+
+    Matching is by the name the export recorded, put through export_layer_name
+    so "Layer 1 (Wall)" finds "Layer_1_(Wall)". A single-layer file written
+    before the name was recorded carries None, and is attached to the shot's
+    only layer - with more than one layer there is nothing to attach it to.
+
+    A file that does not line up returns (None, sentence): the roadmap's rule
+    is that the artist is told, not that the tool guesses which track is which
+    and lets them correct the wrong point.
+    """
+    if not result or not result.get("layers"):
+        return None, "The saved result carries no tracks."
+    by_export_name = {}
+    for name in layer_names:
+        by_export_name.setdefault(export_layer_name(name), name)
+
+    keys = list(result["layers"].keys())
+    if keys == [None]:
+        if len(layer_names) == 1:
+            return {layer_names[0]: None}, ""
+        return None, ("The saved result does not say which layer it belongs to, and this "
+                      "shot has %d layers - re-run the track to make a result that does."
+                      % len(layer_names))
+
+    mapping = {}
+    missing = []
+    for key in keys:
+        target = by_export_name.get(export_layer_name(key))
+        if target is None:
+            missing.append(str(key))
+        else:
+            mapping[target] = key
+    if missing or len(mapping) != len(layer_names):
+        return None, ("The saved result was tracked with layer(s) %s, but this shot now has "
+                      "%s - re-run the 2D track before correcting it."
+                      % (", ".join(str(k) for k in keys) or "none",
+                         ", ".join(layer_names) or "none"))
+    return mapping, ""
+
+
+def result_index_for_frame(result, frame):
+    """The array index of a timeline frame in a loaded result, or None if it has none."""
+    step = max(1, int(result.get("frame_step", 1)))
+    offset = int(frame) - int(result.get("start_frame", 1))
+    if offset < 0 or offset % step:
+        return None
+    t = offset // step
+    return t if 0 <= t < int(result.get("frame_count", 0)) else None
+
+
+def set_corrected_sample(layer_result, n, t, x, y, conf=1.0):
+    """
+    The artist dragged point n on frame index t: that frame becomes what they set.
+
+    Written straight into the stored arrays, so the canvas redraws from the
+    same numbers the exports will be written from. The sample is marked visible
+    and fully confident, because a position the artist placed by hand is the
+    most reliable sample in the track.
+    """
+    tracks = layer_result["tracks"]
+    t, n = int(t), int(n)
+    if not (0 <= t < tracks.shape[0] and 0 <= n < tracks.shape[1]):
+        return False
+    tracks[t, n, 0] = float(x)
+    tracks[t, n, 1] = float(y)
+    layer_result["vis"][t, n] = True
+    layer_result["conf"][t, n] = float(conf)
+    return True
+
+
+def splice_track(layer_result, n, first_t, xy, vis=None, conf=None):
+    """
+    Put a re-tracked segment into a stored result, in place, and say how many frames moved.
+
+    The segment starts at frame index `first_t` and runs forward for as many
+    samples as it has; every earlier frame of that point is left exactly as it
+    was, and every other point is untouched. That is the whole promise of
+    "re-track from here": the work before the correction survives it.
+    """
+    tracks = layer_result["tracks"]
+    T, N, _ = tracks.shape
+    n, first_t = int(n), max(0, int(first_t))
+    xy = np.asarray(xy, dtype=np.float32).reshape(-1, 2)
+    end_t = min(T, first_t + len(xy))
+    count = end_t - first_t
+    if count <= 0 or not (0 <= n < N):
+        return 0
+    tracks[first_t:end_t, n] = xy[:count]
+    if vis is not None:
+        layer_result["vis"][first_t:end_t, n] = np.asarray(vis, dtype=bool).reshape(-1)[:count]
+    else:
+        layer_result["vis"][first_t:end_t, n] = True
+    if conf is not None:
+        layer_result["conf"][first_t:end_t, n] = np.asarray(
+            conf, dtype=np.float32).reshape(-1)[:count]
+    return int(count)
+
+
+# =============================================================================
 # MAIN ORCHESTRATION PIPELINE
 # =============================================================================
 def _export_layer_files(ldata, out_dir, orig_w, orig_h, fps, images_dir, fr, timeline_start, node_name, collection_name, log):
@@ -1356,11 +1648,13 @@ def _export_layer_files(ldata, out_dir, orig_w, orig_h, fps, images_dir, fr, tim
     Returns the corner-pin paths (or None) as (nuke, ae, blender).
     """
     tracks, vis = ldata["tracks"], ldata["vis"]
+    conf = ldata.get("conf")
     ae_fr = dict(fr, timeline_start=timeline_start)
 
-    export_2d_json(tracks, vis, orig_w, orig_h, out_dir / "tracks_2d.json", **fr)
-    export_2d_csv(tracks, vis, orig_w, orig_h, out_dir / "tracks_2d_csv.csv", **fr)
-    export_2d_nuke_tracker(tracks, vis, orig_w, orig_h, fps, out_dir / "tracks_2d_nuke.nk", node_name=node_name, **fr)
+    export_2d_json(tracks, vis, orig_w, orig_h, out_dir / "tracks_2d.json",
+                   conf=conf, layer_name=ldata["name"], **fr)
+    export_2d_csv(tracks, vis, orig_w, orig_h, out_dir / "tracks_2d_csv.csv", conf=conf, **fr)
+    export_2d_nuke_tracker(tracks, vis, orig_w, orig_h, fps, out_dir / "tracks_2d_nuke.nk", node_name=node_name, conf=conf, **fr)
     export_2d_after_effects_jsx(tracks, vis, orig_w, orig_h, fps, out_dir / "tracks_2d_ae.jsx", **ae_fr)
     export_2d_blender_empties(tracks, vis, orig_w, orig_h, fps, out_dir / "tracks_2d_blender.py",
                               images_dir=images_dir, collection_name=collection_name, **fr)
@@ -1381,6 +1675,147 @@ def _export_layer_files(ldata, out_dir, orig_w, orig_h, fps, images_dir, fr, tim
     export_2d_cornerpin_blender(tracks, orig_w, orig_h, fps, cp_blender, **fr)
     log(f"   ✔ [{ldata['name']}] Nuke CornerPin2D, After Effects Corner Pin and Blender quad written.", "#00d2ff")
     return cp_nuke, cp_ae, cp_blender
+
+
+def write_2d_exports(layers_results, out_dir, orig_w, orig_h, fps, images_dir, fr,
+                     timeline_start, source_name="", log=None):
+    """
+    Every 2D delivery format for a whole result, into out_dir.
+
+    One layer writes its files into out_dir itself; several write a subfolder
+    each plus the combined master Nuke, Blender and JSON files alongside. This
+    is the only place the file set is decided, so a re-export after a hand
+    correction produces exactly the files the original solve did.
+
+    `layers_results` is the list the pipeline builds - name, tracks, vis, conf,
+    point_count, export_cornerpin - and `fr` is the {start_frame, frame_step}
+    bundle every writer takes. Returns the paths as a dict.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if log is None:
+        log = lambda msg, color="#ffffff": None
+    is_multi_layer = len(layers_results) > 1
+
+    json_path = out_dir / "tracks_2d.json"
+    nuke_path = out_dir / "tracks_2d_nuke.nk"
+    ae_path = out_dir / "tracks_2d_ae.jsx"
+    blender_path = out_dir / "tracks_2d_blender.py"
+    cornerpin_nuke_path = cornerpin_ae_path = cornerpin_blender_path = None
+
+    # One spelling for the whole file set: a layer called "Wall A" writes a
+    # Wall_A folder, a Tracker_Wall_A node and a Wall_A entry in the master
+    # JSON, and that is the name the correction pass matches on the way back in.
+    for ldata in layers_results:
+        l_name = export_layer_name(ldata["name"])
+        ldata["name"] = l_name
+        layer_dir = out_dir / l_name if is_multi_layer else out_dir
+        layer_dir.mkdir(parents=True, exist_ok=True)
+        cp_paths = _export_layer_files(
+            ldata, layer_dir, orig_w, orig_h, fps, images_dir, fr, timeline_start,
+            node_name=f"Tracker_{l_name}" if is_multi_layer else "CoTracker2D_Tracker",
+            collection_name=f"Layer_{l_name}" if is_multi_layer else "CoTracker_2D_Tracks",
+            log=log,
+        )
+        if not is_multi_layer:
+            cornerpin_nuke_path, cornerpin_ae_path, cornerpin_blender_path = cp_paths
+
+    if is_multi_layer:
+        start_frame = fr["start_frame"]
+        step = max(1, int(fr.get("frame_step", 1)))
+        T = int(max(l["tracks"].shape[0] for l in layers_results))
+
+        export_multi_layer_nuke_tracker(layers_results, orig_w, orig_h, fps, nuke_path, **fr)
+        log(f"   ✔ Generated Multi-Layer Nuke Tracker: {nuke_path.name}", "#00ff88")
+
+        export_multi_layer_blender(layers_results, orig_w, orig_h, fps, blender_path,
+                                   images_dir=images_dir, **fr)
+        log(f"   ✔ Generated Multi-Layer Blender Script: {blender_path.name}", "#00ff88")
+
+        # Master combined JSON
+        all_tracks_dict = {
+            "metadata": {"video": source_name, "width": orig_w, "height": orig_h, "frames": T,
+                         "fps": fps, "start_frame": start_frame, "frame_step": step,
+                         "layers": len(layers_results)},
+            "layers": {}
+        }
+        for ldata in layers_results:
+            tr = ldata["tracks"]
+            vi = ldata["vis"]
+            cf = ldata.get("conf")
+            n_pts = int(ldata.get("point_count") or tr.shape[1])
+            all_tracks_dict["layers"][ldata["name"]] = {
+                "point_count": n_pts,
+                "points": {
+                    f"track_{n+1:03d}": [
+                        {"frame": frame_number(t, start_frame, step),
+                         "x": round(float(tr[t, n, 0]), 2), "y": round(float(tr[t, n, 1]), 2),
+                         "visible": bool(vi[t, n]),
+                         "confidence": round(_conf_at(cf, t, n), 4)}
+                        for t in range(int(tr.shape[0]))
+                    ]
+                    for n in range(n_pts)
+                }
+            }
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(all_tracks_dict, f, indent=2)
+        log(f"   ✔ Generated Multi-Layer JSON: {json_path.name}", "#00ff88")
+
+    return {
+        "json_path": json_path,
+        "nuke_path": nuke_path,
+        "ae_path": ae_path,
+        "blender_path": blender_path,
+        "cornerpin_nuke_path": cornerpin_nuke_path,
+        "cornerpin_ae_path": cornerpin_ae_path,
+        "cornerpin_blender_path": cornerpin_blender_path,
+    }
+
+
+def sync_latest_folder(out_dir, latest_dir):
+    """
+    Mirror a finished output folder into _latest, which every 1-click button reads.
+
+    Never raises: a locked file in _latest (Explorer is often sitting in it)
+    must not lose the export that was just written next to it.
+    """
+    try:
+        out_dir, latest_dir = Path(out_dir), Path(latest_dir)
+        latest_dir.mkdir(parents=True, exist_ok=True)
+        for f in out_dir.iterdir():
+            if f.is_file():
+                shutil.copy2(f, latest_dir / f.name)
+            elif f.is_dir() and f.name != latest_dir.name:
+                sub_dest = latest_dir / f.name
+                if sub_dest.exists():
+                    shutil.rmtree(sub_dest)
+                shutil.copytree(f, sub_dest)
+        return True
+    except Exception:
+        return False
+
+
+def load_predictor(offline=True, device=None):
+    """
+    The CoTracker model on the device, from the checkpoint that ships with the app.
+
+    One place, because the correction pass (2.1) loads exactly the model the
+    full solve did - a re-tracked segment spliced into a track solved by a
+    different network would drift at the join.
+    """
+    if not HAS_COTRACKER:
+        raise ImportError(
+            "The CoTracker package could not be imported. Check that '06 COTRACKER' is present "
+            "next to the app (from source) or was bundled into the build."
+        )
+    device = device or get_default_device()
+    ckpt_name = "scaled_offline.pth" if offline else "scaled_online.pth"
+    ckpt_path = COTRACKER_DIR / "checkpoints" / ckpt_name
+    return CoTrackerPredictor(
+        checkpoint=str(ckpt_path),
+        offline=offline,
+        window_len=60 if offline else 16,
+    ).to(device)
 
 
 def process_cotracker_2d(video_path, config=None, progress_callback=None, log_callback=None, cancel_check=None):
@@ -1480,6 +1915,10 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
 
     offline = config.get("offline", True)
     fps = config.get("fps", 24.0)
+    backwards = bool(config.get("backwards", False))
+    if backwards:
+        log("   Tracking backwards: the clip is run from its last frame to its first "
+            "and the result flipped back, so the exports still start at the head.", "#a0a0b0")
 
     # Normalize to layers list
     raw_layers = config.get("layers")
@@ -1500,14 +1939,7 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
     log(f"▶ [2/4] Initializing CoTracker3 AI on GPU for {len(raw_layers)} tracking layer(s)...", "#00d2ff")
     prog(30, "Loading AI model...")
 
-    ckpt_name = "scaled_offline.pth" if offline else "scaled_online.pth"
-    ckpt_path = COTRACKER_DIR / "checkpoints" / ckpt_name
-
-    model = CoTrackerPredictor(
-        checkpoint=str(ckpt_path),
-        offline=offline,
-        window_len=60 if offline else 16
-    ).to(device)
+    model = load_predictor(offline=offline, device=device)
 
     # Frame-numbering bundle handed to every exporter.
     fr = {"start_frame": export_start_frame, "frame_step": step}
@@ -1520,7 +1952,7 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
         if cancelled():
             return cancelled_result()
 
-        l_name = lconf.get("name", f"Layer_{l_idx+1}").replace(" ", "_")
+        l_name = export_layer_name(lconf.get("name", f"Layer_{l_idx+1}"))
         l_mode = lconf.get("mode", "grid")
         l_min_conf = lconf.get("min_confidence", 0.7)
         l_col = lconf.get("color", "#00d2ff")
@@ -1596,7 +2028,10 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
         prog(35 + int((l_idx / len(raw_layers)) * 35), f"Tracking Layer {l_name} ({N_layer} pts)...")
 
         try:
-            pred_tracks, pred_vis, pred_conf = run_cotracker_chunked(
+            # Backwards runs the engine over the reversed clip and flips the
+            # result back, for a shot whose good reference is at the end.
+            runner = run_cotracker_reversed if backwards else run_cotracker_chunked
+            pred_tracks, pred_vis, pred_conf = runner(
                 model, video_tensor, q_tensor, chunk_size=120, overlap=30,
                 device=device, auto_chunk=auto_chunk, log=log, cancel_check=cancel_check
             )
@@ -1629,6 +2064,11 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
             "tracks": l_tracks_rescaled,
             "tracks_proc": l_tracks_proc,
             "vis": l_vis,
+            # The raw per-sample confidence, kept beside the positions: it is
+            # what the Tracker4 error column, the CSV and the JSON carry, so a
+            # soft section of a track shows up in Nuke instead of having to be
+            # found by eye.
+            "conf": l_conf,
             "color": l_col,
             "point_count": N_layer,
             # Only a layer explicitly set up as a corner pin - never "has 4 points".
@@ -1639,57 +2079,15 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
     prog(75, "Generating Master VFX Exporters...")
     log("▶ [3/4] Generating VFX 2D Tracker Formats (Nuke, AE, Blender, JSON, CSV)...", "#00d2ff")
 
-    # Every layer gets the same file set: in out_dir itself for a single layer, in a
-    # subfolder per layer otherwise (with combined master files alongside).
-    json_path = out_dir / "tracks_2d.json"
-    nuke_path = out_dir / "tracks_2d_nuke.nk"
-    ae_path = out_dir / "tracks_2d_ae.jsx"
-    blender_path = out_dir / "tracks_2d_blender.py"
-    cornerpin_nuke_path = cornerpin_ae_path = cornerpin_blender_path = None
-
-    for ldata in layers_results:
-        l_name = ldata["name"]
-        layer_dir = out_dir / l_name if is_multi_layer else out_dir
-        layer_dir.mkdir(parents=True, exist_ok=True)
-        cp_paths = _export_layer_files(
-            ldata, layer_dir, orig_w, orig_h, fps, images_dir, fr, timeline_start,
-            node_name=f"Tracker_{l_name}" if is_multi_layer else "CoTracker2D_Tracker",
-            collection_name=f"Layer_{l_name}" if is_multi_layer else "CoTracker_2D_Tracks",
-            log=log,
-        )
-        if not is_multi_layer:
-            cornerpin_nuke_path, cornerpin_ae_path, cornerpin_blender_path = cp_paths
-
-    if is_multi_layer:
-        # Multi-layer combined files
-        export_multi_layer_nuke_tracker(layers_results, orig_w, orig_h, fps, nuke_path, **fr)
-        log(f"   ✔ Generated Multi-Layer Nuke Tracker: {nuke_path.name}", "#00ff88")
-
-        export_multi_layer_blender(layers_results, orig_w, orig_h, fps, blender_path, images_dir=images_dir, **fr)
-        log(f"   ✔ Generated Multi-Layer Blender Script: {blender_path.name}", "#00ff88")
-
-        # Master combined JSON
-        all_tracks_dict = {
-            "metadata": {"video": video_path.name, "width": orig_w, "height": orig_h, "frames": T, "fps": fps, "start_frame": export_start_frame, "frame_step": step, "layers": len(layers_results)},
-            "layers": {}
-        }
-        for ldata in layers_results:
-            l_name = ldata["name"]
-            tr = ldata["tracks"]
-            vi = ldata["vis"]
-            all_tracks_dict["layers"][l_name] = {
-                "point_count": ldata["point_count"],
-                "points": {
-                    f"track_{n+1:03d}": [
-                        {"frame": frame_number(t, export_start_frame, step), "x": round(float(tr[t, n, 0]), 2), "y": round(float(tr[t, n, 1]), 2), "visible": bool(vi[t, n])}
-                        for t in range(T)
-                    ]
-                    for n in range(ldata["point_count"])
-                }
-            }
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(all_tracks_dict, f, indent=2)
-        log(f"   ✔ Generated Multi-Layer JSON: {json_path.name}", "#00ff88")
+    paths = write_2d_exports(layers_results, out_dir, orig_w, orig_h, fps, images_dir, fr,
+                             timeline_start, source_name=video_path.name, log=log)
+    json_path = paths["json_path"]
+    nuke_path = paths["nuke_path"]
+    ae_path = paths["ae_path"]
+    blender_path = paths["blender_path"]
+    cornerpin_nuke_path = paths["cornerpin_nuke_path"]
+    cornerpin_ae_path = paths["cornerpin_ae_path"]
+    cornerpin_blender_path = paths["cornerpin_blender_path"]
 
     if cancelled():
         return cancelled_result()
@@ -1707,20 +2105,7 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
     except Exception as e:
         log(f"Notice: Overlay render exception: {e}", "#e0a000")
 
-    # Update _latest folder for instant 1-click access
-    try:
-        latest_dir = scene_dir / "2D_POINT_TRACK" / "_latest"
-        latest_dir.mkdir(parents=True, exist_ok=True)
-        for f in out_dir.iterdir():
-            if f.is_file():
-                shutil.copy2(f, latest_dir / f.name)
-            elif f.is_dir() and f.name != "_latest":
-                sub_dest = latest_dir / f.name
-                if sub_dest.exists():
-                    shutil.rmtree(sub_dest)
-                shutil.copytree(f, sub_dest)
-    except Exception:
-        pass
+    sync_latest_folder(out_dir, scene_dir / "2D_POINT_TRACK" / "_latest")
 
     prog(100, "2D Point Tracking Complete")
     log(f"🎉 SUCCESS: 2D Point Tracking complete for '{base_name}'! Results in 04 SCENES/{base_name}/2D_POINT_TRACK/{timestamp}/", "#00ff88")
@@ -1744,6 +2129,129 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
         "cornerpin_blender_path": str(cornerpin_blender_path) if cornerpin_blender_path else None,
         "overlay_path": str(overlay_path) if overlay_path.exists() else None
     }
+
+
+# =============================================================================
+# CORRECTION PIPELINE: RE-TRACK ONE POINT, RE-EXPORT THE RESULT  (roadmap 2.1)
+# =============================================================================
+def retrack_correction(video_path, result, layer_key, point_index, frame_t, x, y,
+                       config=None, backwards=False, log_callback=None,
+                       progress_callback=None, cancel_check=None, model=None):
+    """
+    Re-run the tracker for one corrected point and splice it into `result`, in place.
+
+    (x, y) is where the artist put the point, in PLATE pixels on frame index
+    `frame_t`; the engine works at the loaded resolution, so it is scaled down
+    on the way in and the new positions are scaled back on the way out - the
+    same two multiplications the full solve uses.
+
+    Forwards always runs, to the out point. `backwards` adds a second pass from
+    the corrected frame to the in point, for a track that was already wrong
+    before the frame the artist noticed it on.
+
+    The clip has to load to the same number of samples the result holds; if the
+    In/Out or the Resolution has moved since the solve, that is said in plain
+    words rather than splicing frames into the wrong places.
+    """
+    config = dict(config or {})
+
+    def log(msg, color="#ffffff"):
+        if log_callback:
+            log_callback(msg, color)
+
+    def prog(val, text):
+        if progress_callback:
+            progress_callback(val, text)
+
+    layer = result["layers"][layer_key]
+    T_stored = int(layer["tracks"].shape[0])
+    step = max(1, int(config.get("frame_step", result.get("frame_step", 1))))
+    in_pt = max(0, int(config.get("in_point", 0)))
+    out_pt = int(config.get("out_point", -1))
+    max_dim = config.get("max_dimension", 720)
+
+    prog(10, "Loading frames for the correction...")
+    frames_np, (orig_w, orig_h) = load_video_frames(
+        video_path, max_dimension=max_dim, frame_step=step, in_point=in_pt, out_point=out_pt)
+    T, proc_h, proc_w, _ = frames_np.shape
+    if T != T_stored:
+        raise ValueError(
+            "The saved result covers %d frames but the current range loads %d. Reset the "
+            "In/Out points to the range the track was made on, or run the 2D track again."
+            % (T_stored, T))
+
+    scale_x = orig_w / float(proc_w)
+    scale_y = orig_h / float(proc_h)
+    video_tensor = torch.from_numpy(frames_np).permute(0, 3, 1, 2)[None]
+
+    prog(30, "Loading the AI model...")
+    model = model or load_predictor(offline=bool(config.get("offline", True)))
+
+    kwargs = dict(chunk_size=120, overlap=30, device=get_default_device(),
+                  auto_chunk=bool(config.get("auto_chunk", True)),
+                  log=log, cancel_check=cancel_check)
+    frame_no = frame_number(int(frame_t), result.get("start_frame", 1), step)
+    runs = [(False, 45, "forward")] + ([(True, 70, "backward")] if backwards else [])
+    spliced = {}
+    for is_back, pct, word in runs:
+        prog(pct, "Re-tracking one point %s from frame %d..." % (word, frame_no))
+        log("   ▶ Re-tracking point #%d %s from frame %d." % (int(point_index) + 1, word, frame_no),
+            "#00d2ff")
+        first_t, xy, seg_vis, seg_conf = run_retrack_segment(
+            model, video_tensor, int(frame_t), float(x) / scale_x, float(y) / scale_y,
+            backwards=is_back, **kwargs)
+        xy = np.asarray(xy, dtype=np.float32).copy()
+        xy[:, 0] *= scale_x
+        xy[:, 1] *= scale_y
+        count = splice_track(layer, int(point_index), first_t, xy, seg_vis, seg_conf)
+        spliced[word] = count
+        log("   ✔ %d frame(s) replaced %s of frame %d; everything outside is untouched."
+            % (count, word, frame_no), "#00ff88")
+
+    # The corrected frame itself is the artist's, not the tracker's: the query
+    # is only a seed and the model may answer a fraction of a pixel away.
+    set_corrected_sample(layer, int(point_index), int(frame_t), x, y)
+    prog(90, "Correction spliced into the result.")
+    return {"frame": frame_no, "spliced": spliced}
+
+
+def export_corrected_result(result, layers_meta, out_dir, fps=24.0, images_dir=None,
+                            timeline_start=1, source_name="", latest_dir=None, log=None):
+    """
+    Write every 2D format again from a corrected result, without re-tracking.
+
+    After a correction the files handed to comp are stale, and nothing about
+    them needs the GPU - they are the same arrays through the same writers. The
+    overlay video is not re-rendered (that does need the frames), so it stays
+    whatever the last real track produced.
+
+    `layers_meta` is one dict per layer in window order: {"name", "key",
+    "export_cornerpin"}, where "key" is that layer's entry in the result.
+    """
+    layers_results = []
+    for meta in layers_meta:
+        block = result["layers"].get(meta.get("key"))
+        if block is None:
+            continue
+        layers_results.append({
+            "name": export_layer_name(meta.get("name") or meta.get("key") or "Layer_01"),
+            "tracks": block["tracks"],
+            "vis": block["vis"],
+            "conf": block.get("conf"),
+            "point_count": int(block["tracks"].shape[1]),
+            "export_cornerpin": bool(meta.get("export_cornerpin", False)),
+        })
+    if not layers_results:
+        raise ValueError("Nothing to export: the corrected result holds no layers.")
+
+    fr = {"start_frame": int(result.get("start_frame", 1)),
+          "frame_step": max(1, int(result.get("frame_step", 1)))}
+    paths = write_2d_exports(layers_results, out_dir, int(result["width"]), int(result["height"]),
+                             fps, images_dir, fr, timeline_start,
+                             source_name=source_name, log=log)
+    if latest_dir:
+        sync_latest_folder(out_dir, latest_dir)
+    return paths
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
 from mask_animator import AnimatedMask, rasterize_masks_to_png
-from core.media_info import probe_fps
+from core.media_info import probe_fps, probe_pixel_aspect
 from core.proc import popen_hidden
 from core.colmap_model import find_best_model, model_stats, model_error, registered_indices
 
@@ -110,9 +110,10 @@ def _source_signature(source):
         return {"source": str(p)}
 
 
-def write_images_stamp(img_dir, source, frame_step, frame_count):
+def write_images_stamp(img_dir, source, frame_step, frame_count, pixel_aspect=1.0):
     stamp = _source_signature(source)
-    stamp.update({"frame_step": int(frame_step), "frame_count": int(frame_count)})
+    stamp.update({"frame_step": int(frame_step), "frame_count": int(frame_count),
+                  "pixel_aspect": float(pixel_aspect or 1.0)})
     try:
         with open(images_stamp_path(img_dir), "w", encoding="utf-8") as f:
             json.dump(stamp, f, indent=2)
@@ -120,8 +121,8 @@ def write_images_stamp(img_dir, source, frame_step, frame_count):
         pass
 
 
-def images_stamp_matches(img_dir, source, frame_step):
-    """True when images/ was extracted from this source at this step."""
+def images_stamp_matches(img_dir, source, frame_step, pixel_aspect=1.0):
+    """True when images/ was extracted from this source at this step and aspect."""
     try:
         with open(images_stamp_path(img_dir), "r", encoding="utf-8") as f:
             stamp = json.load(f)
@@ -129,7 +130,170 @@ def images_stamp_matches(img_dir, source, frame_step):
         return False
     if int(stamp.get("frame_step", 0)) != int(frame_step):
         return False
+    # Frames extracted for a square-pixel run are the wrong shape for a squeezed
+    # one and vice versa; a stamp from before 1.6 simply means square.
+    if abs(float(stamp.get("pixel_aspect", 1.0)) - float(pixel_aspect or 1.0)) > 1e-9:
+        return False
     return all(stamp.get(k) == v for k, v in _source_signature(source).items())
+
+
+# -----------------------------------------------------------------------------
+# Frame extraction (1.6)
+#
+# WHY THE PLATE IS DE-SQUEEZED HERE RATHER THAN DECLARED TO COLMAP.
+# COLMAP has no pixel aspect at all: every camera model it ships assumes square
+# pixels, and the closest thing to an escape hatch - solving a model with a free
+# fx and fy - asks the bundle adjuster to recover the squeeze from the image
+# content, which it does badly on a short shot and not at all on a nodal one. A
+# squeezed plate therefore solves with a lens that is wrong in one axis, and
+# every export inherits it. Scaling the frames back to square before the solve
+# removes the problem instead of modelling it: COLMAP sees the pixels it already
+# assumes it has and the intrinsics come out honest.
+#
+# The rule is de-squeeze exactly once, here, and treat everything downstream as
+# square - a movie and an image sequence alike, because FFmpeg reads a numbered
+# sequence as happily as it reads a clip. A camera solved on square pixels is
+# only valid against square pixels, so the exports point at these frames and
+# carry no aspect of their own; the source's aspect is recorded in
+# camera_track.json as a fact about the plate that was shot.
+# -----------------------------------------------------------------------------
+def desqueeze_filter(pixel_aspect=1.0):
+    """
+    The ffmpeg scale filter that turns a squeezed plate into square pixels, or None.
+
+    The axis that grows is always the short one, so nothing is thrown away:
+    a 2:1 anamorphic (wide pixels) is stretched horizontally, a plate squeezed
+    the other way is stretched vertically. `setsar=1` then states in the file
+    what is now true, so a player does not squeeze it a second time.
+    """
+    pa = float(pixel_aspect or 1.0)
+    if abs(pa - 1.0) <= 1e-9 or pa <= 0.0:
+        return None
+    if pa > 1.0:
+        return f"scale=iw*{pa:g}:ih,setsar=1"
+    return f"scale=iw:ih/{pa:g},setsar=1"
+
+
+def extraction_video_filter(frame_step=1, pixel_aspect=1.0):
+    """The whole -vf chain for extraction (frame step, de-squeeze), or None."""
+    step = max(1, int(frame_step or 1))
+    parts = []
+    if step > 1:
+        parts.append(f"select=not(mod(n\\,{step}))")
+    squeeze = desqueeze_filter(pixel_aspect)
+    if squeeze:
+        parts.append(squeeze)
+    return ",".join(parts) if parts else None
+
+
+def ffmpeg_extract_command(ffmpeg_exe, video, out_pattern, frame_step=1, pixel_aspect=1.0,
+                           start_number=None):
+    """
+    The FFmpeg call that fills images/ for a solve.
+
+    `video` is a clip, or the `%0Nd` pattern of a numbered image sequence - the
+    image2 demuxer needs `-start_number` to know which file the run begins at,
+    and from there the frame step and the de-squeeze are the same filter chain a
+    movie gets. `-qscale:v` is a JPEG quality, so it is only sent when JPEGs are
+    what comes out; a sequence kept in its own format would reject it.
+    """
+    cmd = [str(ffmpeg_exe), "-loglevel", "error", "-stats"]
+    if start_number is not None:
+        cmd.extend(["-start_number", str(int(start_number))])
+    cmd.extend(["-i", str(video)])
+    vf_filter = extraction_video_filter(frame_step, pixel_aspect)
+    if vf_filter:
+        cmd.extend(["-vf", vf_filter])
+        if max(1, int(frame_step or 1)) > 1:
+            # select= drops frames, so the timestamps are no longer regular.
+            cmd.extend(["-vsync", "vfr"])
+    out_pattern = str(out_pattern)
+    if Path(out_pattern).suffix.lower() in (".jpg", ".jpeg"):
+        cmd.extend(["-qscale:v", "2"])
+    cmd.append(out_pattern)
+    return cmd
+
+
+# FFmpeg writes these back out as the artist delivered them, so a de-squeezed
+# sequence keeps its own format; EXR and DPX become JPEG, which is all COLMAP
+# and a background plate need, and is what the movie path has always written.
+DESQUEEZE_KEEP_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+
+
+def desqueeze_output_ext(source_ext):
+    """The extension the de-squeezed frames are written with."""
+    ext = str(source_ext or "").lower()
+    return ext if ext in DESQUEEZE_KEEP_EXTS else ".jpg"
+
+
+def squeezed_source_size(width, height, pixel_aspect):
+    """
+    The WxH these frames had before desqueeze_filter stretched them.
+
+    Only the short axis grew, so the inverse is exact rather than a guess, and
+    it is what lets the log name both shapes without re-reading the source.
+    """
+    pa = float(pixel_aspect or 1.0)
+    w, h = int(width), int(height)
+    if abs(pa - 1.0) <= 1e-9 or pa <= 0.0:
+        return w, h
+    if pa > 1.0:
+        return int(round(w / pa)), h
+    return w, int(round(h * pa))
+
+
+def frame_size(path):
+    """(width, height) of an image on disk, or None when it cannot be read."""
+    try:
+        from PIL import Image
+        with Image.open(str(path)) as im:
+            return int(im.size[0]), int(im.size[1])
+    except Exception:
+        return None
+
+
+def sequence_import_plan(source, img_dir, ffmpeg_exe=None, frame_step=1, pixel_aspect=1.0):
+    """
+    How the frames of a sequence folder get into images/.
+
+    Square pixels are copied: a copy is faster than a decode and gives the solve
+    the artist's own frames untouched. A squeezed sequence is read by FFmpeg
+    instead, through the same de-squeeze filter a clip gets, so the plate is
+    square by the time COLMAP or any export sees it.
+
+    Returns {"mode": "copy" | "ffmpeg" | "unnumbered", "files": [...],
+             "command": [...] or None, "out_pattern": str or None}. "unnumbered"
+    is a squeezed folder whose files are not a numbered sequence: FFmpeg cannot
+    read it as one, and copying it would hand the solve the squeeze, so the
+    caller has to stop rather than quietly get the lens wrong.
+    """
+    src = Path(source)
+    step = max(1, int(frame_step or 1))
+    files = sorted(f for f in src.iterdir()
+                   if f.is_file() and f.suffix.lower() in IMAGE_EXTS) if src.is_dir() else []
+    if step > 1:
+        files = files[::step]
+
+    plan = {"mode": "copy", "files": files, "command": None, "out_pattern": None}
+    pa = float(pixel_aspect or 1.0)
+    if abs(pa - 1.0) <= 1e-9 or not files:
+        return plan
+
+    from export_tools import source_sequence_plate
+    plate = source_sequence_plate(src)
+    if plate is None:
+        plan["mode"] = "unnumbered"
+        return plan
+
+    out_pattern = str(Path(img_dir) / ("frame_%06d" + desqueeze_output_ext(plate["ext"])))
+    plan.update({
+        "mode": "ffmpeg",
+        "out_pattern": out_pattern,
+        "command": ffmpeg_extract_command(ffmpeg_exe, plate["pattern"], out_pattern,
+                                          frame_step=step, pixel_aspect=pa,
+                                          start_number=plate["first"]),
+    })
+    return plan
 
 
 def list_extracted_frames(img_dir):
@@ -244,49 +408,80 @@ class TrackerWorker(QThread):
 
         # Step 1: Frame Extraction / Sequence Loading
         frame_step = max(1, self.config.get("frame_step", 1))
+        # Pixel aspect (1.6): what the artist typed wins, because a sequence
+        # carries no aspect at all and a container can lie about one.
+        try:
+            ui_aspect = float(self.config.get("pixel_aspect") or 0.0)
+        except (TypeError, ValueError):
+            ui_aspect = 0.0
+        if ui_aspect > 0.0:
+            pixel_aspect, aspect_note = ui_aspect, "set in the UI"
+        elif video.is_file():
+            pixel_aspect, aspect_note = probe_pixel_aspect(video), f"probed from {video.name}"
+        else:
+            pixel_aspect, aspect_note = 1.0, "image sequence - assuming square pixels"
+
         extracted_frames = list_extracted_frames(img_dir)
-        if extracted_frames and not images_stamp_matches(img_dir, video, frame_step):
+        if extracted_frames and not images_stamp_matches(img_dir, video, frame_step, pixel_aspect):
             # Frames from another step, another clip with this name, or a run that
             # predates the stamp: never trust them (A14).
             self.log_signal.emit(
                 f"   images/ holds {len(extracted_frames)} frames that were not extracted from "
-                f"{video.name} at step {frame_step} - re-extracting.", "#e0a000")
+                f"{video.name} at step {frame_step} and pixel aspect {pixel_aspect:.4g} - "
+                f"re-extracting.", "#e0a000")
             clear_extracted_frames(img_dir)
             extracted_frames = []
         if not extracted_frames:
             if video.is_dir():
                 self.progress_signal.emit(10, f"[{idx}/{total_videos}] [1/4] Loading image sequence frames...")
                 self.log_signal.emit(f"▶ [1/4] Importing image sequence from folder...", "#ffffff")
-                seq_files = sorted([f for f in video.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_EXTS])
-                if frame_step > 1:
-                    seq_files = seq_files[::frame_step]
-                for s_idx, sf in enumerate(seq_files, start=1):
-                    if self.is_cancelled:
+                plan = sequence_import_plan(video, img_dir, self.ffmpeg_exe,
+                                            frame_step=frame_step, pixel_aspect=pixel_aspect)
+                if plan["mode"] == "unnumbered":
+                    # Solving the squeeze instead of removing it gives a lens that
+                    # is wrong in one axis and an export that inherits it, so this
+                    # is a stop, not a warning.
+                    self.log_signal.emit(
+                        f"✖ Pixel aspect {pixel_aspect:.4g} ({aspect_note}), but the files in "
+                        f"{video.name} are not a numbered sequence, so FFmpeg cannot read them "
+                        f"as one and the frames cannot be de-squeezed. Renumber them "
+                        f"(shot.1001.exr, shot.1002.exr, ...) or track the movie instead.",
+                        "#ff4b4b")
+                    self.video_status_signal.emit(video.name, "Not A Numbered Sequence ✖")
+                    return False
+                if plan["mode"] == "ffmpeg":
+                    # A squeezed sequence goes through FFmpeg for the same reason a
+                    # clip does: the plate has to be square before COLMAP sees it.
+                    self.log_signal.emit(
+                        f"   De-squeezing the sequence with FFmpeg before the solve...", "#a0a0b0")
+                    if not self._run_command(plan["command"], env, "FFmpeg De-squeeze"):
+                        self.video_status_signal.emit(
+                            video.name, "Cancelled" if self.is_cancelled else "FFmpeg Failed ✖")
                         return False
-                    dest_name = f"frame_{s_idx:06d}{sf.suffix.lower()}"
-                    shutil.copy2(sf, img_dir / dest_name)
+                else:
+                    for s_idx, sf in enumerate(plan["files"], start=1):
+                        if self.is_cancelled:
+                            return False
+                        dest_name = f"frame_{s_idx:06d}{sf.suffix.lower()}"
+                        shutil.copy2(sf, img_dir / dest_name)
                 extracted_frames = list_extracted_frames(img_dir)
+                self._log_desqueeze(extracted_frames, pixel_aspect, aspect_note)
             else:
                 self.progress_signal.emit(10, f"[{idx}/{total_videos}] [1/4] Extracting frames...")
                 self.log_signal.emit(f"▶ [1/4] Extracting frames with FFmpeg...", "#ffffff")
 
-                vf_filter = f"select=not(mod(n\\,{frame_step}))" if frame_step > 1 else None
-
-                ffmpeg_cmd = [
-                    str(self.ffmpeg_exe), "-loglevel", "error", "-stats",
-                    "-i", str(video)
-                ]
-                if vf_filter:
-                    ffmpeg_cmd.extend(["-vf", vf_filter, "-vsync", "vfr"])
-                ffmpeg_cmd.extend(["-qscale:v", "2", str(img_dir / "frame_%06d.jpg")])
+                ffmpeg_cmd = ffmpeg_extract_command(
+                    self.ffmpeg_exe, video, img_dir / "frame_%06d.jpg",
+                    frame_step=frame_step, pixel_aspect=pixel_aspect)
 
                 if not self._run_command(ffmpeg_cmd, env, "FFmpeg Extraction"):
                     self.video_status_signal.emit(video.name, "Cancelled" if self.is_cancelled else "FFmpeg Failed ✖")
                     return False
 
                 extracted_frames = list_extracted_frames(img_dir)
+                self._log_desqueeze(extracted_frames, pixel_aspect, aspect_note)
             if extracted_frames:
-                write_images_stamp(img_dir, video, frame_step, len(extracted_frames))
+                write_images_stamp(img_dir, video, frame_step, len(extracted_frames), pixel_aspect)
         else:
             self.log_signal.emit(f"▶ [1/4] Using {len(extracted_frames)} existing frames from images/ folder (step {frame_step}).", "#00ff88")
 
@@ -698,6 +893,11 @@ class TrackerWorker(QThread):
             # as an image sequence the artist already has the real plate, so the
             # exports point at that instead.
             plate = source_sequence_plate(video) if video.is_dir() else None
+            if plate and pixel_aspect != 1.0:
+                # The artist's own files are still squeezed; only the frames we
+                # de-squeezed match the camera that was solved on them, so the
+                # exports point at images/ instead (1.6).
+                plate = None
             if plate:
                 self.log_signal.emit(
                     f"   Plate for Nuke and Blender: your own sequence "
@@ -713,6 +913,21 @@ class TrackerWorker(QThread):
                 self.log_signal.emit(
                     "   Plate for Nuke and Blender: the extracted frames in images/.", "#a0a0b0")
 
+            # The 3D tab's scene setup, distortion delivery and pixel aspect
+            # (1.4, 1.5, 1.6). Anything the artist has not set keeps the old
+            # behaviour, so a config from before these existed still exports
+            # exactly what it used to.
+            scene_transform = self.config.get("scene_transform")
+            try:
+                overscan = max(0.0, float(self.config.get("overscan") or 0.0))
+            except (TypeError, ValueError):
+                overscan = 0.0
+            write_undistort = bool(self.config.get("write_undistort", False))
+            if write_undistort:
+                self.log_signal.emit(
+                    f"   Distortion delivery: undistorted plate and STMaps at "
+                    f"{overscan * 100:.0f}% overscan.", "#a0a0b0")
+
             exp_res = export_all_formats(
                 track_dir,
                 blender_path=b_path,
@@ -722,6 +937,10 @@ class TrackerWorker(QThread):
                 colmap_exe=self.colmap_exe,
                 frame_step=frame_step,
                 source_sequence=plate,
+                scene_transform=scene_transform,
+                overscan=overscan,
+                write_undistort=write_undistort,
+                pixel_aspect=pixel_aspect,
             )
             if exp_res.get("success"):
                 exported = True
@@ -733,6 +952,12 @@ class TrackerWorker(QThread):
                     self.log_signal.emit(f"   ✔ Generated Alembic (.abc) Camera & Point Cloud: camera_track.abc", "#00ff88")
                 if exp_res.get("blend_path"):
                     self.log_signal.emit(f"   ✔ Generated Blender (.blend) Project: camera_track.blend", "#00ff88")
+                if exp_res.get("undistorted_plate"):
+                    self.log_signal.emit(
+                        f"   ✔ Generated undistorted plate: {Path(exp_res['undistorted_plate']).name}",
+                        "#00d2ff")
+                for stmap in exp_res.get("stmaps") or []:
+                    self.log_signal.emit(f"   ✔ Generated STMap: {Path(stmap).name}", "#00d2ff")
             else:
                 self.log_signal.emit(f"✖ Export failed: {exp_res.get('error', 'unknown error')}", "#ff4b4b")
 
@@ -744,8 +969,11 @@ class TrackerWorker(QThread):
                 for f in track_dir.iterdir():
                     if f.is_file():
                         shutil.copy2(f, latest_dir / f.name)
-                if (track_dir / "sparse").exists():
-                    shutil.copytree(track_dir / "sparse", latest_dir / "sparse", dirs_exist_ok=True)
+                # The undistorted plate belongs to the delivery as much as the
+                # model does, so _latest carries it too (1.5).
+                for sub in ("sparse", "undistorted"):
+                    if (track_dir / sub).exists():
+                        shutil.copytree(track_dir / sub, latest_dir / sub, dirs_exist_ok=True)
             except Exception as sync_err:
                 self.log_signal.emit(f"Notice: could not refresh _latest: {sync_err}", "#e0a000")
         except Exception:
@@ -761,6 +989,29 @@ class TrackerWorker(QThread):
         self.log_signal.emit(f"✔ Successfully tracked and exported '{base_name}'! (Results in 3D_CAMERA_TRACK/{timestamp}/)", "#00ff88")
         self.video_status_signal.emit(video.name, "Completed ✔")
         return True
+
+    def _log_desqueeze(self, frames, pixel_aspect, aspect_note):
+        """
+        Say what the de-squeeze did, in the two shapes the artist can check.
+
+        A square plate says nothing: there is nothing to report and the line
+        would only add noise to every ordinary shot.
+        """
+        pa = float(pixel_aspect or 1.0)
+        if abs(pa - 1.0) <= 1e-9 or not frames:
+            return
+        size = frame_size(frames[0])
+        if size is None:
+            self.log_signal.emit(
+                f"   Pixel aspect {pa:.4g} ({aspect_note}) - the frames in images/ were "
+                f"de-squeezed to square pixels before the solve.", "#a0a0b0")
+            return
+        w, h = size
+        w0, h0 = squeezed_source_size(w, h, pa)
+        self.log_signal.emit(
+            f"   Pixel aspect {pa:.4g} ({aspect_note}) - the frames were de-squeezed from "
+            f"{w0}x{h0} to {w}x{h} before the solve, so COLMAP and every export see square "
+            f"pixels.", "#a0a0b0")
 
     def _missing_timeline_frames(self, model_dir, extracted):
         """

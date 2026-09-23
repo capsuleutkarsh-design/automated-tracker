@@ -17,6 +17,12 @@ class TrackingLayer:
         self.animated_masks = []  # list of AnimatedMask instances
         self.visible = True
         self.locked = False
+        # Hand corrections to the solved result (roadmap 2.1): one per
+        # (tracked point, frame) as {"point", "frame", "x", "y"}, where frame
+        # is the clip's own frame index - the same numbering self.points uses -
+        # and x, y are plate pixels. They are the artist's decisions about a
+        # drifting track, so they live in the project file and come back with it.
+        self.corrections = []
 
     @property
     def inclusion_masks(self):
@@ -44,6 +50,51 @@ class TrackingLayer:
                 })
         return res
 
+    def set_correction(self, point_index, frame, x, y):
+        """
+        Record where the artist put a tracked point on a frame.
+
+        One correction per (point, frame): dragging the same marker twice on
+        the same frame is one decision revised, not two. Returns the stored dict.
+        """
+        point_index, frame = int(point_index), int(frame)
+        entry = {"point": point_index, "frame": frame, "x": float(x), "y": float(y)}
+        for i, c in enumerate(self.corrections):
+            if int(c.get("point", -1)) == point_index and int(c.get("frame", -1)) == frame:
+                self.corrections[i] = entry
+                return entry
+        self.corrections.append(entry)
+        return entry
+
+    def clear_correction(self, point_index, frame):
+        """Forget the correction on one point and frame. True if there was one."""
+        point_index, frame = int(point_index), int(frame)
+        before = len(self.corrections)
+        self.corrections = [c for c in self.corrections
+                            if not (int(c.get("point", -1)) == point_index
+                                    and int(c.get("frame", -1)) == frame)]
+        return len(self.corrections) != before
+
+    def corrected_frames(self, point_index=None):
+        """
+        Sorted frames this layer carries corrections on - all points, or one.
+
+        The canvas draws these differently and the timeline marks them, so the
+        artist can see at a glance which frames they have already fixed.
+        """
+        return sorted({int(c.get("frame", -1)) for c in self.corrections
+                       if point_index is None or int(c.get("point", -1)) == int(point_index)}
+                      - {-1})
+
+    def correction_at(self, frame, point_index=None):
+        """The correction on this frame (optionally for one point), or None."""
+        for c in self.corrections:
+            if int(c.get("frame", -1)) != int(frame):
+                continue
+            if point_index is None or int(c.get("point", -1)) == int(point_index):
+                return c
+        return None
+
     def get_all_keyframe_frames(self):
         s = set()
         for m in self.animated_masks:
@@ -64,6 +115,9 @@ class TrackingLayer:
             # switching a layer to grid and saving would throw them away.
             "points": copy.deepcopy(self.points),
             "animated_masks": [m.to_dict() for m in self.animated_masks],
+            # Hand corrections to the solved track are the artist's work too,
+            # so they survive a clip switch and a restart like the roto does.
+            "corrections": copy.deepcopy(self.corrections),
             # Only a layer the user explicitly put in corner-pin mode gets corner-pin
             # exports. "Has exactly 4 points" is not a corner pin - a 2x2 grid has 4.
             "export_cornerpin": bool(self.export_cornerpin or self.mode == "cornerpin"),
@@ -106,6 +160,21 @@ class TrackingLayer:
 
         layer.animated_masks = [AnimatedMask.from_dict(m)
                                 for m in (d.get("animated_masks") or [])]
+
+        # A correction that lost a field is dropped rather than half-restored:
+        # a marker put back on the wrong frame is worse than one the artist has
+        # to place again.
+        layer.corrections = []
+        for c in (d.get("corrections") or []):
+            try:
+                layer.corrections.append({
+                    "point": int(c["point"]),
+                    "frame": int(c["frame"]),
+                    "x": float(c["x"]),
+                    "y": float(c["y"]),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
         return layer
 
 

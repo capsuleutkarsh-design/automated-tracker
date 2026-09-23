@@ -18,8 +18,10 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QPainter, QPen, QColor
 
 from gui.canvas import VideoPointPickerCanvas
+from gui.theme import OK
 from gui.ui_kit import (
     tame_combos, scrollable_strip,
     card, form_row, button_row, inspector_scroll, make_button,
@@ -31,6 +33,42 @@ def _cluster_label(text):
     lbl = QLabel(text)
     lbl.setObjectName("sectionTitle")
     return lbl
+
+
+class MarkedSlider(QSlider):
+    """
+    The transport slider, with a tick on every frame the artist has corrected.
+
+    A correction is a decision about one frame out of several hundred, and
+    scrubbing to find it again is the kind of hunting the tool exists to
+    remove - so the frames that carry one are drawn straight onto the
+    timeline. Qt's own tick marks are evenly spaced, so these are painted here.
+    """
+
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self.marks = ()
+
+    def set_marks(self, frames):
+        """Which frame indices to mark. Repaints only when the set changed."""
+        marks = tuple(sorted({int(f) for f in (frames or ())}))
+        if marks != self.marks:
+            self.marks = marks
+            self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.marks:
+            return
+        span = max(1, self.maximum() - self.minimum())
+        usable = max(1, self.width() - 12)
+        painter = QPainter(self)
+        painter.setPen(QPen(QColor(OK), 2))
+        for f in self.marks:
+            if not (self.minimum() <= f <= self.maximum()):
+                continue
+            x = 6 + int(round((f - self.minimum()) / span * usable))
+            painter.drawLine(x, 2, x, 8)
 
 
 def build_2d_tab(win, tab):
@@ -216,6 +254,17 @@ def build_2d_tab(win, tab):
         "Sends the clip to the GPU a few frames at a time, sized to the free VRAM.\n"
         "Turn off only if you have VRAM to spare - the whole clip then goes up at once.")
     abody.addWidget(win.chk_vram_chunk)
+
+    # Some shots only have a clean reference at the tail: the feature enters
+    # frame late, or the plate softens towards the head. Tracking from frame 1
+    # is then tracking from the worst frame in the shot.
+    win.chk_track_backwards = QCheckBox("Track backwards (last frame first)")
+    win.chk_track_backwards.setToolTip(
+        "Runs the whole layer over the reversed frame range and flips the result\n"
+        "back, for shots whose good reference is at the end. The exports still\n"
+        "start at the head - only the direction the tracker works in changes.\n"
+        "Manual points are tracked from the frame you placed them on either way.")
+    abody.addWidget(win.chk_track_backwards)
     ins.addWidget(ai_card)
 
     ins.addStretch(1)
@@ -240,6 +289,9 @@ def build_2d_tab(win, tab):
     win.canvas_2d.keyframe_nav_requested.connect(win._nav_keyframe_by_offset)
     win.canvas_2d.in_point_requested.connect(win._set_in_point)
     win.canvas_2d.out_point_requested.connect(win._set_out_point)
+    win.canvas_2d.tracked_point_moved.connect(win._on_tracked_point_moved)
+    win.canvas_2d.retrack_requested.connect(win._on_retrack_requested)
+    win.canvas_2d.correction_cleared.connect(win._on_correction_cleared)
     rl.addWidget(win.canvas_2d, 1)
 
     # ---- Transport ------------------------------------------------------
@@ -254,10 +306,12 @@ def build_2d_tab(win, tab):
     win.btn_step_fwd = make_button("▶", "Step forward one frame  (→ / L)", "transport")
     win.btn_step_fwd.clicked.connect(win._step_fwd_frame)
 
-    win.slider_2d_frame = QSlider(Qt.Horizontal)
+    win.slider_2d_frame = MarkedSlider(Qt.Horizontal)
     win.slider_2d_frame.setRange(0, 0)
     win.slider_2d_frame.setFixedHeight(30)
-    win.slider_2d_frame.setToolTip("Scrub the timeline")
+    win.slider_2d_frame.setToolTip(
+        "Scrub the timeline.\n"
+        "Green ticks are frames where you have corrected a tracked point.")
     win.slider_2d_frame.valueChanged.connect(win._on_2d_frame_slider_changed)
 
     win.lbl_frame_idx = QLabel("00:00:00:00  (1/1)")
@@ -348,6 +402,44 @@ def build_2d_tab(win, tab):
     for wdg in (win.btn_toggle_matte, win.btn_toggle_alpha, win.btn_toggle_loupe):
         kbar.addWidget(wdg)
 
+    divider(kbar, vertical=True)
+
+    # cluster 4 - fixing a drifting track (roadmap 2.1)
+    kbar.addWidget(_cluster_label("Fix"))
+    win.btn_show_result = make_button(
+        "Result",
+        "Draw the last 2D result on the plate.\n"
+        "Drag a marker to correct it on that frame, then re-track from there.",
+        "toggle", checkable=True)
+    win.btn_show_result.toggled.connect(win._toggle_tracked_result)
+
+    win.btn_prev_fix = make_button("◀ Fix", "Jump to the previous corrected frame", "compact")
+    win.btn_prev_fix.clicked.connect(lambda: win._jump_correction(-1))
+    win.btn_next_fix = make_button("Fix ▶", "Jump to the next corrected frame", "compact")
+    win.btn_next_fix.clicked.connect(lambda: win._jump_correction(1))
+
+    win.btn_retrack_fwd = make_button(
+        "Re-track ▶",
+        "Re-track the corrected point from this frame to the out point,\n"
+        "and splice the new positions into the saved result.", "compact")
+    win.btn_retrack_fwd.clicked.connect(lambda: win._retrack_correction(False))
+
+    win.btn_retrack_both = make_button(
+        "Re-track ◀▶",
+        "Re-track the corrected point forward to the out point and\n"
+        "backwards to the in point.", "compact")
+    win.btn_retrack_both.clicked.connect(lambda: win._retrack_correction(True))
+
+    win.lbl_corrections = QLabel("No result")
+    win.lbl_corrections.setObjectName("valueChip")
+    win.lbl_corrections.setAlignment(Qt.AlignCenter)
+    win.lbl_corrections.setMinimumWidth(96)
+    win.lbl_corrections.setToolTip("Corrections stored on the active layer's result")
+
+    for wdg in (win.btn_show_result, win.btn_prev_fix, win.btn_next_fix,
+                win.btn_retrack_fwd, win.btn_retrack_both, win.lbl_corrections):
+        kbar.addWidget(wdg)
+
     kbar.addStretch(1)
     # Three clusters of controls do not fit a narrow window; scroll rather than clip.
     rl.addWidget(scrollable_strip(k_frame))
@@ -406,9 +498,18 @@ def build_2d_tab(win, tab):
         "Open Output", "Show the 2D track folder", "export")
     win.btn_open_2d_dir.clicked.connect(win._open_2d_output_folder)
 
+    # After a correction the delivered files no longer match the result the
+    # artist is looking at, and nothing about rewriting them needs the GPU.
+    win.btn_reexport_2d = make_button(
+        "Re-export 2D",
+        "Write every 2D format again from the corrected result, without re-tracking",
+        "export")
+    win.btn_reexport_2d.clicked.connect(win._reexport_2d_result)
+
     button_row(actbody, [win.btn_export_2d_nuke,
                          win.btn_load_overlay_player,
-                         win.btn_open_2d_dir], compact=False)
+                         win.btn_open_2d_dir,
+                         win.btn_reexport_2d], compact=False)
     rl.addWidget(act_card)
 
     splitter.addWidget(right)

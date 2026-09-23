@@ -85,6 +85,66 @@ def probe_fps(video_path, default=DEFAULT_FPS):
     return float(default)
 
 
+DEFAULT_PIXEL_ASPECT = 1.0
+
+
+def parse_sample_aspect(text, default=DEFAULT_PIXEL_ASPECT):
+    """
+    ffprobe's sample_aspect_ratio ('1:1', '40:33', '0:1', 'N/A') as a float.
+
+    ffprobe writes the ratio with a colon, states 'N/A' for a stream it could
+    not read and '0:1' for a container that simply does not say - both mean
+    "square pixels as far as anyone knows", which is `default` rather than a
+    guess. A ratio that is zero or negative is nonsense from a damaged file and
+    is treated the same way.
+    """
+    if text is None:
+        return float(default)
+    cleaned = str(text).strip().replace(":", "/")
+    if not cleaned or cleaned.upper() == "N/A":
+        return float(default)
+    val = _parse_rational(cleaned)
+    if val is None or val <= 0.0:
+        return float(default)
+    return float(val)
+
+
+def probe_pixel_aspect(video_path, default=DEFAULT_PIXEL_ASPECT):
+    """
+    Pixel aspect (sample aspect ratio) of a clip, 1.0 when it cannot be read.
+
+    An anamorphic or otherwise squeezed plate has non-square pixels. Nothing
+    downstream is told about them: the frames are de-squeezed once, before the
+    solve, and the camera and the exported plate are square from then on. A
+    sequence folder carries no such metadata at all, so the artist types it.
+    """
+    video_path = Path(video_path)
+    if video_path.is_dir() or not video_path.exists():
+        return float(default)
+
+    exe = _ffprobe_exe()
+    if exe is None:
+        return float(default)
+    try:
+        res = subprocess.run(
+            [
+                str(exe), "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=sample_aspect_ratio",
+                "-of", "json", str(video_path),
+            ],
+            text=True, timeout=10, **hidden_kwargs(capture=True),
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            streams = json.loads(res.stdout).get("streams") or []
+            if streams:
+                return parse_sample_aspect(streams[0].get("sample_aspect_ratio"), default)
+    except Exception:
+        pass
+
+    return float(default)
+
+
 def probe_frame_count(video_path, fps=None, default=0):
     """Best-effort frame count; 0 when it cannot be determined."""
     video_path = Path(video_path)

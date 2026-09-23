@@ -38,6 +38,14 @@ def _ensure_script_dir_on_path():
         sys.path.insert(0, here)
 
 
+# The pure maths of the scene transform (1.4) and the lens (1.5) lives in core/;
+# the path has to be set up before they can be imported when this file runs as a
+# script, which is what every other core import below does one call at a time.
+_ensure_script_dir_on_path()
+from core import lens as lens_math          # noqa: E402
+from core import scene_transform as transforms   # noqa: E402
+
+
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.exr', '.tif', '.tiff')
 
 
@@ -61,24 +69,36 @@ WORLD_BASES = {
 }
 
 
-def colmap_pose_to(img, target):
+def colmap_pose_to(img, target, transform=None):
     """
     Camera-to-world pose of a parsed COLMAP image in a target convention.
 
     Returns (C, R): the camera centre and a 3x3 camera-to-world rotation, both
     in the target's world basis, with the camera looking down its local -Z.
     Column-vector convention: X_world = R @ X_cam + C.
+
+    `transform` is the artist's scene transform (scale, ground, origin) in the
+    storage form core.scene_transform builds. It is applied in COLMAP's own
+    world, BEFORE the per-DCC basis, which is the whole reason every writer only
+    has to pass it through: the camera, the points and the ground plane all move
+    together and the plate still lines up. A missing or identity transform is
+    skipped outright so the export is unchanged down to the last digit.
     """
     W = WORLD_BASES[target]
+    center, R_world = img["center"], img["R_world"]
+    if transform is not None and not transforms.is_identity(transform):
+        center, R_world = transforms.apply_to_colmap_image(transform, img)
     # + 0.0 normalises -0.0 so a static axis never exports as "-0.000000"
-    C = W @ np.asarray(img["center"], dtype=float) + 0.0
-    R = W @ np.asarray(img["R_world"], dtype=float) @ CAMERA_FLIP + 0.0
+    C = W @ np.asarray(center, dtype=float) + 0.0
+    R = W @ np.asarray(R_world, dtype=float) @ CAMERA_FLIP + 0.0
     return C, R
 
 
-def colmap_points_to(xyz, target):
-    """(N, 3) COLMAP world points -> the target's world basis."""
+def colmap_points_to(xyz, target, transform=None):
+    """(N, 3) COLMAP world points -> the target's world basis, scene transform first."""
     xyz = np.asarray(xyz, dtype=float).reshape(-1, 3)
+    if transform is not None and not transforms.is_identity(transform):
+        xyz = transforms.apply_to_points(transform, xyz)
     return xyz @ WORLD_BASES[target].T
 
 
@@ -427,11 +447,36 @@ def detect_ground_plane_ransac(points, max_iters=300, dist_thresh=0.08, seed=0):
         return None
 
     normal, d = best_plane
-    # COLMAP's camera y points down, so the sky is on the -Y side of the floor.
-    if normal[1] > 0:
+    # A fitted normal has an arbitrary sign. COLMAP's camera y points down, so
+    # the sky is on the -Y side of the floor - scene_transform.COLMAP_UP - and
+    # the per-DCC bases in WORLD_BASES are written to map that onto the DCC's up.
+    if float(np.dot(normal, transforms.COLMAP_UP)) < 0.0:
         normal, d = -normal, -d
     centroid = xyz[best_mask].mean(axis=0)
     return GroundPlane(normal, d, inlier_ratio, centroid)
+
+
+def fit_ground_plane(points, scene_transform=None):
+    """
+    The ground plane every writer shares, fitted AFTER the scene transform.
+
+    The Nuke Card and the Blender plane have to sit on the same floor as the
+    camera and the point cloud, and those have moved: fitting on the original
+    solve would leave the floor behind wherever the artist's scale and rotation
+    used to put it. So the cloud is transformed first and the plane is fitted on
+    the result, in the same transformed COLMAP world the writers then map into
+    their own basis.
+
+    Returns a GroundPlane or None (too few points, or no convincing plane).
+    """
+    if points is None:
+        return None
+    xyz = points.xyz if isinstance(points, PointCloud) else np.asarray(points, dtype=float).reshape(-1, 3)
+    if len(xyz) < 20:
+        return None
+    if scene_transform is not None and not transforms.is_identity(scene_transform):
+        xyz = transforms.apply_to_points(scene_transform, xyz)
+    return detect_ground_plane_ransac(xyz)
 
 
 def find_images_dir(scene_path):
@@ -531,10 +576,200 @@ def _sequence_range(images, img_dir, frame_step=1, source_sequence=None):
 
 
 # =============================================================================
+# DISTORTION DELIVERY (1.5)
+# =============================================================================
+def distortion_summary(cam):
+    """
+    What the solve knows about the lens, in the shape camera_track.json wants.
+
+    `params` is COLMAP's own PARAMS[] line, because a downstream tool that knows
+    the model name can read every coefficient out of it - including the ones
+    k1/k2 have no room for (tangential, rational, omega).
+    """
+    model = str(cam.get("model", "PINHOLE")).upper()
+    try:
+        distorted = bool(lens_math.has_distortion(cam))
+    except ValueError:
+        # A model core/lens does not implement: say so rather than claim there
+        # is no distortion, which would quietly deliver a wrong plate.
+        distorted = None
+    return {
+        "model": model,
+        "params": [float(p) for p in (cam.get("params") or [])],
+        "k1": float(cam.get("k1", 0.0)),
+        "k2": float(cam.get("k2", 0.0)),
+        "has_distortion": distorted,
+    }
+
+
+def _resolve_colmap_exe(colmap_exe=None):
+    """The colmap binary to call, from the caller's path or the app's own."""
+    exe = Path(colmap_exe) if colmap_exe else None
+    if exe is not None and exe.exists():
+        return exe
+    try:
+        _ensure_script_dir_on_path()
+        from core.app_paths import colmap_exe as _resolve
+        exe = _resolve()
+    except Exception:
+        return None
+    return exe if exe is not None and Path(exe).exists() else None
+
+
+def run_image_undistorter(output_dir, model_dir, images_dir, colmap_exe=None, log_callback=None):
+    """
+    `colmap image_undistorter` on the solved model: an undistorted plate to comp on.
+
+    Returns the plate info (as source_sequence_plate describes a sequence) or
+    None. A failure here is never fatal: the camera, the point cloud and the
+    STMaps are all still worth delivering, so it is logged in plain words and
+    the export carries on.
+    """
+    output_dir = Path(output_dir)
+    images_dir = Path(images_dir)
+    exe = _resolve_colmap_exe(colmap_exe)
+    if exe is None:
+        if log_callback:
+            log_callback("Notice: colmap.exe was not found, so no undistorted plate was written. "
+                         "The STMaps below still undistort the original plate.", "#e0a000")
+        return None
+    if not images_dir.is_dir():
+        if log_callback:
+            log_callback(f"Notice: the extracted frames folder {images_dir} is gone, so no "
+                         "undistorted plate could be written.", "#e0a000")
+        return None
+
+    if log_callback:
+        log_callback("   Undistorting the plate with COLMAP (image_undistorter)...", "#a0a0b0")
+    try:
+        _ensure_script_dir_on_path()
+        from core.proc import run_hidden
+        res = run_hidden(
+            [str(exe), "image_undistorter",
+             "--image_path", str(images_dir),
+             "--input_path", str(model_dir),
+             "--output_path", str(output_dir),
+             "--output_type", "COLMAP"],
+            capture=True, text=True, encoding="utf-8", errors="replace", timeout=3600)
+        if res.returncode != 0 and log_callback:
+            tail = [l for l in (res.stdout or "").splitlines() if l.strip()][-4:]
+            log_callback("Notice: image_undistorter exited with %d: %s"
+                         % (res.returncode, " | ".join(tail)), "#e0a000")
+    except Exception as e:
+        if log_callback:
+            log_callback(f"Notice: image_undistorter could not be run ({e}); the rest of the "
+                         "export is unaffected.", "#e0a000")
+        return None
+
+    plate = source_sequence_plate(output_dir / "images")
+    if plate is None and log_callback:
+        log_callback("Notice: image_undistorter wrote no readable image sequence; keeping the "
+                     "original plate in the exports.", "#e0a000")
+    return plate
+
+
+def write_stmaps(output_dir, cam, overscan=0.0, log_callback=None):
+    """
+    undistort.exr and redistort.exr for a camera, at the requested overscan.
+
+    Returns (undistort_path, redistort_path, fmt) with None in place of a map
+    that could not be written. `fmt` is "exr" for a real 32-bit float EXR and
+    "png16" for the lossy fallback, which is worth a warning: a PNG clips every
+    value outside 0..1, and those are exactly the pixels overscan exists for.
+    """
+    output_dir = Path(output_dir)
+    overscan = float(overscan or 0.0)
+    try:
+        undist = lens_math.undistort_stmap(cam, overscan=overscan)
+        redist = lens_math.redistort_stmap(cam, overscan=overscan)
+    except Exception as e:
+        if log_callback:
+            log_callback(f"Notice: the STMaps for this lens could not be computed ({e}).", "#e0a000")
+        return None, None, None
+
+    undist_path, fmt = lens_math.write_exr(output_dir / "undistort.exr", undist)
+    redist_path, fmt_r = lens_math.write_exr(output_dir / "redistort.exr", redist)
+    fmt = fmt if fmt == fmt_r else "png16"
+    if log_callback:
+        if fmt == "exr":
+            log_callback("   Wrote undistort.exr and redistort.exr (32-bit float, %d%% overscan)."
+                         % int(round(overscan * 100)), "#a0a0b0")
+        else:
+            log_callback("Notice: no OpenEXR writer was importable, so the STMaps were written as "
+                         "16-bit PNG. That format clips everything outside 0..1, which is exactly "
+                         "the overscanned border - re-export once OpenEXR is installed.", "#e0a000")
+    return undist_path, redist_path, fmt
+
+
+def prepare_undistort(scene_path, cam, model_dir, images_dir, overscan=0.0,
+                      colmap_exe=None, log_callback=None):
+    """
+    Everything 1.5 delivers for one solve, or None when there is nothing to do.
+
+    The dict it returns is what the Nuke and Blender writers take: the pinhole
+    camera that matches the undistorted plate, the two maps, and the plate
+    itself when COLMAP managed to write one. A lens with no distortion needs
+    none of it - an undistorted plate would be a copy of the original and the
+    maps would be the identity - so that returns None and the export is exactly
+    what it was before the checkbox existed.
+    """
+    scene_path = Path(scene_path)
+    overscan = max(0.0, float(overscan or 0.0))
+    try:
+        distorted = lens_math.has_distortion(cam)
+    except ValueError as e:
+        if log_callback:
+            log_callback(f"Notice: {e}. No undistorted plate or STMaps were written.", "#e0a000")
+        return None
+    if not distorted:
+        if log_callback:
+            log_callback("   The solved lens has no distortion, so there is nothing to undistort.",
+                         "#a0a0b0")
+        return None
+
+    plate = run_image_undistorter(scene_path / "undistorted", model_dir, images_dir,
+                                  colmap_exe=colmap_exe, log_callback=log_callback)
+    undist_map, redist_map, fmt = write_stmaps(scene_path, cam, overscan, log_callback)
+    if plate is None and undist_map is None:
+        return None
+
+    pinhole = lens_math.pinhole_of(cam, overscan)
+    if plate is not None and log_callback:
+        sample = Path(plate["pattern"])
+        log_callback(f"   Undistorted plate: {sample.parent.name}/{sample.name}, frames "
+                     f"{plate['first']}-{plate['last']}.", "#a0a0b0")
+        # COLMAP sizes its own output from the undistorted region of interest, so
+        # it does not have to agree with the convention pinhole_of and the STMaps
+        # use. The exported camera is the one that matches the maps; if the two
+        # rasters differ the artist should hear it here rather than wonder in
+        # Nuke why the corners do not line up.
+        its_own = parse_colmap_cameras(scene_path / "undistorted" / "sparse" / "cameras.txt")
+        for written in its_own.values():
+            if (int(written["width"]), int(written["height"])) != (pinhole["width"], pinhole["height"]):
+                log_callback(
+                    "Notice: COLMAP wrote the undistorted plate at %dx%d, while the exported "
+                    "camera and the STMaps describe %dx%d at %d%% overscan. Use the STMap chain "
+                    "in the Nuke script if the plate does not line up."
+                    % (int(written["width"]), int(written["height"]),
+                       pinhole["width"], pinhole["height"], int(round(overscan * 100))),
+                    "#e0a000")
+            break
+    return {
+        "overscan": overscan,
+        "pinhole": pinhole,
+        "undistort_map": undist_map,
+        "redistort_map": redist_map,
+        "map_format": fmt,
+        "plate": plate,
+    }
+
+
+# =============================================================================
 # EXPORTERS
 # =============================================================================
 def export_blender_script(scene_dir, cameras, images, points, output_script_path=None, fps=None,
-                          ground=None, frame_step=1, source_sequence=None):
+                          ground=None, frame_step=1, source_sequence=None,
+                          scene_transform=None, plate_desqueezed=False, undistort=None):
     """
     Generates a 1-Click Python script for Blender that sets up camera,
     animation, background image sequence, Geometry Nodes point cloud (EEVEE & Cycles renderable),
@@ -547,6 +782,18 @@ def export_blender_script(scene_dir, cameras, images, points, output_script_path
     is used as the background when there is one; otherwise the extracted frames
     are. The scene frame range is the plate's real timeline range, so at
     `frame_step` > 1 the camera is keyed every Nth frame inside it.
+
+    `scene_transform` is the artist's scale / ground / origin (1.4), applied to
+    the camera, the cloud and the plane alike. `undistort` is what
+    prepare_undistort returned (1.5): when it carries an undistorted plate the
+    background points at that and the lens is the pinhole that matches it, since
+    a camera solved with distortion does not sit on an undistorted plate.
+
+    `plate_desqueezed` says the frames this script loads were stretched back to
+    square before the solve (1.6). Everything here is square either way - the
+    flag only decides whether the render is told so explicitly, because a scene
+    that already carries a non-square aspect would otherwise squeeze our square
+    frames a second time.
     """
     scene_path = Path(scene_dir).resolve()
     if output_script_path is None:
@@ -556,9 +803,14 @@ def export_blender_script(scene_dir, cameras, images, points, output_script_path
     if not sorted_images or not cameras:
         return False
 
+    undistorted_plate = (undistort or {}).get("plate")
     first_cam = next(iter(cameras.values()))
-    width = first_cam["width"]
-    height = first_cam["height"]
+    # The lens has to describe the plate the artist is looking at: the pinhole
+    # one when an undistorted plate was written, the solved one otherwise.
+    plate_cam = (undistort or {}).get("pinhole") if undistorted_plate else None
+    plate_cam = plate_cam or first_cam
+    width = plate_cam["width"]
+    height = plate_cam["height"]
     # Frame rate comes from the caller (probed off the source clip). The old code read a
     # "fps" key that parse_colmap_cameras never sets, so every export was silently 30.
     fps_val = float(fps) if fps else float(first_cam.get("fps", 0) or 0) or 24.0
@@ -566,11 +818,11 @@ def export_blender_script(scene_dir, cameras, images, points, output_script_path
     # 29.97 (30000/1001) are represented exactly rather than rounded to 30.
     fps = int(round(fps_val))
     fps_base = round(fps / fps_val, 6) if fps_val > 0 else 1.0
-    cx = first_cam.get("cx", width / 2.0)
-    cy = first_cam.get("cy", height / 2.0)
+    cx = plate_cam.get("cx", width / 2.0)
+    cy = plate_cam.get("cy", height / 2.0)
 
     # Sensor and lens calculation
-    lens = camera_intrinsics_mm(first_cam)
+    lens = camera_intrinsics_mm(plate_cam)
     sensor_width_mm = lens["sensor_width_mm"]
     lens_mm = lens["lens_mm"]
     sensor_height_mm = lens["sensor_height_mm"]
@@ -591,7 +843,23 @@ def export_blender_script(scene_dir, cameras, images, points, output_script_path
     # internal cache; at step > 1 they are every Nth frame and Blender's image
     # user has no step of its own, so the header says so in plain words rather
     # than showing a background that drifts away from the camera.
-    if source_sequence:
+    stepped_note = ""
+    if step > 1:
+        stepped_note = (f"\nNOTE: Frame Step {step} was used, so those frames are every {step}th "
+                        f"frame of the shot\nand do NOT line up with the timeline one to one. "
+                        f"The camera is keyed every {step} frames\nfrom {start_frame}; for a "
+                        f"frame-accurate background, load the original plate yourself.")
+    if undistorted_plate:
+        # The camera below is the pinhole that matches this plate, so it is the
+        # only background the track sits on; the original plate and the STMaps
+        # that get between the two are in the Nuke script.
+        images_dir_str = str(Path(undistorted_plate["pattern"]).parent).replace('\\', '/')
+        img_ext = undistorted_plate["ext"]
+        frame_offset = int(undistorted_plate["first"]) - 1
+        plate_note = (f"Background: the UNDISTORTED plate in undistorted/images/ "
+                      f"({int(round(float((undistort or {}).get('overscan', 0.0)) * 100))}% overscan). "
+                      f"The camera is the pinhole that matches it." + stepped_note)
+    elif source_sequence:
         images_dir_str = str(Path(source_sequence["pattern"]).parent).replace('\\', '/')
         img_ext = source_sequence["ext"]
         frame_offset = int(source_sequence["first"]) - 1
@@ -600,18 +868,13 @@ def export_blender_script(scene_dir, cameras, images, points, output_script_path
     else:
         images_dir_str = str(img_dir).replace('\\', '/')
         frame_offset = 0
-        plate_note = "Background: the extracted frames in images/."
-        if step > 1:
-            plate_note += (f"\nNOTE: Frame Step {step} was used, so those frames are every {step}th "
-                           f"frame of the shot\nand do NOT line up with the timeline one to one. "
-                           f"The camera is keyed every {step} frames\nfrom {start_frame}; for a "
-                           f"frame-accurate background, load the original plate yourself.")
+        plate_note = "Background: the extracted frames in images/." + stepped_note
 
     frames_data = []
     for img in sorted_images:
         f_num = img["frame"]
         # COLMAP World -> Blender World: X_b = X_c, Y_b = Z_c, Z_b = -Y_c
-        loc_blender, R_blender = colmap_pose_to(img, "blender")
+        loc_blender, R_blender = colmap_pose_to(img, "blender", scene_transform)
         rx, ry, rz = rotmat2euler(R_blender)
 
         frames_data.append({
@@ -621,8 +884,8 @@ def export_blender_script(scene_dir, cameras, images, points, output_script_path
         })
 
     # RANSAC Ground Plane (fitted once by the caller so Blender and Nuke agree)
-    if ground is None and points is not None and len(points) >= 20:
-        ground = detect_ground_plane_ransac(points)
+    if ground is None:
+        ground = fit_ground_plane(points, scene_transform)
     ground_data = None
     if ground is not None:
         loc_b, norm_b = ground.in_convention("blender")
@@ -634,6 +897,15 @@ def export_blender_script(scene_dir, cameras, images, points, output_script_path
             "rotation": [round(v, 6) for v in (rx, ry, rz)],
             "inlier_ratio": round(ground.inlier_ratio, 3)
         }
+
+    # The plate was de-squeezed once, before the solve, so the background and the
+    # camera both live in square pixels and the render has to as well. A shot
+    # that never needed de-squeezing says nothing, because Blender is square by
+    # default and an untouched script is what every older export looked like.
+    aspect_lines = ""
+    if plate_desqueezed:
+        aspect_lines = ("    scene.render.pixel_aspect_x = 1.0\n"
+                        "    scene.render.pixel_aspect_y = 1.0\n")
 
     output_script_name = Path(output_script_path).name
     output_script_dir_str = str(Path(output_script_path).parent).replace('\\', '/')
@@ -770,7 +1042,7 @@ def setup_tracked_scene():
     scene = bpy.context.scene
     scene.render.resolution_x = {width}
     scene.render.resolution_y = {height}
-    scene.render.fps = {fps}
+{aspect_lines}    scene.render.fps = {fps}
     scene.render.fps_base = {fps_base}
     scene.frame_start = {start_frame}
     scene.frame_end = {end_frame}
@@ -964,7 +1236,8 @@ if __name__ == "__main__":
     return True
 
 
-def export_usd_scene(scene_dir, cameras, images, points, output_usd_path=None, fps=None):
+def export_usd_scene(scene_dir, cameras, images, points, output_usd_path=None, fps=None,
+                     scene_transform=None, undistort=None):
     if not HAS_USD:
         return False
 
@@ -977,7 +1250,10 @@ def export_usd_scene(scene_dir, cameras, images, points, output_usd_path=None, f
         return False
 
     first_cam = next(iter(cameras.values()))
-    lens = camera_intrinsics_mm(first_cam)
+    # The same lens the other writers use, so a USD stage and a Nuke script of
+    # the same solve are never two different cameras.
+    plate_cam = (undistort or {}).get("pinhole") if (undistort or {}).get("plate") else None
+    lens = camera_intrinsics_mm(plate_cam or first_cam)
 
     # Real timeline frames, so the stage spans the shot's own range; at a frame
     # step the samples inside it simply sit every Nth frame and USD interpolates.
@@ -1006,7 +1282,7 @@ def export_usd_scene(scene_dir, cameras, images, points, output_usd_path=None, f
 
     for img in sorted_images:
         f = img["frame"]
-        loc_usd, R_usd = colmap_pose_to(img, "usd")
+        loc_usd, R_usd = colmap_pose_to(img, "usd", scene_transform)
         # Gf.Matrix4d is row-vector: rotation block transposed, translation in the last row.
         mat = Gf.Matrix4d(*usd_matrix_rows(loc_usd, R_usd))
         xform_op.Set(mat, Usd.TimeCode(f))
@@ -1016,7 +1292,7 @@ def export_usd_scene(scene_dir, cameras, images, points, output_usd_path=None, f
         pts_path = Sdf.Path("/World/Sparse_PointCloud")
         usd_pts = UsdGeom.Points.Define(stage, pts_path)
 
-        xyz_usd = colmap_points_to(points.xyz, "usd")
+        xyz_usd = colmap_points_to(points.xyz, "usd", scene_transform)
         rgb = points.rgb.astype(float) / 255.0
         pts_vec = [Gf.Vec3f(float(p[0]), float(p[1]), float(p[2])) for p in xyz_usd]
         colors_vec = [Gf.Vec3f(float(c[0]), float(c[1]), float(c[2])) for c in rgb]
@@ -1030,7 +1306,8 @@ def export_usd_scene(scene_dir, cameras, images, points, output_usd_path=None, f
     return True
 
 
-def export_nuke_chan(scene_dir, cameras, images, output_chan_path=None, frame_step=1):
+def export_nuke_chan(scene_dir, cameras, images, output_chan_path=None, frame_step=1,
+                     scene_transform=None, undistort=None):
     """
     Exports a clean, standard 8-column ASCII .chan camera tracking file for Nuke:
     Columns: frame  tx  ty  tz  rx  ry  rz  vfov
@@ -1050,7 +1327,10 @@ def export_nuke_chan(scene_dir, cameras, images, output_chan_path=None, frame_st
         return False
 
     first_cam = next(iter(cameras.values()))
-    vfov_deg = camera_intrinsics_mm(first_cam)["vfov_deg"]
+    # An undistorted plate is wider than the one that was solved, so column 8
+    # has to be the pinhole's field of view or the .chan and the .nk disagree.
+    plate_cam = (undistort or {}).get("pinhole") if (undistort or {}).get("plate") else None
+    vfov_deg = camera_intrinsics_mm(plate_cam or first_cam)["vfov_deg"]
 
     lines = [
         "# Nuke .chan camera: frame tx ty tz rx ry rz vfov\n",
@@ -1065,7 +1345,7 @@ def export_nuke_chan(scene_dir, cameras, images, output_chan_path=None, frame_st
             % (step, step, sorted_images[0]["frame"], sorted_images[-1]["frame"]))
     for img in sorted_images:
         f = img["frame"]
-        loc, R_nuke = colmap_pose_to(img, "nuke")
+        loc, R_nuke = colmap_pose_to(img, "nuke", scene_transform)
         rx, ry, rz = rotmat2euler(R_nuke)
 
         rx_deg = math.degrees(rx)
@@ -1081,7 +1361,8 @@ def export_nuke_chan(scene_dir, cameras, images, output_chan_path=None, frame_st
 
 
 def export_nuke_camera_script(scene_dir, cameras, images, points, output_nk_path=None, fps=None,
-                              ground=None, frame_step=1, source_sequence=None):
+                              ground=None, frame_step=1, source_sequence=None,
+                              scene_transform=None, undistort=None):
     """
     Generates a full 1-Click VFX Node Graph (.nk) for Foundry Nuke:
     - Read node (Footage Sequence, offset onto the timeline)
@@ -1091,14 +1372,19 @@ def export_nuke_camera_script(scene_dir, cameras, images, points, output_nk_path
     - Card2 node (RANSAC Ground Plane)
     - Scene node (3D stage)
     - ScanlineRender node (Pre-connected 3D projection comp)
-    - Lens distortion annotations for exact matching
+    - the undistort / redistort STMap chain when maps were written (1.5)
 
     World is Nuke's Y-up with the camera looking down -Z (see WORLD_BASES).
 
-    The Read points at `source_sequence` (the artist's own plate) when there is
-    one, and at the extracted frames otherwise. Stepped extracted frames do not
-    sit on timeline frames at all, so they get a TimeWarp that maps the timeline
-    back onto them instead.
+    The Read points at the undistorted plate when there is one - the camera is
+    then the pinhole that matches it and could not sit on the original - at
+    `source_sequence` (the artist's own plate) next, and at the extracted frames
+    otherwise. Stepped extracted frames do not sit on timeline frames at all, so
+    they get a TimeWarp that maps the timeline back onto them instead.
+
+    `scene_transform` is the artist's scale / ground / origin (1.4). Every plate
+    this script can point at has square pixels - a squeezed one is de-squeezed
+    before the solve (1.6) - so no Read here carries a pixel aspect.
     """
     scene_path = Path(scene_dir).resolve()
     if output_nk_path is None:
@@ -1108,17 +1394,31 @@ def export_nuke_camera_script(scene_dir, cameras, images, points, output_nk_path
     if not sorted_images or not cameras:
         return False
 
+    undistorted_plate = (undistort or {}).get("plate")
     first_cam = next(iter(cameras.values()))
-    width = first_cam["width"]
-    height = first_cam["height"]
+    # The camera has to describe the plate it sits on, and an undistorted plate
+    # is a pinhole one frame larger than the lens that was solved.
+    plate_cam = (undistort or {}).get("pinhole") if undistorted_plate else None
+    plate_cam = plate_cam or first_cam
+    width = plate_cam["width"]
+    height = plate_cam["height"]
 
-    lens = camera_intrinsics_mm(first_cam)
+    lens = camera_intrinsics_mm(plate_cam)
     sensor_width_mm = lens["sensor_width_mm"]
     lens_mm = lens["lens_mm"]
     sensor_height_mm = lens["sensor_height_mm"]
 
+    # A camera solved on square pixels is only valid against square pixels, and
+    # the plates this script points at are square: a squeezed shot is stretched
+    # back once, at extraction, and the frames in images/ are what the solve and
+    # the Read both use. So the format is 1.0, no Read gets a pixel_aspect knob,
+    # and the horizontal aperture is the one the lens was solved with. The
+    # artist's original squeezed sequence is not offered here at all, because
+    # only the de-squeezed frames agree with this camera.
+    haperture_mm = sensor_width_mm
+
     # Window Translate (Principal Point Offset) in Nuke NDC units, see nuke_win_translate
-    win_u, win_v = nuke_win_translate(first_cam)
+    win_u, win_v = nuke_win_translate(plate_cam)
 
     # Camera keys cover the registered frames, every `step` of them; the plate
     # covers the whole sequence.
@@ -1126,7 +1426,10 @@ def export_nuke_camera_script(scene_dir, cameras, images, points, output_nk_path
     start_frame = sorted_images[0]["frame"]
     end_frame = sorted_images[-1]["frame"]
     img_dir = find_images_dir(scene_path)
-    timeline_start, timeline_end, n_frames, img_ext = _sequence_range(images, img_dir, step, source_sequence)
+    # An undistorted plate is made from the extracted frames, so it is numbered
+    # and stepped like them whatever the artist's own sequence does.
+    range_sequence = None if undistorted_plate else source_sequence
+    timeline_start, timeline_end, n_frames, img_ext = _sequence_range(images, img_dir, step, range_sequence)
 
     # Distortion parameters, read per model by parse_colmap_cameras
     k1 = float(first_cam.get("k1", 0.0))
@@ -1137,7 +1440,7 @@ def export_nuke_camera_script(scene_dir, cameras, images, points, output_nk_path
 
     for img in sorted_images:
         f = img["frame"]
-        loc, R_nuke = colmap_pose_to(img, "nuke")
+        loc, R_nuke = colmap_pose_to(img, "nuke", scene_transform)
         rx, ry, rz = rotmat2euler(R_nuke)
 
         rx_deg = math.degrees(rx)
@@ -1173,20 +1476,25 @@ def export_nuke_camera_script(scene_dir, cameras, images, points, output_nk_path
     #    holds the ends.
     timewarp_node_str = ""
     plate_input = "Plate_Footage"
-    if source_sequence:
+    img_dir_str = str(img_dir).replace('\\', '/')
+    if undistorted_plate:
+        img_seq_path = undistorted_plate["pattern"]
+        read_first = int(undistorted_plate["first"])
+        read_last = int(undistorted_plate["last"])
+        read_offset = 0 if step > 1 else timeline_start - read_first
+    elif source_sequence:
         img_seq_path = source_sequence["pattern"]
         read_first = int(source_sequence["first"])
         read_last = int(source_sequence["last"])
         read_offset = timeline_start - read_first
     else:
-        img_dir_str = str(img_dir).replace('\\', '/')
         img_seq_path = f"{img_dir_str}/frame_%06d{img_ext}"
         read_first, read_last = 1, n_frames
         read_offset = 0 if step > 1 else timeline_start - 1
 
     frame_knobs = f" frame_mode offset\n frame {read_offset}\n" if read_offset else ""
 
-    if step > 1 and not source_sequence:
+    if step > 1 and not (source_sequence and not undistorted_plate):
         plate_input = "Plate_Timewarp"
         timewarp_node_str = f'''TimeWarp {{
  inputs 1
@@ -1200,8 +1508,8 @@ def export_nuke_camera_script(scene_dir, cameras, images, points, output_nk_path
 '''
 
     # RANSAC ground plane for Nuke Card (fitted once by the caller so Blender and Nuke agree)
-    if ground is None and points is not None and len(points) >= 20:
-        ground = detect_ground_plane_ransac(points)
+    if ground is None:
+        ground = fit_ground_plane(points, scene_transform)
     card_node_str = ""
     extra_inputs = 0
     if ground is not None:
@@ -1257,6 +1565,105 @@ TransformGeo {{
     # every Nth frame rather than letting the gaps look like a failed solve.
     keys_note = f" (key every {step})" if step > 1 else ""
 
+    # The distortion chain (1.5), written only when the maps exist. It hangs to
+    # the left of the rig on its own backdrop and touches nothing above it: the
+    # original plate goes in, undistort.exr takes the bend out, and a disabled
+    # STMap with redistort.exr already loaded waits for the comp's output.
+    #
+    # The stack is the wiring in a .nk file. Inside this block nothing else is
+    # pushed, so `inputs 2` takes the two nodes just written, deepest first:
+    # src then stmap. `push 0` is Nuke's own spelling for "input left empty",
+    # which is how the redistort node keeps its src free for the artist.
+    stmap_nodes_str = ""
+    undistort_map = (undistort or {}).get("undistort_map")
+    redistort_map = (undistort or {}).get("redistort_map")
+    overscan_pct = int(round(float((undistort or {}).get("overscan", 0.0)) * 100))
+    delivery_note = ""
+    if undistorted_plate:
+        delivery_note += f" | Undistorted plate, {overscan_pct}% overscan"
+    if undistort_map:
+        delivery_note += " | STMaps: undistort, redistort"
+    if undistort_map or redistort_map:
+        if source_sequence:
+            orig_path, orig_first, orig_last = (source_sequence["pattern"],
+                                                int(source_sequence["first"]),
+                                                int(source_sequence["last"]))
+        else:
+            orig_ext, orig_count = image_sequence_info(img_dir)
+            orig_path = f"{img_dir_str}/frame_%06d{orig_ext}"
+            orig_first, orig_last = 1, (orig_count or n_frames)
+        orig_offset = timeline_start - orig_first if step == 1 else 0
+        orig_frame_knobs = f" frame_mode offset\n frame {orig_offset}\n" if orig_offset else ""
+        stmap_nodes_str = f'''BackdropNode {{
+ inputs 0
+ name Lens_Distortion
+ tile_color 0x3a2440ff
+ gl_color 0x3a2440ff
+ label "<b>Lens distortion</b>\\n\\nSTMaps at {overscan_pct}% overscan. Undistort the original plate here, or use the\\nundistorted plate the Read above points at. Redistort your comp on the way out."
+ note_font_size 14
+ xpos -720
+ ypos -120
+ bdwidth 420
+ bdheight 560
+ z_order 0
+}}
+push $cut_paste_input
+Read {{
+ inputs 0
+ file "{orig_path}"
+ first {orig_first}
+ last {orig_last}
+ origfirst {orig_first}
+ origlast {orig_last}
+{orig_frame_knobs} frame_rate {nk_fps:.4f}
+ name Plate_Original
+ label "the plate as it was shot"
+ selected false
+ xpos -680
+ ypos 0
+}}
+'''
+        if undistort_map:
+            stmap_nodes_str += f'''Read {{
+ inputs 0
+ file "{str(undistort_map).replace(chr(92), '/')}"
+ name Undistort_Map
+ selected false
+ xpos -540
+ ypos 0
+}}
+STMap {{
+ inputs 2
+ channels rgba
+ name Undistort_Plate
+ label "original plate -> undistorted ({overscan_pct}% overscan)"
+ selected false
+ xpos -680
+ ypos 120
+}}
+'''
+        if redistort_map:
+            stmap_nodes_str += f'''push 0
+Read {{
+ inputs 0
+ file "{str(redistort_map).replace(chr(92), '/')}"
+ name Redistort_Map
+ selected false
+ xpos -540
+ ypos 240
+}}
+STMap {{
+ inputs 2
+ channels rgba
+ disable true
+ name Redistort_Comp
+ label "ready: connect your comp result and enable to put the distortion back"
+ selected false
+ xpos -680
+ ypos 360
+}}
+'''
+
     # Read node: first/last and origfirst/origlast are the plate's own file
     # numbering, and frame_knobs carries the "offset" frame mode when the plate
     # has to be moved onto the timeline (A3).
@@ -1267,7 +1674,7 @@ BackdropNode {{
  name Tracker_3D_Rig
  tile_color 0x243044ff
  gl_color 0x243044ff
- label "<b>Photogrammetry 3D Tracking Rig</b>\\n\\nCamera: {lens_mm:.2f}mm | Sensor: {sensor_width_mm:.1f}x{sensor_height_mm:.1f}mm | Shift: ({win_u:.4f}, {win_v:.4f})\\nDistortion: k1={k1:.6f}, k2={k2:.6f} | Points: {len(points):,} | Frames: {start_frame}-{end_frame}{keys_note} @ {nk_fps:.3f} fps | Plate: {timeline_start}-{timeline_end}"
+ label "<b>Photogrammetry 3D Tracking Rig</b>\\n\\nCamera: {lens_mm:.2f}mm | Sensor: {sensor_width_mm:.1f}x{sensor_height_mm:.1f}mm | Shift: ({win_u:.4f}, {win_v:.4f})\\nDistortion: k1={k1:.6f}, k2={k2:.6f} | Points: {len(points):,} | Frames: {start_frame}-{end_frame}{keys_note} @ {nk_fps:.3f} fps | Plate: {timeline_start}-{timeline_end}{delivery_note}"
  note_font_size 14
  xpos -220
  ypos -120
@@ -1297,7 +1704,7 @@ Camera3 {{
  translate {{{{curve {tx_curve}}}}} {{{{curve {ty_curve}}}}} {{{{curve {tz_curve}}}}}
  rotate {{{{curve {rx_curve}}}}} {{{{curve {ry_curve}}}}} {{{{curve {rz_curve}}}}}
  focal {lens_mm:.4f}
- haperture {sensor_width_mm:.4f}
+ haperture {haperture_mm:.4f}
  vaperture {sensor_height_mm:.4f}
  win_translate {{{win_u:.6f} {win_v:.6f}}}
  name Solved_Camera
@@ -1332,13 +1739,13 @@ ScanlineRender {{
  xpos 0
  ypos 260
 }}
-'''
+{stmap_nodes_str}'''
     with open(output_nk_path, 'w', encoding='utf-8') as f:
         f.write(script)
     return True
 
 
-def export_ply_pointcloud(scene_dir, points, output_ply_path=None):
+def export_ply_pointcloud(scene_dir, points, output_ply_path=None, scene_transform=None):
     scene_path = Path(scene_dir).resolve()
     if output_ply_path is None:
         output_ply_path = scene_path / "points3D.ply"
@@ -1358,7 +1765,7 @@ property uchar green
 property uchar blue
 end_header
 """
-    xyz = colmap_points_to(points.xyz, "nuke")
+    xyz = colmap_points_to(points.xyz, "nuke", scene_transform)
     # newline='\n' matters: opened in default text mode on Windows, Python turns every
     # \n into \r\n, and strict PLY readers reject carriage returns in the header.
     with open(output_ply_path, 'w', encoding='utf-8', newline='\n') as f:
@@ -1540,8 +1947,29 @@ def _ensure_txt_model(model_dir, colmap_exe=None, log_callback=None):
     return (model_dir / "cameras.txt").exists() and (model_dir / "images.txt").exists()
 
 
+def scene_transform_record(transform):
+    """
+    The scene transform as camera_track.json carries it, or None.
+
+    A downstream tool - and the Re-export button, which writes a new folder from
+    an old solve - has to be able to see exactly what was applied: the three
+    parts, any plain-English note the fit could not meet, and whether it does
+    anything at all. Plain JSON types only.
+    """
+    if transform is None:
+        return None
+    s, Rot, t = transforms.parts(transform)
+    record = transforms.make(s, Rot, t)
+    notes = transform.get("notes") or []
+    record["notes"] = [str(n) for n in notes] if isinstance(notes, (list, tuple)) else [str(notes)]
+    record["applied"] = not transforms.is_identity(transform)
+    return record
+
+
 def export_all_formats(scene_dir, blender_path=None, log_callback=None, fps=None,
-                       start_frame=None, colmap_exe=None, frame_step=1, source_sequence=None):
+                       start_frame=None, colmap_exe=None, frame_step=1, source_sequence=None,
+                       scene_transform=None, overscan=0.0, write_undistort=False,
+                       pixel_aspect=1.0):
     """
     Parses a COLMAP scene folder and automatically generates all export formats:
     - import_to_blender.py
@@ -1558,9 +1986,31 @@ def export_all_formats(scene_dir, blender_path=None, log_callback=None, fps=None
     frame rate. `source_sequence` (see source_sequence_plate) is the original
     plate when the shot came in as an image sequence, and is what the Nuke Read
     and the Blender background point at.
+
+    `scene_transform` is the artist's scale / ground / origin as
+    core.scene_transform stores it (1.4); it moves the camera, the cloud and the
+    ground plane together, so the plate still lines up. `write_undistort` asks
+    for an undistorted plate and the two STMaps at `overscan` (1.5) - a barrel
+    strong enough to need 40 % is ordinary, so nothing here caps it.
+
+    `pixel_aspect` is the aspect the SOURCE was squeezed with (1.6). When it is
+    not 1.0 the frames in images/ were de-squeezed before the solve, so they are
+    the only plate that agrees with the camera and the exports point at them
+    instead of the artist's own sequence. It is recorded in camera_track.json as
+    information about the source and nowhere else: every export describes square
+    pixels, because that is what was solved and what is being handed over.
     """
     scene_path = Path(scene_dir).resolve()
     step = max(1, int(frame_step or 1))
+    overscan = max(0.0, float(overscan or 0.0))
+    pixel_aspect = float(pixel_aspect or 1.0)
+    plate_desqueezed = abs(pixel_aspect - 1.0) > 1e-9
+    if plate_desqueezed:
+        # The artist's sequence on disk is still squeezed. Putting it under a
+        # camera solved on de-squeezed frames is the one failure a comp does not
+        # catch - a slow horizontal drift, not a broken script - so the exports
+        # simply do not offer it.
+        source_sequence = None
     sparse_dir = scene_path / "sparse"
 
     # When no rate is supplied (batch_reconstruct.bat / direct CLI use), work the shot
@@ -1615,38 +2065,69 @@ def export_all_formats(scene_dir, blender_path=None, log_callback=None, fps=None
         log_callback("   Frame step %d - camera keys land every %d frames, %d..%d."
                      % (step, step, keyed[0], keyed[-1]), "#a0a0b0")
 
-    # One seeded ground-plane fit shared by Blender and Nuke (C9).
-    ground = detect_ground_plane_ransac(points) if len(points) >= 20 else None
+    # The artist's scale, floor and origin, logged in the words they set them in
+    # so the export folder can be read back months later (1.4).
+    if scene_transform is not None and not transforms.is_identity(scene_transform):
+        s, _Rot, t = transforms.parts(scene_transform)
+        if log_callback:
+            log_callback("   Scene transform: scale %.6g, translation (%.4f, %.4f, %.4f) and the "
+                         "fitted rotation, applied to the camera, the cloud and the ground plane."
+                         % (s, t[0], t[1], t[2]), "#a0a0b0")
+            for note in (scene_transform.get("notes") or []):
+                log_callback("   %s" % note, "#e0a000")
+
+    # One seeded ground-plane fit shared by Blender and Nuke (C9), on the points
+    # as they will be exported - the transform has already moved the floor.
+    ground = fit_ground_plane(points, scene_transform)
+
+    first_cam = next(iter(cameras.values()))
+    undistort = None
+    if write_undistort:
+        undistort = prepare_undistort(scene_path, first_cam, model_dir,
+                                      find_images_dir(scene_path), overscan=overscan,
+                                      colmap_exe=colmap_exe, log_callback=log_callback)
+    if plate_desqueezed and log_callback:
+        log_callback("   Pixel aspect %.4g: your plate is %.4g:1 squeezed; the solve and the "
+                     "exported scripts use the de-squeezed %dx%d frames in images/, so the "
+                     "camera and the plate agree. Your original sequence needs its own pixel "
+                     "aspect if you bring it in yourself."
+                     % (pixel_aspect, pixel_aspect,
+                        int(first_cam["width"]), int(first_cam["height"])), "#a0a0b0")
 
     exported_files = []
 
     # 1. PLY Point Cloud (first: the Blender script and the Nuke ReadGeo load it)
     ply_file = scene_path / "points3D.ply"
-    if export_ply_pointcloud(scene_path, points, ply_file):
+    if export_ply_pointcloud(scene_path, points, ply_file, scene_transform=scene_transform):
         exported_files.append(str(ply_file))
 
     # 2. Blender 1-Click Script
     blender_script = scene_path / "import_to_blender.py"
     if export_blender_script(scene_path, cameras, images, points, blender_script, fps=fps, ground=ground,
-                             frame_step=step, source_sequence=source_sequence):
+                             frame_step=step, source_sequence=source_sequence,
+                             scene_transform=scene_transform, plate_desqueezed=plate_desqueezed,
+                             undistort=undistort):
         exported_files.append(str(blender_script))
 
     # 3. Nuke 1-Click Script (.nk)
     nuke_nk_file = scene_path / "camera_track_nuke.nk"
     if export_nuke_camera_script(scene_path, cameras, images, points, nuke_nk_file, fps=fps, ground=ground,
-                                 frame_step=step, source_sequence=source_sequence):
+                                 frame_step=step, source_sequence=source_sequence,
+                                 scene_transform=scene_transform, undistort=undistort):
         exported_files.append(str(nuke_nk_file))
 
     # 4. Nuke .chan Camera File
     chan_file = scene_path / "camera_track.chan"
     # .chan carries no frame-rate field, so fps is not passed here.
-    if export_nuke_chan(scene_path, cameras, images, chan_file, frame_step=step):
+    if export_nuke_chan(scene_path, cameras, images, chan_file, frame_step=step,
+                        scene_transform=scene_transform, undistort=undistort):
         exported_files.append(str(chan_file))
 
     # 5. Universal Scene Description (.usda)
     if HAS_USD:
         usd_file = scene_path / "camera_track.usda"
-        if export_usd_scene(scene_path, cameras, images, points, usd_file, fps=fps):
+        if export_usd_scene(scene_path, cameras, images, points, usd_file, fps=fps,
+                            scene_transform=scene_transform, undistort=undistort):
             exported_files.append(str(usd_file))
 
     # 6. Structured JSON
@@ -1659,11 +2140,43 @@ def export_all_formats(scene_dir, blender_path=None, log_callback=None, fps=None
             # a downstream tool needs the step to know that and to read the gaps
             # between keys as intended rather than as missing frames.
             "frame_step": step,
+            # Everything an artist would otherwise have to guess at, in the one
+            # file another tool can read: what was done to the world (1.4), what
+            # the lens does and what was delivered against it (1.5), and what
+            # the source was squeezed with (1.6).
+            "scene_transform": scene_transform_record(scene_transform),
+            "distortion": distortion_summary(first_cam),
+            "overscan": overscan,
+            # The camera that matches an undistorted plate at this overscan,
+            # written whether or not one was produced: it is what a comp needs
+            # to rebuild the plate from the maps.
+            "pinhole": lens_math.pinhole_of(first_cam, overscan),
+            "undistort": {
+                "plate": undistort["plate"]["pattern"] if undistort and undistort.get("plate") else None,
+                "undistort_map": undistort.get("undistort_map") if undistort else None,
+                "redistort_map": undistort.get("redistort_map") if undistort else None,
+                "map_format": undistort.get("map_format") if undistort else None,
+            } if undistort else None,
+            # The source's own aspect, kept because it is real information about
+            # the plate that was shot, and a flag saying what the frames these
+            # exports point at actually are: de-squeezed and square, or the
+            # source untouched. A downstream tool should not have to infer it.
+            "pixel_aspect": pixel_aspect,
+            "plate_desqueezed": plate_desqueezed,
             "cameras": cameras,
             "images": images,
             "points_count": len(points)
         }, f, indent=2)
     exported_files.append(str(json_file))
+
+    # The distortion delivery is part of the handoff, so it belongs in the list
+    # the log prints back to the artist.
+    if undistort:
+        for path in (undistort.get("undistort_map"), undistort.get("redistort_map")):
+            if path:
+                exported_files.append(str(path))
+        if undistort.get("plate"):
+            exported_files.append(str(Path(undistort["plate"]["pattern"]).parent))
 
     # 7. Auto-bake Alembic (.abc) via background Blender if available
     auto_export_alembic_via_blender(scene_path, blender_path=blender_path, log_callback=log_callback)
@@ -1680,7 +2193,11 @@ def export_all_formats(scene_dir, blender_path=None, log_callback=None, fps=None
         "frames_count": len(images),
         "points_count": len(points),
         "alembic_path": str(abc_file) if abc_file.exists() else None,
-        "blend_path": str(blend_file) if blend_file.exists() else None
+        "blend_path": str(blend_file) if blend_file.exists() else None,
+        "undistorted_plate": (undistort["plate"]["pattern"]
+                              if undistort and undistort.get("plate") else None),
+        "stmaps": [p for p in ((undistort or {}).get("undistort_map"),
+                               (undistort or {}).get("redistort_map")) if p],
     }
 
 

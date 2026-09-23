@@ -14,12 +14,14 @@ import traceback
 import datetime
 from pathlib import Path
 
+import numpy as np
+
 try:
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QLabel, QTabWidget, QMessageBox, QFileDialog, QTableWidgetItem,
         QInputDialog, QColorDialog, QListWidgetItem, QStackedLayout,
-        QGraphicsOpacityEffect, QDoubleSpinBox
+        QGraphicsOpacityEffect, QDoubleSpinBox, QPushButton
     )
     from PySide6.QtCore import Qt, QTimer, QSettings, QThread, QObject, Signal
     from PySide6.QtGui import (
@@ -68,9 +70,12 @@ from core.tracking_layer import TrackingLayer
 from core.workers import TrackerWorker, CoTrackerWorker, FrameExtractorWorker
 from core.hardware import gpu_monitor
 from core.proc import run_hidden, popen_gui
+from core import media_info
 from core.media_info import probe_fps, probe_frame_count, detect_sequence_start, sequence_files
 from core.presets import PRESETS, DEFAULT_PRESET
 from core import project as project_file
+from core import scene_transform
+from gui.canvas import project_solved_points
 from core.media_pool import (
     VIDEO_EXTS, scan_media_pool, find_latest_output,
     thumb_path, prune_thumb_cache,
@@ -118,6 +123,193 @@ class MediaCopyWorker(QThread):
         self.finished_signal.emit(copied, errors)
 
 
+class UpdateCheckWorker(QThread):
+    """
+    Asks GitHub whether a newer release exists (2.6).
+
+    Installs are manual, so somebody can sit on an old build for months without
+    knowing. Opt-in, off the GUI thread, and silent about every failure: a
+    missing network is not worth a dialog.
+    """
+    found_signal = Signal(dict)
+
+    def run(self):
+        try:
+            from core.update_check import check_for_update
+            info = check_for_update(APP_VERSION)
+        except Exception:
+            info = None
+        if info:
+            self.found_signal.emit(info)
+
+
+class ReExportWorker(QThread):
+    """
+    Write a fresh export folder from a solve that already exists (roadmap 1.4).
+
+    Re-exporting is minutes of writing, not seconds, because the STMaps and the
+    undistorted plate are full-resolution images - so it runs here rather than
+    on the GUI thread, like every other job in this window.
+
+    The existing sparse model is COPIED into a new timestamped folder rather
+    than exported over: a scene transform or an overscan the artist regrets must
+    never cost them the export they already handed to comp.
+    """
+    log_signal = Signal(str, str)
+    finished_signal = Signal(bool, str)     # success, message
+
+    def __init__(self, source_dir, shot_dir, options):
+        super().__init__()
+        self.source_dir = Path(source_dir)
+        self.shot_dir = Path(shot_dir)
+        self.options = dict(options)
+        self.output_dir = None
+
+    def run(self):
+        try:
+            from export_tools import export_all_formats, source_sequence_plate
+
+            stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            out_dir = self.shot_dir / "3D_CAMERA_TRACK" / stamp
+            src_sparse = self.source_dir / "sparse"
+            if not src_sparse.is_dir():
+                self.finished_signal.emit(
+                    False, "The solve in %s has no sparse model to export." % self.source_dir.name)
+                return
+            out_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(src_sparse, out_dir / "sparse", dirs_exist_ok=True)
+            self.output_dir = out_dir
+            self.log_signal.emit("▶ Re-exporting into 3D_CAMERA_TRACK/%s ..." % stamp, ACCENT)
+
+            video = self.options.get("video_path")
+            plate = None
+            if video is not None and Path(video).is_dir():
+                plate = source_sequence_plate(Path(video))
+
+            res = export_all_formats(
+                out_dir,
+                blender_path=self.options.get("blender_path"),
+                log_callback=lambda m, c: self.log_signal.emit(m, c),
+                fps=self.options.get("fps"),
+                start_frame=self.options.get("start_frame"),
+                colmap_exe=self.options.get("colmap_exe"),
+                frame_step=self.options.get("frame_step", 1),
+                source_sequence=plate,
+                scene_transform=self.options.get("scene_transform"),
+                overscan=self.options.get("overscan", 0.0),
+                write_undistort=self.options.get("write_undistort", False),
+                pixel_aspect=self.options.get("pixel_aspect", 1.0),
+            )
+            if not res.get("success"):
+                self.finished_signal.emit(
+                    False, "Re-export failed: %s" % res.get("error", "unknown error"))
+                return
+
+            # _latest is what every Open Output button and the media table read,
+            # so a re-export that did not move it would look like it did nothing.
+            try:
+                latest_dir = self.shot_dir / "3D_CAMERA_TRACK" / "_latest"
+                shutil.rmtree(latest_dir, ignore_errors=True)
+                latest_dir.mkdir(parents=True, exist_ok=True)
+                for f in out_dir.iterdir():
+                    if f.is_file():
+                        shutil.copy2(f, latest_dir / f.name)
+                for sub in ("sparse", "undistorted"):
+                    if (out_dir / sub).exists():
+                        shutil.copytree(out_dir / sub, latest_dir / sub, dirs_exist_ok=True)
+            except Exception as sync_err:
+                self.log_signal.emit("Notice: could not refresh _latest: %s" % sync_err, WARN)
+
+            self.finished_signal.emit(
+                True, "✔ Re-exported into 3D_CAMERA_TRACK/%s" % stamp)
+        except Exception as e:
+            log.exception("re-export failed")
+            for line in traceback.format_exc().rstrip().splitlines():
+                self.log_signal.emit("   %s" % line, ERR)
+            self.finished_signal.emit(False, "Re-export raised: %s" % e)
+
+
+class TrackCorrectionWorker(QThread):
+    """
+    Fix a drifting 2D track without re-solving the shot (roadmap 2.1).
+
+    Two jobs, because both are the wrong thing to do on the GUI thread: a
+    re-track puts one point back through CoTracker on the GPU, and a re-export
+    writes every delivery format again (the Blender script for a dense grid is
+    megabytes of it).
+
+    The result is worked on as a COPY and handed back on finish. The canvas
+    paints straight out of those arrays, and a worker writing into them while
+    the window repaints is how a track flickers half-updated on screen.
+    """
+    log_signal = Signal(str, str)
+    progress_signal = Signal(int, str)
+    finished_signal = Signal(bool, str)
+
+    def __init__(self, job):
+        super().__init__()
+        self.job = dict(job)
+        self.is_cancelled = False
+        self.result = None
+        self.output_dir = None
+
+    def cancel(self):
+        self.is_cancelled = True
+
+    def run(self):
+        import copy as _copy
+        try:
+            import cotracker_2d as c2d
+        except ImportError as e:
+            self.finished_signal.emit(False, "CoTracker engine failed to import: %s" % e)
+            return
+
+        job = self.job
+        result = _copy.deepcopy(job["result"])
+        try:
+            if job["mode"] == "retrack":
+                info = c2d.retrack_correction(
+                    job["video_path"], result, job["layer_key"], job["point_index"],
+                    job["frame_t"], job["x"], job["y"],
+                    config=job.get("config"), backwards=job.get("backwards", False),
+                    log_callback=lambda m, c: self.log_signal.emit(m, c),
+                    progress_callback=lambda v, t: self.progress_signal.emit(int(v), t),
+                    cancel_check=lambda: self.is_cancelled,
+                )
+                self.result = result
+                parts = ", ".join("%s %d frame(s)" % (word, n)
+                                  for word, n in info["spliced"].items())
+                self.finished_signal.emit(
+                    True, "✔ Re-tracked point #%d from frame %d (%s)."
+                    % (int(job["point_index"]) + 1, info["frame"], parts))
+                return
+
+            stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            out_dir = Path(job["track_root"]) / stamp
+            self.progress_signal.emit(20, "Writing the corrected exports...")
+            paths = c2d.export_corrected_result(
+                result, job["layers_meta"], out_dir,
+                fps=job.get("fps", 24.0), images_dir=job.get("images_dir"),
+                timeline_start=job.get("timeline_start", 1),
+                source_name=job.get("source_name", ""),
+                latest_dir=Path(job["track_root"]) / "_latest",
+                log=lambda m, c: self.log_signal.emit(m, c),
+            )
+            self.result = result
+            self.output_dir = out_dir
+            self.progress_signal.emit(100, "Corrected exports written")
+            self.finished_signal.emit(
+                True, "✔ Re-exported the corrected tracks into 2D_POINT_TRACK/%s "
+                      "(%s)." % (stamp, Path(paths["json_path"]).name))
+        except c2d.TrackingCancelled:
+            self.finished_signal.emit(False, "⏹ Correction cancelled.")
+        except Exception as e:
+            log.exception("track correction failed")
+            for line in traceback.format_exc().rstrip().splitlines():
+                self.log_signal.emit("   %s" % line, ERR)
+            self.finished_signal.emit(False, "✖ %s" % e)
+
+
 class TrackerMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -133,8 +325,33 @@ class TrackerMainWindow(QMainWindow):
         self.frame_extractor = None
         self._pending_extract = None
         self.copy_worker = None
+        self.reexport_worker = None
+        self.update_worker = None
+        self._check_updates = False
+        self.correction_worker = None
         self._pending_imports = []
         self._closing = False
+
+        # The last 2D result for the shot in view (roadmap 2.1), loaded back
+        # from tracks_2d.json so a correction still works after the app has
+        # been closed and reopened. `_track_layer_map` says which layer in the
+        # window owns which block of the file, `_track_problem` is the sentence
+        # shown when the file does not match the layers, and `_last_correction`
+        # is what the Re-track buttons act on when the playhead is not sitting
+        # on a corrected frame.
+        self._track_result = None
+        self._track_layer_map = None
+        self._track_problem = ""
+        self._last_correction = None
+
+        # Scene setup (1.4). `_solve` is the newest solve for the shot in view -
+        # its camera_track.json, its points in COLMAP's own world and a lookup
+        # from timeline frame to solved camera - loaded only when a solve
+        # exists. `_scene_picks` holds indices into those points, per purpose.
+        self._solve = None
+        self._scene_transform = None
+        self._scene_picks = {"scale": [], "ground": [], "origin": []}
+        self._scene_pick_mode = None
 
         self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
         self._last_clip = self.settings.value("media/last_clip", "", type=str)
@@ -212,6 +429,15 @@ class TrackerMainWindow(QMainWindow):
             except Exception as e:
                 self._status("Blender auto-detect failed: %s" % e, error=True)
 
+        # Correction works on a loaded result, and there is none until a clip
+        # is picked - so the buttons start off rather than looking available.
+        self._refresh_correction_ui()
+
+        # Reading a saved 2D result back needs the tracker module, and importing
+        # it pulls in torch (about a second). Warm it here, off the GUI thread,
+        # so selecting a clip does not stall on it.
+        threading.Thread(target=self._warm_tracker_import, daemon=True).start()
+
         # Old thumbnails cost disk for nothing; keep the cache bounded.
         try:
             removed = prune_thumb_cache(thumbs_dir())
@@ -236,6 +462,15 @@ class TrackerMainWindow(QMainWindow):
                 "Check the folder exists and you have permission to read it."
                 % (VIDEOS_DIR, e))
         self._update_hardware_monitor()
+        self._start_update_check()
+
+    @staticmethod
+    def _warm_tracker_import():
+        """Import the tracker module in the background; failure is not fatal here."""
+        try:
+            import cotracker_2d  # noqa: F401
+        except Exception as e:
+            log.info("tracker module could not be pre-imported: %s", e)
 
     def _status(self, text, error=False):
         """Status-bar message that is also written to app.log (C19)."""
@@ -318,6 +553,9 @@ class TrackerMainWindow(QMainWindow):
         help_menu = menubar.addMenu("&Help")
         act_about = help_menu.addAction("About Automated Tracker")
         act_about.triggered.connect(self._show_about_dialog)
+        self.act_updates = help_menu.addAction("Check for Updates on Start")
+        self.act_updates.setCheckable(True)
+        self.act_updates.toggled.connect(self._on_update_pref)
 
         # ================================================================
         # ATMOSPHERIC BACKGROUND via QStackedLayout(StackAll)
@@ -364,6 +602,21 @@ class TrackerMainWindow(QMainWindow):
 
         self.tabs.addTab(self.tab_3d, "3D Camera Tracking (COLMAP)")
         self.tabs.addTab(self.tab_2d, "2D Point Tracking (CoTracker3)")
+        # A newer release is worth one quiet line above the tabs, never a dialog.
+        self.update_banner = QWidget()
+        self.update_banner.setVisible(False)
+        _ub = QHBoxLayout(self.update_banner)
+        _ub.setContentsMargins(0, 4, 0, 4)
+        self.lbl_update = QLabel("")
+        self.lbl_update.setObjectName("statusChip")
+        self.lbl_update.setOpenExternalLinks(True)
+        _ub.addWidget(self.lbl_update, 1)
+        _dismiss = QPushButton("Dismiss")
+        _dismiss.setToolTip("Hide this until the next launch.")
+        _dismiss.clicked.connect(lambda: self.update_banner.setVisible(False))
+        _ub.addWidget(_dismiss)
+        content_layout.addWidget(self.update_banner)
+
         content_layout.addWidget(self.tabs, 1)
 
         stacked.addWidget(content)
@@ -734,6 +987,15 @@ class TrackerMainWindow(QMainWindow):
             "animated_masks": all_masks if all_masks else None,
             "mask_shot": mask_shot,
             "ba_refine_distortion": self.chk_ba_refine.isChecked(),
+            # Handoff settings the exporters read (1.4, 1.5, 1.6). The scene
+            # transform belongs to the shot in view, so a batch of other shots
+            # gets None rather than this one's scale and floor.
+            "scene_transform": (self._scene_transform
+                                if len(videos) == 1 and Path(videos[0]).stem == self._current_shot_name()
+                                else None),
+            "overscan": self._overscan_value(),
+            "write_undistort": bool(self.chk_write_undistort.isChecked()),
+            "pixel_aspect": float(self.spin_pixel_aspect.value()),
         }
 
         self._pause_playback()
@@ -767,6 +1029,11 @@ class TrackerMainWindow(QMainWindow):
         self.btn_stop_3d.setEnabled(False)
         self._append_log_3d(f"\n{message}", OK if success else ERR)
         self._refresh_videos()
+        # A fresh solve is a fresh point cloud, so the picks that pointed into
+        # the old one mean nothing now.
+        self._clear_scene_picks()
+        self._load_solve_for_shot(self._current_shot_name())
+        self._refresh_scene_setup()
 
     def _append_log_3d(self, text, color=TEXT_DIM):
         self.log_text.append(f'<span style="color: {color};">{text}</span>')
@@ -1072,15 +1339,43 @@ class TrackerMainWindow(QMainWindow):
         # over what the file numbering and the probe guessed a moment ago.
         self._project_shot = video_path.stem
         self._project_save_failed = False
+        # The previous shot's picks and transform must not follow the artist to
+        # the next one - they index into a point cloud that is no longer loaded.
+        self._scene_transform = None
+        for bucket in self._scene_picks.values():
+            del bucket[:]
         saved = project_file.load_project(project_file.project_path(SCENES_DIR, video_path.stem))
         self._project_loaded = saved is not None
         self._apply_fps_for_clip(video_path, saved.get("fps") if saved else None)
+        self._apply_pixel_aspect_for_clip(
+            video_path, (saved.get("settings_3d") or {}).get("pixel_aspect") if saved else None)
         if saved:
             self._apply_project(saved)
             self._append_log_2d(
                 f"Restored the saved project for '{video_path.stem}': "
                 f"{len(self.canvas_2d.layers)} layer(s), timeline start "
                 f"{self.spin_start_frame_2d.value()}.", OK)
+        else:
+            # A shot that has never been saved starts from the defaults. Leaving
+            # the previous shot's state in the window is how masks drawn on one
+            # plate end up culling points on another, or a Frame Step of 3 set
+            # for a long take silently follows you onto a short one.
+            fresh = project_file.default_project()
+            fresh["timeline_start"] = self.spin_start_frame_2d.value()
+            self._apply_project(fresh)
+            self._append_log_2d(
+                f"'{video_path.stem}' has no saved project yet - starting from the "
+                f"default settings.", TEXT_DIM)
+
+        # The Scene setup panel follows the clip the canvas is showing, because
+        # that is the plate its points are picked on.
+        self._set_scene_pick_mode(None)
+        self._load_solve_for_shot(video_path.stem)
+        self._refresh_scene_setup()
+
+        # After the project, because the result is matched to the layers it was
+        # tracked from and those have only just come back.
+        self._load_track_result_for_shot(video_path.stem)
 
         self._last_clip = video_name
         self._schedule_settings_save()
@@ -1595,8 +1890,15 @@ class TrackerMainWindow(QMainWindow):
             "auto_chunk": self.chk_vram_chunk.isChecked(),
             "timeline_start": self.spin_start_frame_2d.value(),
             "in_point": self.canvas_2d.in_point,
-            "out_point": self.canvas_2d.out_point
+            "out_point": self.canvas_2d.out_point,
+            # Whole-layer backwards tracking, for a shot whose good reference
+            # is at the end (roadmap 2.1).
+            "backwards": bool(self.chk_track_backwards.isChecked()),
         }
+        if config["backwards"]:
+            self._append_log_2d(
+                "Tracking backwards: the clip runs last frame first and the result is "
+                "flipped back, so the exports still start at the head.", ACCENT)
 
         self._pause_playback()
         self.btn_start_2d.setEnabled(False)
@@ -1611,9 +1913,15 @@ class TrackerMainWindow(QMainWindow):
         self.worker_2d.start()
 
     def _stop_tracking_2d(self):
+        # Cancel means "stop the 2D job", whichever of the two is running - the
+        # correction pass goes through the same tracker and honours the same flag.
         if self.worker_2d and self.worker_2d.isRunning():
             self._append_log_2d("⏹ Stopping 2D tracking process...", ERR)
             self.worker_2d.cancel()
+            self.btn_stop_2d.setEnabled(False)
+        if self.correction_worker and self.correction_worker.isRunning():
+            self._append_log_2d("⏹ Stopping the correction...", ERR)
+            self.correction_worker.cancel()
             self.btn_stop_2d.setEnabled(False)
 
     def _append_log_2d(self, text, color=TEXT_DIM):
@@ -1630,7 +1938,380 @@ class TrackerMainWindow(QMainWindow):
         self.btn_stop_2d.setEnabled(False)
         self._append_log_2d(f"\n{message}", OK if success else ERR)
         if success:
+            # A fresh solve replaces whatever was loaded for correcting, and
+            # the corrections that belonged to the old one go with it.
+            for layer in self.canvas_2d.layers:
+                layer.corrections = []
+            self._load_track_result_for_shot(self._current_shot_name())
+            self._schedule_project_save()
             self._load_overlay_into_player()
+
+    # =========================================================================
+    # FIXING A DRIFTING 2D TRACK  (roadmap 2.1)
+    #
+    # The result of the last solve is loaded back from tracks_2d.json, drawn on
+    # the plate, and corrected by dragging a marker onto the feature it slid
+    # off. "Re-track from here" then puts that ONE point back through CoTracker
+    # from that frame, and the new positions are spliced into the stored result
+    # from the correction onward - everything the artist already accepted in
+    # front of it is left alone.
+    # =========================================================================
+    def _track_root_for(self, shot_name):
+        return SCENES_DIR / shot_name / "2D_POINT_TRACK"
+
+    def _load_track_result_for_shot(self, shot_name):
+        """
+        Load the shot's last 2D result and attach it to the current layers.
+
+        Called when the clip is picked and after a track finishes, so the
+        correction tools work on a shot solved days ago just as well as on one
+        solved a minute ago. A result that does not line up with the layers in
+        the window leaves correction switched off with the reason on screen -
+        guessing which stored track belongs to which layer would have the
+        artist correcting the wrong point.
+        """
+        self._track_result = None
+        self._track_layer_map = None
+        self._track_problem = ""
+        self._last_correction = None
+        self.canvas_2d.clear_tracked_result()
+
+        if shot_name:
+            json_path, _folder = find_latest_output(
+                SCENES_DIR / shot_name, "2D_POINT_TRACK", "tracks_2d.json",
+                legacy_subdirs=("cotracker_2d",))
+            if json_path:
+                try:
+                    import cotracker_2d as c2d
+                    result = c2d.load_tracks_2d(json_path)
+                except Exception as e:
+                    log.warning("could not read %s: %s", json_path, e)
+                    result = None
+                    self._track_problem = "The saved 2D result could not be read: %s" % e
+                if result:
+                    names = [l.name for l in self.canvas_2d.layers]
+                    mapping, problem = c2d.match_result_to_layers(result, names)
+                    if mapping:
+                        self._track_result = result
+                        self._track_layer_map = mapping
+                        self._append_log_2d(
+                            "Loaded the last 2D result for '%s': %d frame(s), %s. Switch "
+                            "Result on to see it and drag a point to correct it."
+                            % (shot_name, result["frame_count"],
+                               ", ".join("%s %d point(s)"
+                                         % (n, result["layers"][k]["tracks"].shape[1])
+                                         for n, k in mapping.items())), TEXT_DIM)
+                    else:
+                        self._track_problem = problem
+                        self._append_log_2d("! %s" % problem, WARN)
+                elif not self._track_problem:
+                    self._track_problem = "The saved 2D result could not be read."
+
+        self._push_result_to_canvas()
+        self._refresh_correction_ui()
+
+    def _result_in_point(self):
+        """
+        The clip frame the loaded result starts on.
+
+        The file records the timeline frame its first sample sits on, so the
+        clip-relative index is that minus the shot's timeline start - the same
+        arithmetic the exporters did on the way out.
+        """
+        if not self._track_result:
+            return 0
+        return max(0, int(self._track_result["start_frame"])
+                   - int(self.spin_start_frame_2d.value()))
+
+    def _push_result_to_canvas(self):
+        """Hand the loaded result to the canvas, keyed by the layer it belongs to."""
+        canvas = self.canvas_2d
+        if not (self._track_result and self._track_layer_map):
+            canvas.clear_tracked_result()
+            return
+        layers = {name: self._track_result["layers"][key]
+                  for name, key in self._track_layer_map.items()
+                  if key in self._track_result["layers"]}
+        canvas.set_tracked_result(
+            layers,
+            in_point=self._result_in_point(),
+            frame_step=self._track_result["frame_step"],
+            show=bool(self.btn_show_result.isChecked()))
+
+    def _all_corrections(self):
+        """Every correction on every layer, as (layer, correction dict) pairs."""
+        out = []
+        for layer in self.canvas_2d.layers:
+            for c in layer.corrections:
+                out.append((layer, c))
+        return out
+
+    def _refresh_correction_ui(self):
+        """Chip, timeline ticks and button states, from whatever is loaded now."""
+        has_result = bool(self._track_result and self._track_layer_map)
+        busy = self._correction_busy()
+        marks = sorted({int(c["frame"]) for _l, c in self._all_corrections()})
+
+        self.btn_show_result.setEnabled(has_result)
+        if not has_result and self.btn_show_result.isChecked():
+            # A shot with no result must not sit there claiming to show one.
+            self.btn_show_result.blockSignals(True)
+            self.btn_show_result.setChecked(False)
+            self.btn_show_result.blockSignals(False)
+        for btn in (self.btn_prev_fix, self.btn_next_fix):
+            btn.setEnabled(has_result and bool(marks))
+        for btn in (self.btn_retrack_fwd, self.btn_retrack_both):
+            btn.setEnabled(has_result and not busy)
+        self.btn_reexport_2d.setEnabled(has_result and not busy)
+
+        if has_result:
+            text = "%d fix%s" % (len(marks), "" if len(marks) == 1 else "es")
+            self._set_chip_state(self.lbl_corrections, "key" if marks else "idle")
+            self.lbl_corrections.setToolTip(
+                "Corrected frames: %s" % (", ".join(str(f + 1) for f in marks[:12]) or "none yet")
+                + ("\nRe-export to write these into the delivered files." if marks else ""))
+        else:
+            text = "No result"
+            self._set_chip_state(self.lbl_corrections, "idle")
+            self.lbl_corrections.setToolTip(
+                self._track_problem or "Run a 2D track to get a result you can correct.")
+        self.lbl_corrections.setText(text)
+
+        # Only the frames this shot's result actually covers get a tick; a
+        # correction left over from another range would point at nothing.
+        try:
+            self.slider_2d_frame.set_marks(marks)
+        except AttributeError:
+            pass
+
+    def _toggle_tracked_result(self, checked):
+        """The Result toggle: draw the last solve over the plate, or stop."""
+        if checked and not (self._track_result and self._track_layer_map):
+            self.btn_show_result.setChecked(False)
+            QMessageBox.information(
+                self, "No 2D Result",
+                self._track_problem or
+                "There is no 2D result for this shot yet.\n\nRun 2D Point Tracking first.")
+            return
+        self.canvas_2d.show_tracked_points = bool(checked)
+        self._push_result_to_canvas()
+        self.canvas_2d.update()
+        if checked:
+            self._append_log_2d(
+                "Showing the last 2D result. Drag a marker to correct it on this frame, "
+                "then Re-track ▶ (or right-click the marker).", ACCENT)
+
+    def _layer_named(self, name):
+        return next((l for l in self.canvas_2d.layers if l.name == name), None)
+
+    def _result_block(self, layer_name):
+        """The loaded arrays for a layer name, or None."""
+        if not (self._track_result and self._track_layer_map):
+            return None
+        key = self._track_layer_map.get(layer_name)
+        if key not in self._track_result["layers"]:
+            return None
+        return self._track_result["layers"][key]
+
+    def _on_tracked_point_moved(self, layer_name, point_index, frame, x, y):
+        """A tracked marker was dragged: that frame becomes what the artist set."""
+        block = self._result_block(layer_name)
+        layer = self._layer_named(layer_name)
+        t = self.canvas_2d.tracked_index_for_frame(frame)
+        if block is None or layer is None or t is None:
+            self._append_log_2d(
+                "The result does not cover frame %d, so there is nothing to correct there."
+                % (int(frame) + 1), WARN)
+            return
+        import cotracker_2d as c2d
+        layer.set_correction(point_index, frame, x, y)
+        c2d.set_corrected_sample(block, point_index, t, x, y)
+        self._last_correction = (layer_name, int(point_index), int(frame))
+        self._append_log_2d(
+            "◈ Corrected [%s] point #%d on frame %d to (%.1f, %.1f). Re-track ▶ to carry "
+            "it forward." % (layer_name, int(point_index) + 1, int(frame) + 1, x, y), OK)
+        self.canvas_2d.update()
+        self._refresh_correction_ui()
+        self._schedule_project_save()
+
+    def _on_correction_cleared(self, layer_name, point_index, frame):
+        """Forget one correction. The spliced positions stay - only the mark goes."""
+        layer = self._layer_named(layer_name)
+        if layer is not None and layer.clear_correction(point_index, frame):
+            self._append_log_2d(
+                "Forgot the correction on [%s] point #%d, frame %d."
+                % (layer_name, int(point_index) + 1, int(frame) + 1), TEXT_DIM)
+            if self._last_correction == (layer_name, int(point_index), int(frame)):
+                self._last_correction = None
+            self.canvas_2d.update()
+            self._refresh_correction_ui()
+            self._schedule_project_save()
+
+    def _on_retrack_requested(self, layer_name, point_index, frame, backwards):
+        self._run_retrack(layer_name, int(point_index), int(frame), bool(backwards))
+
+    def _retrack_correction(self, backwards=False):
+        """
+        The Re-track buttons: work on the correction under the playhead.
+
+        With nothing corrected on this frame the last correction is used, so
+        scrubbing away to look at the fix and then pressing the button still
+        does what the artist means.
+        """
+        frame = int(self.canvas_2d.current_frame)
+        target = None
+        for layer, c in self._all_corrections():
+            if int(c["frame"]) == frame:
+                target = (layer.name, int(c["point"]), frame)
+                break
+        target = target or self._last_correction
+        if not target:
+            QMessageBox.information(
+                self, "Nothing to Re-track",
+                "Switch Result on, drag a tracked point onto the feature it slid off, "
+                "and then re-track from that frame.\n\n"
+                "You can also right-click any marker to re-track it from the frame in view.")
+            return
+        self._run_retrack(target[0], target[1], target[2], backwards)
+
+    def _run_retrack(self, layer_name, point_index, frame, backwards):
+        """Start the re-track worker for one point, from one frame."""
+        if self._correction_busy():
+            self._append_log_2d("A 2D job is already running.", WARN)
+            return
+        block = self._result_block(layer_name)
+        layer = self._layer_named(layer_name)
+        t = self.canvas_2d.tracked_index_for_frame(frame)
+        if block is None or layer is None or t is None:
+            QMessageBox.warning(
+                self, "Frame Not in the Result",
+                "The saved result does not cover frame %d, so it cannot be re-tracked from "
+                "there." % (int(frame) + 1))
+            return
+
+        # A marker re-tracked without being dragged starts from where the solve
+        # left it - which is exactly what "re-track from here" means when the
+        # track is right on this frame and wrong after it.
+        c = layer.correction_at(frame, point_index)
+        if c:
+            x, y = float(c["x"]), float(c["y"])
+        else:
+            x, y = float(block["tracks"][t, point_index, 0]), float(block["tracks"][t, point_index, 1])
+
+        v_name = self.combo_2d_video.currentText()
+        if not v_name:
+            return
+        step = int(self._track_result["frame_step"])
+        in_pt = self._result_in_point()
+        config = {
+            "max_dimension": self._max_dimension_2d(),
+            "frame_step": step,
+            "in_point": in_pt,
+            # Exactly the range the result covers, whatever the In/Out chips
+            # say now: the spliced frames have to line up with the stored ones.
+            "out_point": in_pt + (int(self._track_result["frame_count"]) - 1) * step,
+            "offline": "Offline" in self.combo_2d_model.currentText(),
+            "auto_chunk": self.chk_vram_chunk.isChecked(),
+        }
+        self._pause_playback()
+        self._append_log_2d(
+            "▶ Re-tracking [%s] point #%d from frame %d%s — one point only, not the grid."
+            % (layer_name, int(point_index) + 1, int(frame) + 1,
+               " (and backwards)" if backwards else ""), ACCENT)
+        self._start_correction_worker({
+            "mode": "retrack",
+            "result": self._track_result,
+            "video_path": VIDEOS_DIR / v_name,
+            "layer_key": self._track_layer_map[layer_name],
+            "point_index": int(point_index),
+            "frame_t": int(t),
+            "x": x, "y": y,
+            "backwards": bool(backwards),
+            "config": config,
+        })
+
+    def _reexport_2d_result(self):
+        """Write every 2D format again from the corrected result, without re-tracking."""
+        if self._correction_busy():
+            self._append_log_2d("A 2D job is already running.", WARN)
+            return
+        if not (self._track_result and self._track_layer_map):
+            QMessageBox.information(
+                self, "No 2D Result",
+                self._track_problem or
+                "There is no 2D result to export yet.\n\nRun 2D Point Tracking first.")
+            return
+        shot = self._current_shot_name()
+        if not shot:
+            return
+        layers_meta = []
+        for layer in self.canvas_2d.layers:
+            key = self._track_layer_map.get(layer.name)
+            if key in self._track_result["layers"]:
+                layers_meta.append({
+                    "name": layer.name,
+                    "key": key,
+                    "export_cornerpin": bool(layer.export_cornerpin or layer.mode == "cornerpin"),
+                })
+        self._append_log_2d(
+            "▶ Re-exporting the corrected 2D tracks (no re-tracking, the overlay video "
+            "stays as the last real track rendered it).", ACCENT)
+        self._start_correction_worker({
+            "mode": "export",
+            "result": self._track_result,
+            "track_root": self._track_root_for(shot),
+            "layers_meta": layers_meta,
+            "fps": self.current_fps if self.current_fps and self.current_fps > 0 else 24.0,
+            "images_dir": SCENES_DIR / shot / "images",
+            "timeline_start": int(self.spin_start_frame_2d.value()),
+            "source_name": self.combo_2d_video.currentText(),
+        })
+
+    def _jump_correction(self, direction):
+        """Move the playhead to the next or previous corrected frame."""
+        marks = sorted({int(c["frame"]) for _l, c in self._all_corrections()})
+        if not marks:
+            return
+        here = int(self.canvas_2d.current_frame)
+        later = [f for f in marks if f > here]
+        earlier = [f for f in marks if f < here]
+        target = (later[0] if later else marks[0]) if direction > 0 else \
+                 (earlier[-1] if earlier else marks[-1])
+        self.slider_2d_frame.setValue(target)
+
+    def _correction_busy(self):
+        """True while a re-track, a re-export or a full 2D track is running."""
+        for w in (self.correction_worker, self.worker_2d):
+            if w is not None and w.isRunning():
+                return True
+        return False
+
+    def _start_correction_worker(self, job):
+        self.btn_start_2d.setEnabled(False)
+        self.btn_stop_2d.setEnabled(True)
+        self.correction_worker = TrackCorrectionWorker(job)
+        self.correction_worker.log_signal.connect(self._append_log_2d)
+        self.correction_worker.progress_signal.connect(self._update_progress_2d)
+        self.correction_worker.finished_signal.connect(self._on_correction_finished)
+        self.correction_worker.start()
+        self._refresh_correction_ui()
+
+    def _on_correction_finished(self, success, message):
+        self.btn_start_2d.setEnabled(True)
+        self.btn_stop_2d.setEnabled(False)
+        worker = self.correction_worker
+        if success and worker is not None and worker.result is not None:
+            # The worker corrected a copy; adopt it, so the canvas and the next
+            # correction both work on the spliced numbers.
+            self._track_result = worker.result
+            self._push_result_to_canvas()
+            self.canvas_2d.update()
+        self._append_log_2d(message, OK if success else ERR)
+        if success and worker is not None and worker.job.get("mode") == "retrack":
+            self._append_log_2d(
+                "   The delivered files still hold the old positions — press Re-export 2D "
+                "when the track is how you want it.", TEXT_DIM)
+        self._refresh_correction_ui()
 
     def _update_video_status(self, video_name, status):
         for row in range(self.table.rowCount()):
@@ -1654,6 +2335,459 @@ class TrackerMainWindow(QMainWindow):
                     stat_item.setText(status)
                     stat_item.setForeground(QColor(ACCENT))
 
+
+    # =========================================================================
+    # SCENE SETUP: SCALE, GROUND AND ORIGIN  (roadmap 1.4)
+    #
+    # The artist sets all three by picking the solve's OWN 3D points on the 2D
+    # canvas of the same clip. Everything below works in COLMAP's world, which
+    # is where core.scene_transform and export_tools.colmap_pose_to start, and
+    # the transform is built with up=COLMAP_UP because COLMAP's y points down.
+    # =========================================================================
+    def _current_shot_name(self):
+        """The shot the 2D canvas is showing, which is the one scene setup works on."""
+        name = self.combo_2d_video.currentText()
+        return Path(name).stem if name else None
+
+    @staticmethod
+    def _read_ply_points(ply_path):
+        """
+        The solve's point cloud as (N, 3) in COLMAP's own world, or None.
+
+        points3D.ply is written for the DCCs, in the Nuke/USD Y-up basis
+        (export_tools.WORLD_BASES["nuke"] = diag(1, -1, -1)). That basis is its
+        own inverse, so flipping y and z again puts the points back in the frame
+        the cameras, the reprojection and scene_transform all work in.
+        """
+        try:
+            with open(ply_path, "r", encoding="utf-8", errors="replace") as fh:
+                count = 0
+                for line in fh:
+                    stripped = line.strip()
+                    if stripped.startswith("element vertex"):
+                        count = int(stripped.split()[-1])
+                    if stripped == "end_header":
+                        break
+                else:
+                    return None
+                rows = np.loadtxt(fh, usecols=(0, 1, 2),
+                                  max_rows=count or None, ndmin=2)
+        except Exception as e:
+            log.warning("could not read %s: %s", ply_path, e)
+            return None
+        if rows.size == 0:
+            return None
+        return rows.reshape(-1, 3) * np.array([1.0, -1.0, -1.0])
+
+    def _load_solve_for_shot(self, shot_name):
+        """
+        Load the newest solve for a shot into `self._solve`, or clear it.
+
+        Cameras and the per-frame poses come from camera_track.json; the points
+        come from points3D.ply beside it. Nothing here raises: a shot with no
+        solve, or with a half-written one, simply leaves the panel disabled with
+        a sentence saying so.
+        """
+        self._solve = None
+        if not shot_name:
+            return
+        track_json, folder = find_latest_output(
+            SCENES_DIR / shot_name, "3D_CAMERA_TRACK", "camera_track.json",
+            legacy_subdirs=("",))
+        if not track_json:
+            return
+        try:
+            import json
+            with open(track_json, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as e:
+            log.warning("could not read %s: %s", track_json, e)
+            return
+
+        images = data.get("images") or {}
+        # The solve's own timeline start, not the spin box: the frame numbers in
+        # this file were written with it, and the artist may have changed the
+        # box since. current_frame 0 is the plate's first frame either way.
+        start = int(data.get("timeline_start", 1) or 1)
+        by_frame = {}
+        for img in images.values():
+            try:
+                by_frame[int(img["frame"])] = img
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        points = self._read_ply_points(Path(folder) / "points3D.ply")
+        self._solve = {
+            "dir": Path(folder),
+            "json": data,
+            "cameras": data.get("cameras") or {},
+            "by_frame": by_frame,
+            "timeline_start": start,
+            "points": points,
+        }
+
+    def _solve_point_count(self):
+        pts = (self._solve or {}).get("points")
+        return 0 if pts is None else int(len(pts))
+
+    def _solved_image_for_frame(self, frame_idx):
+        """The solved camera sitting on the plate frame the 2D tab is showing, or None."""
+        if not self._solve:
+            return None
+        return self._solve["by_frame"].get(
+            int(self._solve["timeline_start"]) + int(frame_idx))
+
+    def _solve_camera(self, img):
+        """The intrinsics of a solved image. JSON keys are strings; ids are not."""
+        cams = self._solve["cameras"]
+        cam_id = img.get("camera_id")
+        return (cams.get(str(cam_id)) or cams.get(cam_id)
+                or (next(iter(cams.values())) if cams else None))
+
+    def _refresh_scene_setup(self):
+        """Enable or disable the Scene setup card and say why, then redraw it."""
+        enabled, reason = project_file.scene_setup_enabled(
+            (self._solve or {}).get("json"),
+            self._solve_point_count() if self._solve else None)
+        self.scene_setup_card.setEnabled(enabled)
+        if not enabled:
+            self._set_scene_pick_mode(None)
+            self.lbl_scene_points.setText(reason)
+        else:
+            # _update_scene_overlay replaces this the moment a picker is armed;
+            # until then the artist gets the size of what they are about to pick.
+            self.lbl_scene_points.setText(
+                "%d solved points from the %s solve. Arm a picker below to see them "
+                "on the plate." % (self._solve_point_count(), self._solve["dir"].name))
+        self._update_pick_labels()
+        self.lbl_scene_status.setText(self._scene_transform_summary())
+        self._update_scene_overlay()
+
+    def _update_pick_labels(self):
+        picks = self._scene_picks
+        self.lbl_scale_picks.setText("%d / 2" % len(picks["scale"]))
+        self.lbl_ground_picks.setText("%d / 3" % len(picks["ground"]))
+        self.lbl_origin_picks.setText("%d / 1" % len(picks["origin"]))
+
+    def _all_picked_indices(self):
+        """Every picked point, scale first, so the numbering on screen is stable."""
+        picks = self._scene_picks
+        return picks["scale"] + picks["ground"] + picks["origin"]
+
+    def _set_scene_pick_mode(self, mode):
+        """
+        Arm one of the three pickers, or None for off.
+
+        The three toggle buttons are mutually exclusive: a click has to mean one
+        thing, and an artist who forgot which picker was armed would silently
+        put floor points into the scale pair.
+        """
+        self._scene_pick_mode = mode
+        for name, btn in (("scale", self.btn_pick_scale),
+                          ("ground", self.btn_pick_ground),
+                          ("origin", self.btn_pick_origin)):
+            want = (name == mode)
+            if btn.isChecked() != want:
+                btn.blockSignals(True)
+                btn.setChecked(want)
+                btn.blockSignals(False)
+        self._update_scene_overlay()
+
+    def _on_scene_pick_toggled(self, which, checked):
+        self._set_scene_pick_mode(which if checked else None)
+        if checked:
+            # The points are picked on the plate, which lives on the other tab.
+            self.tabs.setCurrentWidget(self.tab_2d)
+            self._append_log_3d(
+                "Picking %s points: click the amber solved points on the 2D tab." % which,
+                ACCENT)
+
+    def _update_scene_overlay(self):
+        """Reproject the solve onto the frame in view, or take the overlay away."""
+        canvas = self.canvas_2d
+        if not self._scene_pick_mode or not self._solve or self._solve.get("points") is None:
+            canvas.scene_pick_active = False
+            canvas.show_solved_points = False
+            canvas.clear_solved_points()
+            return
+
+        canvas.scene_pick_active = True
+        canvas.show_solved_points = True
+        points = self._solve["points"]
+        img = self._solved_image_for_frame(canvas.current_frame)
+        if img is None:
+            canvas.clear_solved_points()
+            solved = sorted(self._solve["by_frame"])
+            nearest = ""
+            if solved:
+                start = int(self._solve["timeline_start"])
+                here = start + int(canvas.current_frame)
+                closest = min(solved, key=lambda f: abs(f - here))
+                nearest = "  Nearest solved frame: %d." % closest
+            self.lbl_scene_points.setText(
+                "%d solved points, but this frame has no solved camera, so they "
+                "cannot be drawn on it.%s" % (len(points), nearest))
+            return
+
+        cam = self._solve_camera(img)
+        if not cam:
+            canvas.clear_solved_points()
+            self.lbl_scene_points.setText("This solve carries no intrinsics for the frame in view.")
+            return
+        try:
+            xy, visible = project_solved_points(points, img["center"], img["R_world"], cam)
+        except Exception as e:
+            canvas.clear_solved_points()
+            self.lbl_scene_points.setText("Could not reproject the solved points: %s" % e)
+            return
+
+        canvas.set_solved_points(xy, visible, (cam.get("width"), cam.get("height")))
+        canvas.set_solved_selection(self._all_picked_indices())
+        self.lbl_scene_points.setText(
+            "%d solved points, %d on this frame. Click one to pick it."
+            % (len(points), int(np.count_nonzero(visible))))
+
+    def _on_solved_point_picked(self, index):
+        """A click landed on a reprojected point; file it under the armed picker."""
+        mode = self._scene_pick_mode
+        if not mode or not self._solve:
+            return
+        bucket = self._scene_picks[mode]
+        limit = {"scale": 2, "ground": None, "origin": 1}[mode]
+        if index in bucket:
+            bucket.remove(index)          # clicking a picked point unpicks it
+        else:
+            if limit is not None and len(bucket) >= limit:
+                # The newest pick wins rather than being ignored: the artist
+                # clicked it, so they meant it.
+                bucket.pop(0)
+            bucket.append(int(index))
+        self._update_pick_labels()
+        self.canvas_2d.set_solved_selection(self._all_picked_indices())
+        pt = self._solve["points"][int(index)]
+        self._append_log_3d(
+            "%s: %d point(s) picked  (last at %.3f, %.3f, %.3f in solve units)."
+            % (mode.capitalize(), len(bucket), pt[0], pt[1], pt[2]), TEXT_DIM)
+
+    def _clear_scene_picks(self):
+        for bucket in self._scene_picks.values():
+            del bucket[:]
+        self._update_pick_labels()
+        self.canvas_2d.set_solved_selection(())
+        self._append_log_3d("Cleared the picked points.", TEXT_DIM)
+
+    def _ground_points_for_build(self, notes):
+        """
+        The points a ground fit should be run on, or None with a note saying why not.
+
+        The auto plane is turned into three points ON that plane rather than
+        being fitted separately, so both routes go through the same
+        scene_transform.fit_ground and cannot drift apart.
+        """
+        picks = self._scene_picks["ground"]
+        points = self._solve["points"]
+        if self.chk_auto_ground.isChecked():
+            try:
+                from export_tools import detect_ground_plane_ransac
+                plane = detect_ground_plane_ransac(points)
+            except Exception as e:
+                notes.append("Ground not levelled: the auto plane fit failed (%s)." % e)
+                return None
+            if plane is None:
+                notes.append("Ground not levelled: no convincing plane in the point cloud - "
+                             "pick three points on the floor instead.")
+                return None
+            normal = plane.normal / (np.linalg.norm(plane.normal) or 1.0)
+            # Two directions inside the plane, from the world axis least like
+            # the normal, so the triangle is never degenerate.
+            helper = np.zeros(3)
+            helper[int(np.argmin(np.abs(normal)))] = 1.0
+            a = np.cross(normal, helper)
+            a /= (np.linalg.norm(a) or 1.0)
+            b = np.cross(normal, a)
+            return np.array([plane.centroid, plane.centroid + a, plane.centroid + b])
+        if len(picks) >= 3:
+            return points[picks]
+        if picks:
+            notes.append("Ground not levelled: it needs at least three points, %d picked."
+                         % len(picks))
+        return None
+
+    def _apply_scene_transform(self):
+        """Build the transform from what the panel holds, log it, and save it."""
+        if not self._solve or self._solve.get("points") is None:
+            self._append_log_3d("There is no solve loaded to build a scene transform from.", WARN)
+            return
+        points = self._solve["points"]
+        notes = []
+
+        # --- scale
+        scale_pair, real_metres = None, None
+        picks = self._scene_picks["scale"]
+        typed = project_file.to_metres(
+            self.spin_scale_distance.value(), self.combo_scale_unit.currentText())
+        if len(picks) == 2 and typed > 0:
+            scale_pair = (points[picks[0]], points[picks[1]])
+            real_metres = typed
+        elif len(picks) == 2:
+            notes.append("Scale not set: type the real distance between the two picked points.")
+        elif picks:
+            notes.append("Scale not set: it needs two points, %d picked." % len(picks))
+
+        # --- ground
+        ground_points = self._ground_points_for_build(notes)
+
+        # --- origin
+        origin_point = None
+        if self.chk_origin_under_camera.isChecked():
+            img = self._solved_image_for_frame(self.canvas_2d.current_frame)
+            if ground_points is None:
+                notes.append("Origin not moved: the ground under the camera needs a ground "
+                             "plane - pick three floor points or tick the auto plane.")
+            elif img is None:
+                notes.append("Origin not moved: the frame the 2D tab is showing has no "
+                             "solved camera.")
+            else:
+                # Work out where the camera stands once scale and levelling are
+                # applied, drop it onto the floor there, and hand `build` the
+                # ORIGINAL-space point that lands on it - which is what it wants.
+                base = scene_transform.build(
+                    points_for_ground=ground_points, scale_pair=scale_pair,
+                    real_distance=real_metres, up=scene_transform.COLMAP_UP, notes=[])
+                centre = scene_transform.apply_to_points(
+                    base, np.asarray(img["center"], dtype=float))
+                floor = scene_transform.apply_to_points(base, ground_points)
+                # With up=COLMAP_UP a levelled floor is a plane of constant y,
+                # so "under the camera" is the camera's x and z at the floor's y.
+                target = np.array([centre[0], float(np.mean(floor[:, 1])), centre[2]])
+                origin_point = scene_transform.apply_to_points(
+                    scene_transform.invert(base), target)
+        elif self._scene_picks["origin"]:
+            origin_point = points[self._scene_picks["origin"][0]]
+
+        if scale_pair is None and ground_points is None and origin_point is None:
+            self._append_log_3d(
+                "Nothing to apply yet: pick two points and type a distance for scale, "
+                "three for the ground, or one for the origin.", WARN)
+            for note in notes:
+                self._append_log_3d("   %s" % note, WARN)
+            return
+
+        try:
+            transform = scene_transform.build(
+                points_for_ground=ground_points,
+                scale_pair=scale_pair,
+                real_distance=real_metres,
+                origin_point=origin_point,
+                up=scene_transform.COLMAP_UP,
+                notes=notes)
+        except Exception as e:
+            self._append_log_3d("✖ Could not build the scene transform: %s" % e, ERR)
+            return
+
+        self._scene_transform = transform
+        scale = float(transform["scale"])
+        self._append_log_3d(
+            "✔ Scene transform applied: scale ×%.6f — one solve unit is now %.6f m."
+            % (scale, scale), OK)
+        if ground_points is not None and not any(n.startswith("Ground") for n in notes):
+            self._append_log_3d("   Ground levelled onto Y = 0.", OK)
+        if origin_point is not None:
+            self._append_log_3d("   Origin moved to the picked position.", OK)
+        for note in notes:
+            self._append_log_3d("   %s" % note, WARN)
+        self._append_log_3d(
+            "   Press Re-export This Solve to write a new export folder with it.", TEXT_DIM)
+
+        self.lbl_scene_status.setText(self._scene_transform_summary())
+        self._schedule_project_save()
+
+    def _reset_scene_transform(self):
+        self._scene_transform = None
+        self.lbl_scene_status.setText(self._scene_transform_summary())
+        self._append_log_3d(
+            "Scene transform cleared: the solve goes back to COLMAP's arbitrary "
+            "scale, tilt and origin.", ACCENT)
+        self._schedule_project_save()
+
+    def _scene_transform_summary(self):
+        """One line describing the stored transform, for the panel."""
+        transform = self._scene_transform
+        if not transform:
+            return "No scene transform: the solve is in COLMAP's own units."
+        try:
+            scale, rotation, translation = scene_transform.parts(transform)
+        except Exception:
+            return "The stored scene transform could not be read."
+        levelled = float(np.abs(rotation - np.eye(3)).max()) > 1e-9
+        moved = float(np.abs(translation).max()) > 1e-9
+        return "Scene transform: scale ×%.4f, ground %s, origin %s." % (
+            scale,
+            "levelled" if levelled else "as solved",
+            "moved" if moved else "as solved")
+
+    # -- Re-export ------------------------------------------------------------
+    def _reexport_current_solve(self):
+        """Write a new export folder from the existing solve, off the GUI thread."""
+        if self.reexport_worker is not None and self.reexport_worker.isRunning():
+            self._append_log_3d("A re-export is already running.", WARN)
+            return
+        shot = self._current_shot_name()
+        if not shot:
+            QMessageBox.warning(self, "No Shot Selected",
+                                "Select a clip first - re-export works on its existing solve.")
+            return
+        shot_dir = SCENES_DIR / shot
+        found, folder = find_latest_output(
+            shot_dir, "3D_CAMERA_TRACK", ["sparse/cameras.txt", "sparse/cameras.bin"],
+            legacy_subdirs=("",))
+        if not found:
+            QMessageBox.warning(
+                self, "No Solve Found",
+                "No solved COLMAP model was found for '%s'.\n\nRun 3D Camera Tracking first."
+                % shot)
+            return
+
+        options = {
+            "video_path": VIDEOS_DIR / self.combo_2d_video.currentText(),
+            "blender_path": self.txt_blender_path.text().strip() or None,
+            "fps": self.current_fps if self.current_fps and self.current_fps > 0 else None,
+            "start_frame": self.spin_start_frame_3d.value(),
+            "colmap_exe": COLMAP_EXE,
+            "frame_step": self.spin_step.value(),
+            "scene_transform": self._scene_transform,
+            "overscan": self._overscan_value(),
+            "write_undistort": bool(self.chk_write_undistort.isChecked()),
+            "pixel_aspect": float(self.spin_pixel_aspect.value()),
+        }
+        self._append_log_3d(
+            "▶ Re-exporting '%s' from %s — scene transform %s, overscan %d%%, "
+            "undistorted plate %s, pixel aspect %.4f."
+            % (shot, Path(folder).name,
+               "set" if self._scene_transform else "none",
+               int(round(options["overscan"] * 100)),
+               "yes" if options["write_undistort"] else "no",
+               options["pixel_aspect"]), ACCENT)
+
+        self.btn_reexport.setEnabled(False)
+        self.reexport_worker = ReExportWorker(folder, shot_dir, options)
+        self.reexport_worker.log_signal.connect(self._append_log_3d)
+        self.reexport_worker.finished_signal.connect(self._on_reexport_finished)
+        self.reexport_worker.start()
+
+    def _overscan_value(self):
+        """The overscan spin box as the fraction the exporters take."""
+        return max(0.0, min(project_file.MAX_OVERSCAN, self.spin_overscan.value() / 100.0))
+
+    def _on_reexport_finished(self, success, message):
+        self.btn_reexport.setEnabled(True)
+        self._append_log_3d(message, OK if success else ERR)
+        if success:
+            # The media table's status column and the panel both read the newest
+            # output, so both have to be told it moved.
+            self._refresh_videos()
+            self._load_solve_for_shot(self._current_shot_name())
+            self._refresh_scene_setup()
 
     # =========================================================================
     # PER-SHOT PROJECT FILE
@@ -1686,6 +2820,7 @@ class TrackerMainWindow(QMainWindow):
             "min_confidence": float(self.spin_min_conf.value()),
             "grid_size": int(self.spin_grid_size.value()),
             "auto_chunk": bool(self.chk_vram_chunk.isChecked()),
+            "track_backwards": bool(self.chk_track_backwards.isChecked()),
         }
         data["settings_3d"] = {
             "preset": self.preset_combo.currentText(),
@@ -1701,7 +2836,13 @@ class TrackerMainWindow(QMainWindow):
             "caspar_ba": bool(self.chk_caspar_ba.isChecked()),
             "generate_mesh": bool(self.chk_mesh_gen.isChecked()),
             "blender_path": self.txt_blender_path.text().strip(),
+            "write_undistort": bool(self.chk_write_undistort.isChecked()),
+            "overscan": self._overscan_value(),
+            "pixel_aspect": float(self.spin_pixel_aspect.value()),
         }
+        # Scale, ground and origin live at the top level, not in settings_3d:
+        # they describe the shot's world, not a control on a tab.
+        data["scene_transform"] = self._scene_transform
         return data
 
     def _apply_project(self, data):
@@ -1746,6 +2887,11 @@ class TrackerMainWindow(QMainWindow):
             quiet_check(self.chk_gpu, s3.get("use_gpu", True))
             quiet_check(self.chk_caspar_ba, s3.get("caspar_ba", True))
             quiet_check(self.chk_mesh_gen, s3.get("generate_mesh", False))
+            quiet_check(self.chk_write_undistort, s3.get("write_undistort", False))
+            quiet(self.spin_overscan, int(round(float(s3.get("overscan", 0.0)) * 100)))
+            # Pixel aspect is set by _apply_pixel_aspect_for_clip, for the same
+            # reason the frame rate is: a video file's own value wins over a
+            # saved one, and only a sequence's is the artist's to keep.
             blender = (s3.get("blender_path") or "").strip()
             if blender:
                 self.txt_blender_path.blockSignals(True)
@@ -1756,8 +2902,13 @@ class TrackerMainWindow(QMainWindow):
             combo_text(self.combo_2d_model, s2.get("model"))
             combo_text(self.combo_2d_res, s2.get("resolution"))
             quiet_check(self.chk_vram_chunk, s2.get("auto_chunk", True))
+            quiet_check(self.chk_track_backwards, s2.get("track_backwards", False))
 
             self._set_timeline_start(int(data.get("timeline_start", 1)))
+
+            # The scene transform is the shot's, not a widget's: it only has to
+            # come back into the window state the panel and the exports read.
+            self._scene_transform = data.get("scene_transform")
 
             self.canvas_2d.layers_from_config(
                 data.get("layers"),
@@ -1844,6 +2995,46 @@ class TrackerMainWindow(QMainWindow):
             f"Frame rate {self.current_fps:.3f} fps, from {source} — used for playback, "
             f"timecode and every export.", TEXT_DIM)
 
+    def _apply_pixel_aspect_for_clip(self, video_path, saved_aspect=None):
+        """
+        Decide the shot's pixel aspect and put it in the field (roadmap 1.6).
+
+        A video file can carry a sample aspect ratio, so that is read from the
+        file when the probe knows how; an image sequence carries nothing, so the
+        saved project wins and the field stays the artist's. The field is left
+        editable either way - a wrapper that claims square pixels on an
+        anamorphic plate is common enough that locking the artist out would be
+        worse than trusting them.
+        """
+        video_path = Path(video_path)
+        aspect, source = 1.0, "the default"
+        if saved_aspect:
+            try:
+                if float(saved_aspect) > 0:
+                    aspect, source = float(saved_aspect), "the saved project"
+            except (TypeError, ValueError):
+                pass
+
+        if video_path.is_file():
+            try:
+                probed = float(media_info.probe_pixel_aspect(video_path))
+            except Exception as e:
+                log.warning("pixel aspect probe failed for %s: %s", video_path.name, e)
+                probed = 0.0
+            # A probe that found a real squeeze is the best answer there is. A
+            # probe that came back square may only mean the file says nothing,
+            # so it must not quietly undo a value the artist typed for this shot.
+            if probed > 0 and abs(probed - 1.0) > 1e-6:
+                aspect, source = probed, "the file"
+
+        self.spin_pixel_aspect.blockSignals(True)
+        self.spin_pixel_aspect.setValue(aspect)
+        self.spin_pixel_aspect.blockSignals(False)
+        if abs(aspect - 1.0) > 1e-6:
+            self._append_log_3d(
+                "Pixel aspect %.4f, from %s — the plate is squeezed, so the solve and "
+                "the exports are corrected for it." % (aspect, source), ACCENT)
+
     def _on_fps_changed(self, value):
         """The artist typed a rate for a sequence."""
         fps = float(value) if value and float(value) > 0 else 24.0
@@ -1898,7 +3089,8 @@ class TrackerMainWindow(QMainWindow):
 
     def closeEvent(self, event):
         running = [(name, w) for name, w in (("3D solve", self.worker_3d),
-                                             ("2D track", self.worker_2d))
+                                             ("2D track", self.worker_2d),
+                                             ("2D correction", self.correction_worker))
                    if w is not None and w.isRunning()]
         if running:
             r = QMessageBox.question(
@@ -1930,6 +3122,8 @@ class TrackerMainWindow(QMainWindow):
         self.vram_timer.stop()
         self._settings_timer.stop()
         self._project_timer.stop()
+        if self.update_worker is not None:
+            self.update_worker.wait(3500)
 
         for name, w in running:
             self._status("Cancelling %s..." % name)
@@ -1943,7 +3137,7 @@ class TrackerMainWindow(QMainWindow):
             if not w.wait(15000):
                 log.warning("%s worker did not stop within 15 s; exiting anyway", name)
 
-        for w in (self.frame_extractor, self.copy_worker):
+        for w in (self.frame_extractor, self.copy_worker, self.reexport_worker):
             if w is not None and w.isRunning():
                 if hasattr(w, "cancel"):
                     try:
@@ -1982,9 +3176,17 @@ class TrackerMainWindow(QMainWindow):
         for w in (self.spin_tri, self.spin_overlap, self.spin_inliers, self.spin_step,
                   self.spin_min_conf):
             w.valueChanged.connect(lambda _v: p())
+        for w in (self.spin_overscan, self.spin_pixel_aspect):
+            w.valueChanged.connect(lambda _v: p())
         for w in (self.chk_single_cam, self.chk_ba_refine, self.chk_gpu,
-                  self.chk_caspar_ba, self.chk_mesh_gen, self.chk_vram_chunk):
+                  self.chk_caspar_ba, self.chk_mesh_gen, self.chk_vram_chunk,
+                  self.chk_write_undistort, self.chk_track_backwards):
             w.toggled.connect(lambda _b: p())
+        # Scene setup: a pick is not saved (it is a step towards a transform),
+        # but the frame in view decides which camera the points are drawn
+        # through, so the overlay follows the playhead.
+        self.canvas_2d.solved_point_picked.connect(self._on_solved_point_picked)
+        self.slider_2d_frame.valueChanged.connect(lambda _v: self._update_scene_overlay())
         # Both Timeline start boxes describe the same thing, so either one
         # moving carries the other with it before the project is written.
         for w in (self.spin_start_frame_2d, self.spin_start_frame_3d):
@@ -1998,6 +3200,24 @@ class TrackerMainWindow(QMainWindow):
         if not self._closing:
             self._settings_timer.start()
 
+    def _on_update_pref(self, on):
+        self._check_updates = bool(on)
+        self._schedule_settings_save()
+
+    def _start_update_check(self):
+        if not self._check_updates or self.update_worker is not None:
+            return
+        self.update_worker = UpdateCheckWorker()
+        self.update_worker.found_signal.connect(self._on_update_found)
+        self.update_worker.start()
+
+    def _on_update_found(self, info):
+        self.lbl_update.setText(
+            'Version %s is available (you have %s) - '
+            '<a href="%s" style="color:%s">release notes</a>'
+            % (info.get("tag", "?"), display_version(), info.get("url", ""), ACCENT))
+        self.update_banner.setVisible(True)
+
     def _save_settings(self):
         st = self.settings
         try:
@@ -2009,6 +3229,7 @@ class TrackerMainWindow(QMainWindow):
             # one, so the last one they typed is worth remembering app-wide.
             st.setValue("track2d/last_fps", float(self._last_user_fps))
             st.setValue("media/last_clip", self.combo_2d_video.currentText() or self._last_clip)
+            st.setValue("updates/check_on_start", bool(self._check_updates))
             st.sync()
         except Exception as e:
             log.warning("saving settings failed: %s", e)
@@ -2036,6 +3257,9 @@ class TrackerMainWindow(QMainWindow):
 
             last_fps = val("track2d/last_fps", 24.0, float)
             self._last_user_fps = last_fps if last_fps and last_fps > 0 else 24.0
+
+            self._check_updates = val("updates/check_on_start", False, bool)
+            self.act_updates.setChecked(self._check_updates)
 
             # Everything else the solver tabs hold is per shot and comes from
             # 04 SCENES/<shot>/project.json when the clip is selected.

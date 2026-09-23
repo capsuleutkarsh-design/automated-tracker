@@ -34,6 +34,10 @@ def default_settings_2d():
         "min_confidence": 0.70,
         "grid_size": 10,
         "auto_chunk": True,
+        # Whole-layer backwards tracking (2.1). Off by default, because most
+        # shots read best from the head; it is per shot because it is a
+        # property of the plate, not a preference.
+        "track_backwards": False,
     }
 
 
@@ -53,7 +57,67 @@ def default_settings_3d():
         "caspar_ba": True,
         "generate_mesh": False,
         "blender_path": "",
+        # Lens delivery (1.5) and the plate's pixel shape (1.6). A file written
+        # before these existed simply lacks them and migrate() fills them in,
+        # which is why the defaults are the old behaviour: no undistorted plate,
+        # no overscan, square pixels.
+        "write_undistort": False,
+        "overscan": 0.0,
+        "pixel_aspect": 1.0,
     }
+
+
+# How much overscan the panel will accept. Undistorting a strong barrel lens
+# (k1 around -0.3) pushes the corners of the plate about 40 % outside the frame,
+# so anything less than half again would lose them - see lens.pinhole_of.
+MAX_OVERSCAN = 0.5
+
+# What the artist can type a measured distance in, as metres. The solve is
+# scaled in metres because that is what every DCC's unit defaults to, so the
+# unit dropdown is purely a convenience at the point of typing.
+SCALE_UNITS = {
+    "metres": 1.0,
+    "centimetres": 0.01,
+    "feet": 0.3048,
+    "inches": 0.0254,
+}
+
+
+def to_metres(value, unit):
+    """
+    A distance the artist typed, in metres.
+
+    An unknown unit is treated as metres rather than raising: the dropdown can
+    only offer what is in SCALE_UNITS, and a project file written by a newer
+    build must not stop this one opening the shot.
+    """
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return value * SCALE_UNITS.get(str(unit).strip().lower(), 1.0)
+
+
+def scene_setup_enabled(camera_track, point_count=None):
+    """
+    Whether the Scene setup panel can be used on this shot, and why not.
+
+    Returns (enabled, reason). `camera_track` is the parsed camera_track.json of
+    the newest solve, or None when there is no solve; `point_count` is how many
+    3D points were loaded, or None when they have not been looked at yet.
+
+    Pure so the rule can be unit-tested without a window: the panel picks solved
+    points, so it needs a solve, intrinsics to project them with, and points to
+    pick. Each failure carries the sentence the artist is shown - the roadmap's
+    rule is that they never have to guess why something is greyed out.
+    """
+    if not isinstance(camera_track, dict) or not camera_track.get("images"):
+        return False, "Solve this shot first - scene setup works on the solved points."
+    if not camera_track.get("cameras"):
+        return False, "The solve carries no camera intrinsics, so its points cannot be drawn."
+    if point_count is not None and int(point_count) <= 0:
+        return False, "The solve produced no 3D points to pick."
+    return True, ""
 
 
 def default_project():
@@ -69,8 +133,9 @@ def default_project():
         "layers": [],
         "settings_2d": default_settings_2d(),
         "settings_3d": default_settings_3d(),
-        # Reserved for roadmap 1.4 (scale, ground and origin). Written as null
-        # from the start so a file saved today loads unchanged once it lands.
+        # Scale, ground and origin (1.4), in scene_transform's storage form -
+        # {"scale", "rotation", "translation"} - or null for "leave the solve
+        # in COLMAP's own arbitrary world".
         "scene_transform": None,
     }
 
@@ -161,6 +226,28 @@ def migrate(data):
 
     if not isinstance(out.get("layers"), list):
         out["layers"] = []
+
+    # The delivery settings are handed straight to the exporters, so a value
+    # edited by hand into the file must not reach them as a string or as
+    # something outside the range the maths can honour.
+    s3 = out["settings_3d"]
+    s3["write_undistort"] = bool(s3.get("write_undistort"))
+    try:
+        s3["overscan"] = min(MAX_OVERSCAN, max(0.0, float(s3.get("overscan", 0.0))))
+    except (TypeError, ValueError):
+        s3["overscan"] = 0.0
+    try:
+        pa = float(s3.get("pixel_aspect", 1.0))
+        s3["pixel_aspect"] = pa if pa > 0.0 else 1.0
+    except (TypeError, ValueError):
+        s3["pixel_aspect"] = 1.0
+
+    # A scene transform that is not the three keys the exporters read is worth
+    # dropping rather than passing on: a half-written one would silently move
+    # the camera somewhere nobody asked for.
+    st = out.get("scene_transform")
+    if not (isinstance(st, dict) and "scale" in st and "rotation" in st and "translation" in st):
+        out["scene_transform"] = None
 
     try:
         out["fps"] = float(out.get("fps") or 0) or 24.0

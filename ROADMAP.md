@@ -1,5 +1,28 @@
 # Automated Tracker — roadmap
 
+**Progress (2026-09-23).** Phase 1 is complete: per-shot project files, the
+frame-rate control, registering the frames COLMAP skipped, scale/ground/origin,
+lens distortion delivery and pixel aspect. From phase 2: track correction and
+confidence in Nuke's error column (2.1, 2.2) and the update check (2.6). From
+phase 3: the DCC verification scripts and the continuous test run (3.2, 3.4).
+Remaining: 2.3 per-shot batch settings, 2.4 quiet logs, 2.5 undo and shortcuts,
+3.1 the window split and 3.3 the installer trim.
+
+Three things were found by testing rather than by reading, and fixed on the way
+through. A solve at Frame Step above 1 put camera keys on consecutive frames
+and faked the frame rate to hide it, disagreeing with the 2D tab about the same
+plate. Pixel aspect was applied twice, because the extractor de-squeezes the
+frames and the exporter then told Nuke to squeeze them again. And selecting a
+shot that had never been saved left the previous shot's settings in the window,
+so a Frame Step of 3 set for a long take silently followed you onto the next
+one, as did its layers and masks.
+
+Still unconfirmed inside the applications themselves, because neither Nuke nor
+Blender is installed here: the sign of Nuke's window translate, whether its
+`.chan` importer tolerates our two comment lines, and what Blender calls the
+point cloud's colour attribute. `tools/verify_nuke.py` and
+`tools/verify_blender.py` answer all three in one run each.
+
 Written 2026-09-22 after the 1.1.1 review pass. Three phases, in the order they
 should be built. Each item says what it is for, how it will be built in this
 codebase, which files it touches, how it will be tested, and what "done" means.
@@ -170,16 +193,34 @@ shot and redistorting through the map restores the original frame.
 the pipeline knows about non-square pixels.
 
 **Design.** Pixel aspect field on the 3D tab, auto-filled from ffprobe's
-sample aspect ratio for videos, editable for sequences, saved per shot. If it
-is not 1.0, frames are de-squeezed at extraction (ffmpeg scale) so COLMAP sees
-square pixels, and the exports carry the value: Nuke Read `pixel_aspect`,
-Camera `haperture` adjusted, Blender `pixel_aspect_x`, JSON field.
+sample aspect ratio for videos, editable for sequences, saved per shot.
 
-**Files.** `core/media_info.py` (SAR probe), `core/workers.py` (extraction),
-`export_tools.py`, `gui/tab_3d.py`, `core/project.py`.
+The rule is: de-squeeze exactly once, before the solve, and treat everything
+downstream as square. The first draft of this said the exports should carry the
+aspect instead (Nuke Read `pixel_aspect`, an adjusted `haperture`, Blender
+`pixel_aspect_x`), which was wrong: the extractor already de-squeezes, so the
+plate the scripts point at has square pixels and telling Nuke to squeeze it
+again would squeeze it twice. A camera solved on square pixels is only valid
+against square pixels, and the failure from getting this wrong is a subtle
+horizontal drift rather than an obvious error.
 
-**Tests.** A 2:1 SAR probe; extraction command includes the scale; Nuke Read
-carries `pixel_aspect 2`.
+So when the aspect is not 1.0 the frames go through FFmpeg's scale filter on
+the way into `images/` (movies and numbered image sequences alike), the exports
+point at those de-squeezed frames rather than the artist's own squeezed plate,
+and no aspect is written into any script. The source aspect and a
+`plate_desqueezed` flag stay in `camera_track.json` as information, and the log
+says which plate the scripts use and why. A squeezed sequence whose files are
+not numbered is refused with a renumber-or-use-the-movie message, because
+copying it would quietly produce a lens wrong in one axis.
+
+**Files.** `core/media_info.py` (SAR probe), `core/workers.py` (extraction and
+sequence import), `export_tools.py`, `gui/tab_3d.py`, `core/project.py`.
+
+**Tests.** A 2:1 SAR probe; the extraction command carries the scale filter for
+both a movie and a numbered sequence; a square sequence is still copied; the
+Read points at the de-squeezed frames when squeezed and at the artist's own
+sequence when not; no aspect knob in any script; a square shot's exports are
+byte-identical to before.
 
 **Done when** a squeezed test plate (made with ffmpeg from the sample) solves
 and lines up in Nuke with the correct aspect.
