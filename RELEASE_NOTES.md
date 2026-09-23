@@ -1,4 +1,4 @@
-# Automated Tracker 1.1.1
+# Automated Tracker 1.2.0
 
 2D point tracking with Meta CoTracker3 and 3D camera solves with COLMAP, in one
 Windows desktop app, with exports for Nuke, After Effects, Blender and USD.
@@ -6,92 +6,110 @@ Everything is bundled; nothing is downloaded while the app runs.
 
 Website: <https://capsuleutkarsh-design.github.io/automated-tracker/>
 
-## What changed in 1.1.1
+## Read this before using it on real work
 
-A full review pass. Every export now lands on the plate's real frame numbers,
-the solver no longer hands you a two-frame camera, and the app tells you when
-something goes wrong instead of going quiet.
+The exported cameras have never been opened in Nuke or Blender. The conventions
+they are written to were corrected and unit-tested against COLMAP's own
+projections, but only running them in those applications proves it. Before
+trusting a shot to this tool, track something you have already solved
+elsewhere, import the camera, stick a card on a feature and scrub. If it slides
+or the scene lies on its side, run `tools/verify_nuke.py` from Nuke's Script
+Editor or `tools/verify_blender.py` from Blender; both print a report naming
+what is wrong.
 
-**Frame numbers you can trust.** A plate numbered from 1001 (or any Timeline
-Start) now comes back on 1001 in every format: 3D keys are anchored on frame 1
-even when COLMAP skips the first frames, the Nuke Read node carries a frame
-offset and the plate's real extension, After Effects and roto keys subtract
-Timeline Start, and image-sequence folders are previewed and scrubbed directly
-in the 2D tab.
+There is also no per-tracker error readout yet, so a solve that looks plausible
+cannot yet be told from a good one except by eye.
 
-**3D exports fixed for each package.** Nuke scenes are Y-up (they used to lie
-on their side), the USD camera rotation is corrected, `.chan` carries vertical
-FOV, the lens centre shift is written in Nuke's normalised units, and every
-writer shares one pose conversion so they cannot drift apart again.
+## What changed in 1.2.0
 
-**Solver.** When the first COLMAP pass registers too few frames it retries with
-a wide-baseline initial pair, then a relaxed pass, and keeps the best. On the
-sample dolly shot this went from 2 of 60 frames to 60 of 60. A solve covering
-under half the shot is refused with a plain explanation instead of being
-reported as done. Lens models that COLMAP does not have were removed from the
-list. Changing Frame Step invalidates the extracted-frame cache.
+**A shot is now a shot.** Layers, masks, points, the in and out range, timeline
+start, frame rate, pixel aspect and both tabs' settings are saved per shot in
+`04 SCENES/<shot>/project.json` and come back when you select the clip. A batch
+solve uses each shot's own settings rather than whatever is on screen, and says
+so before it starts. Selecting a shot that has never been saved starts from the
+defaults, so one shot's frame step no longer follows you onto the next.
 
-**2D tracker.** GPU chunking budgets the model's real working resolution (4K
-no longer collapses to eight-frame chunks), query frames are re-clamped after
-an out-of-memory retry and seeded from the frame you clicked, animated masks
-respect the In point, the jump filter anchors on first visibility and scales
-with resolution, corner pin is an explicit layer mode with correct corner
-order, Del removes a keyframe (Shift+Del the mask), cancel works mid-track,
-frames are resized on load, and the filters and overlay are vectorised.
+**Scale, ground and origin.** After a solve, the solved points are drawn on the
+plate. Pick two and type the real distance to set scale, pick three or more for
+the floor, pick one for the origin. The transform is applied to every export,
+and a Re-export button rewrites them without solving again.
 
-**App.** Crashes write a log under `%LOCALAPPDATA%\AutomatedTracker\logs` and
-show a dialog, closing during a job asks first and cancels cleanly, settings
-persist between launches, thumbnails are keyed by content, a single frame
-extractor runs at a time, and the hardware monitor stops when idle.
+**Lens distortion delivery.** Optionally write an undistorted plate, a matching
+pinhole camera and undistort and redistort STMaps as 32-bit float EXR, with
+overscan up to 50 percent, wired into the Nuke script ready for comp.
 
-**Build.** One version source, installer upgrades clean out the old runtime,
-the runtime bundle drops build-only packages and the unused 228 MB ffplay, and
-a 105-test suite plus a headless end-to-end run guard the above.
+**Fixing a track that drifts.** The last 2D result is loaded back and drawn on
+the canvas. Drag a point to its right place on any frame, then re-track that
+one point forward, or forward and backward, and the result is spliced in.
+Layers can be tracked from the last frame first. Nuke's Tracker4 error column
+now carries one minus the confidence per frame, so a weak section shows up in
+the curve editor.
+
+**Undo and a keyboard scheme.** Every canvas edit is undoable. Space, J, K, L,
+arrows, Home and End, I and O for the range, comma and full stop for mask
+keyframes. Press F1 for the list.
+
+**Solves that used to fail.** Video hands COLMAP adjacent frames with almost no
+parallax, so a dolly shot could register two frames out of sixty and still be
+reported as finished. The solver now retries with a wide-baseline initial pair,
+registers the frames it missed afterwards, and refuses to export a camera
+covering less than half the shot. On the sample footage this went from 2 of 60
+frames to 60 of 60.
+
+**Frame numbers.** A solve at Frame Step above 1 used to put camera keys on
+consecutive frames and fake the frame rate to hide it. Keys now land every Nth
+frame across the plate's real range at its own rate. Pixel aspect was applied
+twice, once by the extractor and again by the exporter; the rule is now to
+de-squeeze once, before the solve, and treat everything downstream as square.
+
+**About a gigabyte smaller.** CoTracker is transformer-heavy and its small
+convolutional backbone gains nothing from cuDNN: over a 200-frame grid at 720p,
+9.87 seconds and 10.7 GB peak VRAM with cuDNN against 9.91 seconds and 8.8 GB
+without. So cuDNN is off, which frees nearly 2 GB of VRAM for longer chunks and
+lets the build drop 643 MB that can then never be reached. Together with the
+recurrent engines, the multi-GPU solver, the profiler interface and some
+duplicated tools, the frozen build went from 3.89 GB to 2.81 GB.
+
+**Also:** an opt-in check for newer releases, quieter logs with the solver's own
+chatter kept to the log file, crash reports written to
+`%LOCALAPPDATA%\AutomatedTracker\logs`, and 431 automated tests where 1.1.0 had
+none.
 
 ## Download
 
-There are two ways to get it. Both come from the files attached to this release.
-
 ### Installer (recommended)
 
-Download **all three** files into one folder, then run the exe. The installer
-is split because the bundled AI model and PyTorch runtime are larger than a
-single Windows installer can hold. The exe on its own installs nothing.
+Download both files into one folder and run the exe. The exe alone installs
+nothing.
 
 | File | Size | SHA-256 |
 |---|---|---|
-| `AutomatedTracker_Setup_1.1.1.exe` | 2.4 MB | `5b100ed70aeaf97c8de9b1bddc73ffc0ba66a78d84baed495793c60a7ad148ca` |
-| `AutomatedTracker_Setup_1.1.1-1.bin` | 1.90 GB | `44629a07b92315d0df9481792f6f9e4373b338bb2cbaeb17ff6c364811f64990` |
-| `AutomatedTracker_Setup_1.1.1-2.bin` | 206 MB | `7bb43c7da193c085a999863e001750352ad0df485a70c92886cc35a515818c45` |
+| `AutomatedTracker_Setup_1.2.0.exe` | 2.3 MB | `9db818408f9034f5ff7008137ff5daee9d300e14f99a2bb41c1e856de7b3ac8c` |
+| `AutomatedTracker_Setup_1.2.0-1.bin` | 1.53 GB | `44005368346f4f7a753866438ea23540653378f1c2e22e175e0bb0382515a2b3` |
 
-Setup asks for administrator rights once because it installs to Program Files.
-It needs about 9 GB of disk. Installing over 1.1.0 is fine; the old runtime is
-removed first.
+Setup asks for administrator rights once. Installing over an earlier version is
+fine; the old runtime is removed first.
 
 ### From source
 
-Clone the repository, then run `SETUP.bat` once. It downloads the runtime
-bundle below from this release, verifies the checksums and unpacks it beside
-the code, using only tools that ship with Windows. Then start the app with
-`LAUNCH_UI.bat`. The runtime bundle is unchanged from 1.1.0; the same three
-files are attached here again so `SETUP.bat` finds them on this release.
+Clone the repository and run `SETUP.bat` once. It downloads the runtime below
+from this release, checks it and unpacks it beside the code, then start the app
+with `LAUNCH_UI.bat`.
 
 | File | Size | SHA-256 |
 |---|---|---|
 | `runtime.parts.txt` | 204 B | part list read by `SETUP.bat` |
-| `runtime_1.1.0_part01.zip` | 1.83 GB | `ed979bc2f6ea0443004062778a4fe73106393970ffa4465e826e86771e906fb0` |
-| `runtime_1.1.0_part02.zip` | 1.63 GB | `933fb43bb00d578cfa0eb1c2338b04caf660f15e59ad9b99f910e4b9811d072b` |
+| `runtime_1.2.0_part01.zip` | 1.19 GB | `46049841aca5272db1affeab6da505c9f412c1a9a35dd7cfd75cc2b1a46da9f9` |
+| `runtime_1.2.0_part02.zip` | 1.15 GB | `4ad18a19c10c588009bacde1b7e39f9705bb1504f7313d1597556ef4bf52857a` |
 
-Clone into a short path such as `C:\automated-tracker`. Deep folders can push
-files inside the runtime past Windows' 260-character path limit.
+Clone into a short path such as `C:\automated-tracker`; deep folders can push
+files inside the runtime past Windows' 260-character limit.
 
 ## Requirements
 
 - Windows 10 or 11, 64-bit
-- NVIDIA GPU with CUDA recommended. Tracking and solving fall back to the CPU
-  without one.
-- About 9 GB free for the install, plus space for frame caches next to your
-  footage.
+- NVIDIA GPU with CUDA recommended; both engines fall back to the CPU
+- About 6 GB free for the install
 
 ## Licences
 
@@ -101,8 +119,10 @@ under its own licence, included in the install.
 
 ---
 
-## 1.1.0 (2026-09-22)
+## 1.1.1
 
-First packaged release: CoTracker3 2D tab, COLMAP 3D tab, exports for Nuke,
-After Effects, Blender and USD, Timeline Start control, self-test, installer
-split into `.bin` slices, runtime bundle for source checkouts.
+Frame numbers, export conventions and crash handling. Superseded by 1.2.0.
+
+## 1.1.0
+
+First packaged release.
