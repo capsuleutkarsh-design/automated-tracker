@@ -75,6 +75,55 @@ chatter kept to the log file, crash reports written to
 `%LOCALAPPDATA%\AutomatedTracker\logs`, and 431 automated tests where 1.1.0 had
 none.
 
+## If you used 1.1.0 or earlier, read this
+
+Two things that looked like the tool not working were bugs, and both are fixed.
+It is worth re-running a shot that disappointed you.
+
+**The 2D track came back almost empty.** On a large frame this was close to
+guaranteed. The old code decided how many frames fitted in the GPU from the
+resolution of your plate, but the model resizes every chunk to its own fixed
+working size, so it was measuring the wrong thing. On a 2560x1440 clip at
+Original or 1080p it concluded almost nothing fitted and dropped to eight-frame
+windows on a model that wants sixty. Quality collapses at that size, the points
+wander, and two culling bugs then threw most of them away: the filter judged
+every track from frame 1 even when the point was not visible there, and the
+"this point jumped too far" limit was a fixed pixel count, far too tight on a
+big frame. All three are fixed. Run the same clip at the same settings and you
+should get tracks across the grid, with no warning that your card is too small.
+
+**The 3D solve showed a point cloud and dozens of cameras instead of one moving
+camera.** That is COLMAP's own viewer, which the "Open COLMAP 3D Viewport" menu
+item opens, and it draws one camera frustum per solved frame the way a
+photogrammetry tool does. It is a sign the solve worked. Your moving camera is
+in the exported files: `import_to_blender.py`, `camera_track_nuke.nk`,
+`camera_track.chan` and `camera_track.usda` each contain a single animated
+camera.
+
+**A dolly or push-in shot solved only a couple of frames and still said it
+finished.** Video hands COLMAP neighbouring frames with almost no parallax, so
+its first attempt at a starting pair triangulates nothing. The solver now
+retries with a wide-baseline pair, registers the frames it missed afterwards,
+and refuses to export a camera covering less than half the shot. On the sample
+footage this took a solve from 2 frames out of 60 to 60 out of 60.
+
+## Privacy and offline use
+
+The application makes exactly one network request, and only if you ask it to:
+the opt-in update check in the Help menu, which reads GitHub's releases API and
+downloads nothing. It is off by default.
+
+Everything else is local. The AI model loads from the checkpoint bundled in the
+install, by path, with no download fallback. COLMAP, FFmpeg and PyTorch run as
+local processes on local files. There is no telemetry and no crash reporting
+service, and the whole pipeline works with the machine disconnected.
+
+What it writes: solves and exports into `04 SCENES` beside your footage, and a
+rotating log, thumbnails and any crash reports under
+`%LOCALAPPDATA%\AutomatedTracker`. Note that logs and crash reports contain file
+paths and clip names, so strip them before sending one anywhere if the job is
+covered by an NDA.
+
 ## Download
 
 ### Installer (recommended)
