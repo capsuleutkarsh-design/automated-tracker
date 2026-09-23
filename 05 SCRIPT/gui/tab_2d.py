@@ -8,70 +8,32 @@ beneath it, then the console and run controls.
 The transport and roto controls are grouped into labelled clusters instead of
 one long undifferentiated run of buttons.
 
-Every widget keeps the attribute name tracker_gui.py expects.
+Built against the AppContext, not the window: every widget is registered
+through `ctx.ui` under the name tracker_gui.py, the tests and the headless
+scripts already use, and every button runs a named method on `ctx` or on one of
+the panels it carries. gui/context.py documents what that allows.
+
+The layer card, the transport bar and the Keys and Range clusters are owned by
+gui/layer_panel.py and gui/player.py; this file only decides where they sit.
 """
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
     QSpinBox, QDoubleSpinBox, QCheckBox, QPushButton, QTextEdit,
-    QProgressBar, QRadioButton, QSlider, QListWidget, QSplitter,
+    QProgressBar, QRadioButton, QSplitter,
     QSizePolicy,
 )
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPainter, QPen, QColor
 
 from gui.canvas import VideoPointPickerCanvas
-from gui.theme import OK
 from gui.ui_kit import (
     tame_combos, scrollable_strip,
     card, form_row, button_row, inspector_scroll, make_button,
-    strip, divider,
+    strip, divider, group_label,
 )
 
 
-def _cluster_label(text):
-    lbl = QLabel(text)
-    lbl.setObjectName("sectionTitle")
-    return lbl
-
-
-class MarkedSlider(QSlider):
-    """
-    The transport slider, with a tick on every frame the artist has corrected.
-
-    A correction is a decision about one frame out of several hundred, and
-    scrubbing to find it again is the kind of hunting the tool exists to
-    remove - so the frames that carry one are drawn straight onto the
-    timeline. Qt's own tick marks are evenly spaced, so these are painted here.
-    """
-
-    def __init__(self, orientation, parent=None):
-        super().__init__(orientation, parent)
-        self.marks = ()
-
-    def set_marks(self, frames):
-        """Which frame indices to mark. Repaints only when the set changed."""
-        marks = tuple(sorted({int(f) for f in (frames or ())}))
-        if marks != self.marks:
-            self.marks = marks
-            self.update()
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if not self.marks:
-            return
-        span = max(1, self.maximum() - self.minimum())
-        usable = max(1, self.width() - 12)
-        painter = QPainter(self)
-        painter.setPen(QPen(QColor(OK), 2))
-        for f in self.marks:
-            if not (self.minimum() <= f <= self.maximum()):
-                continue
-            x = 6 + int(round((f - self.minimum()) / span * usable))
-            painter.drawLine(x, 2, x, 8)
-
-
-def build_2d_tab(win, tab):
+def build_2d_tab(ctx, tab):
     root = QVBoxLayout(tab)
     root.setContentsMargins(8, 8, 8, 8)
     root.setSpacing(8)
@@ -90,92 +52,69 @@ def build_2d_tab(win, tab):
 
     # ---- Media ----------------------------------------------------------
     media_card, mbody = card("Source Clip")
-    win.combo_2d_video = QComboBox()
-    win.combo_2d_video.setToolTip("Clips found in 02 VIDEOS")
-    win.combo_2d_video.currentTextChanged.connect(win._on_2d_video_selected)
-    mbody.addWidget(win.combo_2d_video)
+    ctx.ui.combo_2d_video = QComboBox()
+    ctx.ui.combo_2d_video.setToolTip("Clips found in 02 VIDEOS")
+    ctx.ui.combo_2d_video.currentTextChanged.connect(ctx.on_2d_video_selected)
+    mbody.addWidget(ctx.ui.combo_2d_video)
 
-    win.btn_extract_frames = make_button(
+    ctx.ui.btn_extract_frames = make_button(
         "Unpack Frame Cache",
         "Extract every frame to disk so scrubbing is instant")
-    win.btn_extract_frames.clicked.connect(win._extract_frames_for_current_video)
-    mbody.addWidget(win.btn_extract_frames)
+    ctx.ui.btn_extract_frames.clicked.connect(ctx.extract_frames_for_current_video)
+    mbody.addWidget(ctx.ui.btn_extract_frames)
 
-    win.spin_start_frame_2d = QSpinBox()
-    win.spin_start_frame_2d.setRange(0, 9999999)
-    win.spin_start_frame_2d.setValue(1)
-    win.spin_start_frame_2d.setToolTip("Frame number the shot's first frame sits on in your timeline.\nLeave at 1 unless the plate is numbered from something else -\na 1001-1200 sequence needs 1001, or the exported keys land\noff the end of your comp and read as a single static value.")
-    form_row(mbody, "Timeline start", win.spin_start_frame_2d)
+    ctx.ui.spin_start_frame_2d = QSpinBox()
+    ctx.ui.spin_start_frame_2d.setRange(0, 9999999)
+    ctx.ui.spin_start_frame_2d.setValue(1)
+    ctx.ui.spin_start_frame_2d.setToolTip("Frame number the shot's first frame sits on in your timeline.\nLeave at 1 unless the plate is numbered from something else -\na 1001-1200 sequence needs 1001, or the exported keys land\noff the end of your comp and read as a single static value.")
+    form_row(mbody, "Timeline start", ctx.ui.spin_start_frame_2d)
 
     # An image sequence carries no frame rate, and 24 was simply assumed - so a
     # 25 fps plate had every exported key placed at the wrong time. Video files
     # fill this from the probe and lock it; sequences are the artist's to set.
-    win.spin_fps = QDoubleSpinBox()
-    win.spin_fps.setRange(1.0, 240.0)
-    win.spin_fps.setDecimals(3)
-    win.spin_fps.setSingleStep(1.0)
-    win.spin_fps.setValue(24.0)
-    win.spin_fps.setToolTip(
+    ctx.ui.spin_fps = QDoubleSpinBox()
+    ctx.ui.spin_fps.setRange(1.0, 240.0)
+    ctx.ui.spin_fps.setDecimals(3)
+    ctx.ui.spin_fps.setSingleStep(1.0)
+    ctx.ui.spin_fps.setValue(24.0)
+    ctx.ui.spin_fps.setToolTip(
         "Frame rate of the plate. Drives playback, the timecode readout and\n"
         "every exported curve, so a wrong value puts the keys on wrong times.\n"
         "Read from the file for a video and locked; editable for an image\n"
         "sequence, which carries no rate of its own.\n"
         "Common rates: 23.976, 24, 25, 29.97, 30, 48, 50, 60.")
-    win.spin_fps.valueChanged.connect(win._on_fps_changed)
-    form_row(mbody, "Frame rate", win.spin_fps)
+    ctx.ui.spin_fps.valueChanged.connect(ctx.on_fps_changed)
+    form_row(mbody, "Frame rate", ctx.ui.spin_fps)
     ins.addWidget(media_card)
 
     # ---- Layers ---------------------------------------------------------
-    layer_card, lbody = card("Tracking Layers")
-
-    win.layer_list = QListWidget()
-    win.layer_list.setMinimumHeight(92)
-    win.layer_list.setMaximumHeight(150)
-    win.layer_list.setToolTip("Each layer solves independently and exports its own tracks")
-    win.layer_list.currentRowChanged.connect(win._on_layer_selected)
-    lbody.addWidget(win.layer_list)
-
-    win.btn_add_layer = make_button("+ Add", "Add a tracking layer")
-    win.btn_add_layer.clicked.connect(win._add_new_layer)
-    win.btn_del_layer = make_button("Delete", "Remove the active layer")
-    win.btn_del_layer.clicked.connect(win._delete_active_layer)
-    win.btn_rename_layer = make_button("Rename", "Rename the active layer")
-    win.btn_rename_layer.clicked.connect(win._rename_active_layer)
-    win.btn_color_layer = make_button("Colour", "Change the layer's overlay colour")
-    win.btn_color_layer.clicked.connect(win._change_layer_color)
-    button_row(lbody, [win.btn_add_layer, win.btn_del_layer,
-                       win.btn_rename_layer, win.btn_color_layer])
-
-    win.btn_export_roto = make_button(
-        "Export Roto to Nuke",
-        "Export animated rotomasks as a Foundry Nuke Roto node (.nk)")
-    win.btn_export_roto.clicked.connect(win._export_active_masks_to_nuke_roto)
-    lbody.addWidget(win.btn_export_roto)
-    ins.addWidget(layer_card)
+    # The whole card, its buttons and the rules behind them live in
+    # gui/layer_panel.py; the tab only decides where it sits.
+    ins.addWidget(ctx.layers.build_card())
 
     # ---- Mode & tools ---------------------------------------------------
     mode_card, obody = card("Mode & Tools")
 
-    win.radio_grid = QRadioButton("Automatic dense grid")
-    win.radio_grid.setChecked(True)
-    win.radio_grid.setToolTip("Scatter a regular grid of points over the frame")
-    win.radio_grid.toggled.connect(win._on_2d_mode_toggled)
+    ctx.ui.radio_grid = QRadioButton("Automatic dense grid")
+    ctx.ui.radio_grid.setChecked(True)
+    ctx.ui.radio_grid.setToolTip("Scatter a regular grid of points over the frame")
+    ctx.ui.radio_grid.toggled.connect(ctx.layers.on_2d_mode_toggled)
 
-    win.radio_points = QRadioButton("Interactive point picker")
-    win.radio_points.setToolTip("Click the features you want tracked")
-    win.radio_points.toggled.connect(win._on_2d_mode_toggled)
+    ctx.ui.radio_points = QRadioButton("Interactive point picker")
+    ctx.ui.radio_points.setToolTip("Click the features you want tracked")
+    ctx.ui.radio_points.toggled.connect(ctx.layers.on_2d_mode_toggled)
 
-    win.radio_cornerpin = QRadioButton("4-point corner pin (screen replace)")
-    win.radio_cornerpin.setToolTip("Click 4 corners clockwise from top-left")
-    win.radio_cornerpin.toggled.connect(win._on_2d_mode_toggled)
+    ctx.ui.radio_cornerpin = QRadioButton("4-point corner pin (screen replace)")
+    ctx.ui.radio_cornerpin.setToolTip("Click 4 corners clockwise from top-left")
+    ctx.ui.radio_cornerpin.toggled.connect(ctx.layers.on_2d_mode_toggled)
 
-    for r in (win.radio_grid, win.radio_points, win.radio_cornerpin):
+    for r in (ctx.ui.radio_grid, ctx.ui.radio_points, ctx.ui.radio_cornerpin):
         obody.addWidget(r)
 
     divider(obody)
 
-    win.combo_canvas_tool = QComboBox()
-    win.combo_canvas_tool.addItems([
+    ctx.ui.combo_canvas_tool = QComboBox()
+    ctx.ui.combo_canvas_tool.addItems([
         "Select & Edit",
         "Place Points (Click)",
         "Draw Inclusion Box",
@@ -183,88 +122,88 @@ def build_2d_tab(win, tab):
         "Draw Exclusion Box",
         "Draw Exclusion Polygon",
     ])
-    win.combo_canvas_tool.setToolTip(
+    ctx.ui.combo_canvas_tool.setToolTip(
         "What a click on the viewport does.\n"
         "Inclusion keeps points inside the shape; exclusion removes them.")
-    win.combo_canvas_tool.currentIndexChanged.connect(win._on_canvas_tool_changed)
-    form_row(obody, "Canvas tool", win.combo_canvas_tool)
+    ctx.ui.combo_canvas_tool.currentIndexChanged.connect(ctx.on_canvas_tool_changed)
+    form_row(obody, "Canvas tool", ctx.ui.combo_canvas_tool)
 
-    win.grid_settings_widget = QWidget()
-    g_lay = QVBoxLayout(win.grid_settings_widget)
+    ctx.ui.grid_settings_widget = QWidget()
+    g_lay = QVBoxLayout(ctx.ui.grid_settings_widget)
     g_lay.setContentsMargins(0, 0, 0, 0)
     g_lay.setSpacing(0)
-    win.spin_grid_size = QSpinBox()
-    win.spin_grid_size.setRange(2, 50)
-    win.spin_grid_size.setValue(10)
-    win.spin_grid_size.setToolTip("Points per side. 10 gives a 10x10 grid.")
-    win.spin_grid_size.valueChanged.connect(win._on_grid_size_changed)
-    win.lbl_total_pts = QLabel("100 pts")
-    win.lbl_total_pts.setObjectName("valueChip")
-    win.lbl_total_pts.setAlignment(Qt.AlignCenter)
-    win.lbl_total_pts.setMinimumWidth(72)
-    form_row(g_lay, "Grid size (N×N)", win.spin_grid_size, hint=win.lbl_total_pts)
-    obody.addWidget(win.grid_settings_widget)
+    ctx.ui.spin_grid_size = QSpinBox()
+    ctx.ui.spin_grid_size.setRange(2, 50)
+    ctx.ui.spin_grid_size.setValue(10)
+    ctx.ui.spin_grid_size.setToolTip("Points per side. 10 gives a 10x10 grid.")
+    ctx.ui.spin_grid_size.valueChanged.connect(ctx.layers.on_grid_size_changed)
+    ctx.ui.lbl_total_pts = QLabel("100 pts")
+    ctx.ui.lbl_total_pts.setObjectName("valueChip")
+    ctx.ui.lbl_total_pts.setAlignment(Qt.AlignCenter)
+    ctx.ui.lbl_total_pts.setMinimumWidth(72)
+    form_row(g_lay, "Grid size (N×N)", ctx.ui.spin_grid_size, hint=ctx.ui.lbl_total_pts)
+    obody.addWidget(ctx.ui.grid_settings_widget)
 
     divider(obody)
 
     btn_clear_masks = make_button(
         "Clear Masks", "Clear all inclusion and exclusion masks on the active layer")
-    btn_clear_masks.clicked.connect(win._clear_active_layer_masks)
+    btn_clear_masks.clicked.connect(ctx.clear_active_layer_masks)
     btn_clear_pts = make_button(
         "Clear Points", "Clear manual tracking points on the active layer")
-    btn_clear_pts.clicked.connect(win._clear_manual_points)
+    btn_clear_pts.clicked.connect(ctx.clear_manual_points)
     btn_jump_key = make_button(
         "Go to Key", "Jump the timeline to the active layer's keyframe")
-    btn_jump_key.clicked.connect(win._jump_to_point_keyframe)
+    btn_jump_key.clicked.connect(ctx.jump_to_point_keyframe)
     button_row(obody, [btn_clear_masks, btn_clear_pts, btn_jump_key])
     ins.addWidget(mode_card)
 
     # ---- Solver ---------------------------------------------------------
     ai_card, abody = card("AI Solver")
 
-    win.combo_2d_res = QComboBox()
-    win.combo_2d_res.addItems([
+    ctx.ui.combo_2d_res = QComboBox()
+    ctx.ui.combo_2d_res.addItems([
         "720p (HD - Recommended)", "512p (Fast)", "1080p (Full HD)", "Original"])
-    win.combo_2d_res.setToolTip(
+    ctx.ui.combo_2d_res.setToolTip(
         "Size the clip is loaded at. CoTracker itself always samples every block\n"
         "at its own fixed model resolution, so this does not make the tracking more\n"
         "precise - it only changes how much detail survives the downscale and how\n"
         "much RAM, VRAM upload and load time the clip costs. 720p suits most clips.")
-    form_row(abody, "Resolution", win.combo_2d_res)
+    form_row(abody, "Resolution", ctx.ui.combo_2d_res)
 
-    win.spin_min_conf = QDoubleSpinBox()
-    win.spin_min_conf.setRange(0.1, 0.99)
-    win.spin_min_conf.setValue(0.70)
-    win.spin_min_conf.setSingleStep(0.05)
-    win.spin_min_conf.setToolTip(
+    ctx.ui.spin_min_conf = QDoubleSpinBox()
+    ctx.ui.spin_min_conf.setRange(0.1, 0.99)
+    ctx.ui.spin_min_conf.setValue(0.70)
+    ctx.ui.spin_min_conf.setSingleStep(0.05)
+    ctx.ui.spin_min_conf.setToolTip(
         "Minimum tracking confidence a sample must reach to count as visible.\n"
         "Higher = fewer but more reliable points.")
-    win.spin_min_conf.valueChanged.connect(win._on_min_conf_changed)
-    form_row(abody, "Confidence", win.spin_min_conf)
+    ctx.ui.spin_min_conf.valueChanged.connect(ctx.layers.on_min_conf_changed)
+    form_row(abody, "Confidence", ctx.ui.spin_min_conf)
 
-    win.combo_2d_model = QComboBox()
-    win.combo_2d_model.addItems([
+    ctx.ui.combo_2d_model = QComboBox()
+    ctx.ui.combo_2d_model.addItems([
         "CoTracker3 Offline (High Accuracy)", "CoTracker3 Online (Streaming)"])
-    win.combo_2d_model.setToolTip("Offline sees the whole window at once and is more accurate.")
-    form_row(abody, "Model", win.combo_2d_model)
+    ctx.ui.combo_2d_model.setToolTip("Offline sees the whole window at once and is more accurate.")
+    form_row(abody, "Model", ctx.ui.combo_2d_model)
 
-    win.chk_vram_chunk = QCheckBox("Auto VRAM chunking (prevent out-of-memory)")
-    win.chk_vram_chunk.setChecked(True)
-    win.chk_vram_chunk.setToolTip(
+    ctx.ui.chk_vram_chunk = QCheckBox("Auto VRAM chunking (prevent out-of-memory)")
+    ctx.ui.chk_vram_chunk.setChecked(True)
+    ctx.ui.chk_vram_chunk.setToolTip(
         "Sends the clip to the GPU a few frames at a time, sized to the free VRAM.\n"
         "Turn off only if you have VRAM to spare - the whole clip then goes up at once.")
-    abody.addWidget(win.chk_vram_chunk)
+    abody.addWidget(ctx.ui.chk_vram_chunk)
 
     # Some shots only have a clean reference at the tail: the feature enters
     # frame late, or the plate softens towards the head. Tracking from frame 1
     # is then tracking from the worst frame in the shot.
-    win.chk_track_backwards = QCheckBox("Track backwards (last frame first)")
-    win.chk_track_backwards.setToolTip(
+    ctx.ui.chk_track_backwards = QCheckBox("Track backwards (last frame first)")
+    ctx.ui.chk_track_backwards.setToolTip(
         "Runs the whole layer over the reversed frame range and flips the result\n"
         "back, for shots whose good reference is at the end. The exports still\n"
         "start at the head - only the direction the tracker works in changes.\n"
         "Manual points are tracked from the frame you placed them on either way.")
-    abody.addWidget(win.chk_track_backwards)
+    abody.addWidget(ctx.ui.chk_track_backwards)
     ins.addWidget(ai_card)
 
     ins.addStretch(1)
@@ -279,167 +218,58 @@ def build_2d_tab(win, tab):
     rl.setSpacing(8)
 
     # ---- Viewport -------------------------------------------------------
-    win.canvas_2d = VideoPointPickerCanvas()
-    win.canvas_2d.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-    win.canvas_2d.file_dropped.connect(win._import_dropped_video)
-    win.canvas_2d.point_added.connect(win._on_point_added_on_canvas)
-    win.canvas_2d.masks_changed.connect(win._refresh_layer_list)
+    ctx.ui.canvas_2d = VideoPointPickerCanvas()
+    ctx.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+    ctx.canvas.file_dropped.connect(ctx.import_dropped_video)
+    ctx.canvas.point_added.connect(ctx.on_point_added_on_canvas)
+    ctx.canvas.masks_changed.connect(ctx.layers.refresh_layer_list)
     # An undo puts masks, points, corrections or the range back without going
     # through any of the handlers that normally redraw the chips, so the canvas
     # says what changed and the chips follow it.
-    win.canvas_2d.masks_changed.connect(win._update_keyframe_status)
-    win.canvas_2d.corrections_changed.connect(win._refresh_correction_ui)
-    win.canvas_2d.range_changed.connect(win._sync_range_status)
-    win.canvas_2d.tracked_point_moved.connect(win._on_tracked_point_moved)
-    win.canvas_2d.retrack_requested.connect(win._on_retrack_requested)
-    win.canvas_2d.correction_cleared.connect(win._on_correction_cleared)
-    rl.addWidget(win.canvas_2d, 1)
+    ctx.canvas.masks_changed.connect(ctx.player.update_keyframe_status)
+    ctx.canvas.corrections_changed.connect(ctx.correction.refresh)
+    ctx.canvas.range_changed.connect(ctx.player.sync_range_status)
+    ctx.canvas.tracked_point_moved.connect(ctx.correction.on_tracked_point_moved)
+    ctx.canvas.retrack_requested.connect(ctx.correction.on_retrack_requested)
+    ctx.canvas.correction_cleared.connect(ctx.correction.on_correction_cleared)
+    rl.addWidget(ctx.canvas, 1)
 
     # ---- Transport ------------------------------------------------------
-    t_frame, tbar = strip(spacing=7)
-
-    win.btn_step_back = make_button("◀", "Step back one frame  (←, or Shift+← for ten)", "transport")
-    win.btn_step_back.clicked.connect(win._step_back_frame)
-
-    win.btn_play_pause = make_button("▶  Play", "Play / pause  (Space, or J / K / L to shuttle)", "transportPlay")
-    win.btn_play_pause.clicked.connect(win._toggle_playback)
-
-    win.btn_step_fwd = make_button("▶", "Step forward one frame  (→, or Shift+→ for ten)", "transport")
-    win.btn_step_fwd.clicked.connect(win._step_fwd_frame)
-
-    win.slider_2d_frame = MarkedSlider(Qt.Horizontal)
-    win.slider_2d_frame.setRange(0, 0)
-    win.slider_2d_frame.setFixedHeight(30)
-    win.slider_2d_frame.setToolTip(
-        "Scrub the timeline.\n"
-        "Green ticks are frames where you have corrected a tracked point.")
-    win.slider_2d_frame.valueChanged.connect(win._on_2d_frame_slider_changed)
-
-    win.lbl_frame_idx = QLabel("00:00:00:00  (1/1)")
-    win.lbl_frame_idx.setObjectName("valueChip")
-    win.lbl_frame_idx.setAlignment(Qt.AlignCenter)
-    win.lbl_frame_idx.setMinimumWidth(150)
-    win.lbl_frame_idx.setToolTip("Timecode and frame, at the clip's real frame rate")
-
-    win.chk_loop = QCheckBox("Loop")
-    win.chk_loop.setChecked(True)
-    win.chk_loop.setToolTip("Restart playback from the first frame when it reaches the end")
-
-    win.combo_view_layer = QComboBox()
-    win.combo_view_layer.addItems(["Clean Video", "Motion Overlay"])
-    win.combo_view_layer.setFixedWidth(148)
-    win.combo_view_layer.setToolTip("Switch between the plate and the rendered motion trails")
-    win.combo_view_layer.currentIndexChanged.connect(win._on_view_layer_changed)
-
-    tbar.addWidget(win.btn_step_back)
-    tbar.addWidget(win.btn_play_pause)
-    tbar.addWidget(win.btn_step_fwd)
-    tbar.addWidget(win.slider_2d_frame, 1)
-    tbar.addWidget(win.lbl_frame_idx)
-    divider(tbar, vertical=True)
-    tbar.addWidget(win.chk_loop)
-    tbar.addWidget(win.combo_view_layer)
-    rl.addWidget(t_frame)
+    # Built, owned and wired by gui/player.py; the tab only places it.
+    rl.addWidget(ctx.player.build_transport_bar())
 
     # ---- Roto / range / view --------------------------------------------
     k_frame, kbar = strip(spacing=6)
 
     # cluster 1 - keyframes
-    kbar.addWidget(_cluster_label("Keys"))
-    win.btn_prev_key = make_button("◀ Prev", "Previous mask keyframe  ( , or [ )", "compact")
-    win.btn_prev_key.clicked.connect(win._jump_prev_keyframe)
-    win.btn_set_key = make_button("Set", "Create or update a keyframe here", "compact")
-    win.btn_set_key.clicked.connect(win._set_mask_keyframe_on_current)
-    win.btn_del_key = make_button("Del", "Delete the keyframe here  (Del)", "compact")
-    win.btn_del_key.clicked.connect(win._delete_mask_keyframe_on_current)
-    win.btn_next_key = make_button("Next ▶", "Next mask keyframe  ( . or ] )", "compact")
-    win.btn_next_key.clicked.connect(win._jump_next_keyframe)
-    win.btn_del_mask = make_button(
-        "Del Mask", "Delete the selected mask with all its keyframes  (Shift+Del)", "compact")
-    win.btn_del_mask.clicked.connect(win.canvas_2d.delete_selected_mask)
-
-    win.lbl_key_status = QLabel("◆ f1")
-    win.lbl_key_status.setObjectName("valueChip")
-    win.lbl_key_status.setAlignment(Qt.AlignCenter)
-    win.lbl_key_status.setMinimumWidth(74)
-
-    for wdg in (win.btn_prev_key, win.btn_set_key, win.btn_del_key,
-                win.btn_next_key, win.btn_del_mask, win.lbl_key_status):
-        kbar.addWidget(wdg)
+    ctx.player.add_keys_cluster(kbar)
 
     divider(kbar, vertical=True)
 
     # cluster 2 - tracking range
-    kbar.addWidget(_cluster_label("Range"))
-    win.btn_set_in = make_button("In", "Set the tracking in-point  (I, Alt+I clears it)", "compact")
-    win.btn_set_in.clicked.connect(lambda: win._set_in_point(win.canvas_2d.current_frame))
-    win.btn_set_out = make_button("Out", "Set the tracking out-point  (O, Alt+O clears it)", "compact")
-    win.btn_set_out.clicked.connect(lambda: win._set_out_point(win.canvas_2d.current_frame))
-    win.btn_reset_range = make_button("Reset", "Track the whole clip again", "compact")
-    win.btn_reset_range.clicked.connect(win._reset_tracking_range)
-
-    win.lbl_range_status = QLabel("Full")
-    win.lbl_range_status.setObjectName("valueChip")
-    win.lbl_range_status.setAlignment(Qt.AlignCenter)
-    win.lbl_range_status.setMinimumWidth(74)
-
-    for wdg in (win.btn_set_in, win.btn_set_out, win.btn_reset_range, win.lbl_range_status):
-        kbar.addWidget(wdg)
+    ctx.player.add_range_cluster(kbar)
 
     divider(kbar, vertical=True)
 
     # cluster 3 - viewport modes
-    kbar.addWidget(_cluster_label("View"))
-    win.btn_toggle_matte = make_button("Matte", "Show the live mask overlay  (M)", "toggle", checkable=True)
-    win.btn_toggle_matte.setChecked(True)
-    win.btn_toggle_matte.toggled.connect(win._toggle_canvas_matte_overlay)
+    kbar.addWidget(group_label("View"))
+    ctx.ui.btn_toggle_matte = make_button("Matte", "Show the live mask overlay  (M)", "toggle", checkable=True)
+    ctx.ui.btn_toggle_matte.setChecked(True)
+    ctx.ui.btn_toggle_matte.toggled.connect(ctx.toggle_canvas_matte_overlay)
 
-    win.btn_toggle_alpha = make_button("Alpha", "High-contrast alpha channel view  (A)", "toggle", checkable=True)
-    win.btn_toggle_alpha.toggled.connect(win._toggle_canvas_alpha_mode)
+    ctx.ui.btn_toggle_alpha = make_button("Alpha", "High-contrast alpha channel view  (A)", "toggle", checkable=True)
+    ctx.ui.btn_toggle_alpha.toggled.connect(ctx.toggle_canvas_alpha_mode)
 
-    win.btn_toggle_loupe = make_button("Loupe", "Sub-pixel magnifier  (hold Ctrl)", "toggle", checkable=True)
-    win.btn_toggle_loupe.toggled.connect(win._toggle_canvas_loupe)
+    ctx.ui.btn_toggle_loupe = make_button("Loupe", "Sub-pixel magnifier  (hold Ctrl)", "toggle", checkable=True)
+    ctx.ui.btn_toggle_loupe.toggled.connect(ctx.toggle_canvas_loupe)
 
-    for wdg in (win.btn_toggle_matte, win.btn_toggle_alpha, win.btn_toggle_loupe):
+    for wdg in (ctx.ui.btn_toggle_matte, ctx.ui.btn_toggle_alpha, ctx.ui.btn_toggle_loupe):
         kbar.addWidget(wdg)
 
     divider(kbar, vertical=True)
 
     # cluster 4 - fixing a drifting track (roadmap 2.1)
-    kbar.addWidget(_cluster_label("Fix"))
-    win.btn_show_result = make_button(
-        "Result",
-        "Draw the last 2D result on the plate.\n"
-        "Drag a marker to correct it on that frame, then re-track from there.",
-        "toggle", checkable=True)
-    win.btn_show_result.toggled.connect(win._toggle_tracked_result)
-
-    win.btn_prev_fix = make_button("◀ Fix", "Jump to the previous corrected frame", "compact")
-    win.btn_prev_fix.clicked.connect(lambda: win._jump_correction(-1))
-    win.btn_next_fix = make_button("Fix ▶", "Jump to the next corrected frame", "compact")
-    win.btn_next_fix.clicked.connect(lambda: win._jump_correction(1))
-
-    win.btn_retrack_fwd = make_button(
-        "Re-track ▶",
-        "Re-track the corrected point from this frame to the out point,\n"
-        "and splice the new positions into the saved result.", "compact")
-    win.btn_retrack_fwd.clicked.connect(lambda: win._retrack_correction(False))
-
-    win.btn_retrack_both = make_button(
-        "Re-track ◀▶",
-        "Re-track the corrected point forward to the out point and\n"
-        "backwards to the in point.", "compact")
-    win.btn_retrack_both.clicked.connect(lambda: win._retrack_correction(True))
-
-    win.lbl_corrections = QLabel("No result")
-    win.lbl_corrections.setObjectName("valueChip")
-    win.lbl_corrections.setAlignment(Qt.AlignCenter)
-    win.lbl_corrections.setMinimumWidth(96)
-    win.lbl_corrections.setToolTip("Corrections stored on the active layer's result")
-
-    for wdg in (win.btn_show_result, win.btn_prev_fix, win.btn_next_fix,
-                win.btn_retrack_fwd, win.btn_retrack_both, win.lbl_corrections):
-        kbar.addWidget(wdg)
+    ctx.correction.add_fix_cluster(kbar)
 
     kbar.addStretch(1)
     # Three clusters of controls do not fit a narrow window; scroll rather than clip.
@@ -451,17 +281,17 @@ def build_2d_tab(win, tab):
     btn_clear_2d_log.setFixedWidth(64)
     log_card.header_layout.addWidget(btn_clear_2d_log)
 
-    win.log_2d_text = QTextEdit()
-    win.log_2d_text.setReadOnly(True)
-    win.log_2d_text.setMinimumHeight(96)
-    win.log_2d_text.setMaximumHeight(200)
-    btn_clear_2d_log.clicked.connect(win.log_2d_text.clear)
-    logbody.addWidget(win.log_2d_text)
+    ctx.ui.log_2d_text = QTextEdit()
+    ctx.ui.log_2d_text.setReadOnly(True)
+    ctx.ui.log_2d_text.setMinimumHeight(96)
+    ctx.ui.log_2d_text.setMaximumHeight(200)
+    btn_clear_2d_log.clicked.connect(ctx.ui.log_2d_text.clear)
+    logbody.addWidget(ctx.ui.log_2d_text)
 
-    win.progress_2d = QProgressBar()
-    win.progress_2d.setValue(0)
-    win.progress_2d.setFormat("Ready")
-    logbody.addWidget(win.progress_2d)
+    ctx.ui.progress_2d = QProgressBar()
+    ctx.ui.progress_2d.setValue(0)
+    ctx.ui.progress_2d.setFormat("Ready")
+    logbody.addWidget(ctx.ui.progress_2d)
     rl.addWidget(log_card)
 
     # ---- Actions --------------------------------------------------------
@@ -470,47 +300,48 @@ def build_2d_tab(win, tab):
 
     run_row = QHBoxLayout()
     run_row.setSpacing(7)
-    win.btn_start_2d = QPushButton("▶   Run 2D Point Tracking")
-    win.btn_start_2d.setObjectName("primary")
-    win.btn_start_2d.setToolTip("Track every layer through the current range")
-    win.btn_start_2d.clicked.connect(win._start_tracking_2d)
+    ctx.ui.btn_start_2d = QPushButton("▶   Run 2D Point Tracking")
+    ctx.ui.btn_start_2d.setObjectName("primary")
+    ctx.ui.btn_start_2d.setToolTip("Track every layer through the current range")
+    ctx.ui.btn_start_2d.clicked.connect(ctx.start_tracking_2d)
 
-    win.btn_stop_2d = QPushButton("Cancel")
-    win.btn_stop_2d.setObjectName("danger")
-    win.btn_stop_2d.setToolTip("Stop the running track after the current block of frames")
-    win.btn_stop_2d.setFixedWidth(100)
-    win.btn_stop_2d.setEnabled(False)
-    win.btn_stop_2d.clicked.connect(win._stop_tracking_2d)
+    ctx.ui.btn_stop_2d = QPushButton("Cancel")
+    ctx.ui.btn_stop_2d.setObjectName("danger")
+    ctx.ui.btn_stop_2d.setToolTip("Stop the running track after the current block of frames")
+    ctx.ui.btn_stop_2d.setFixedWidth(100)
+    ctx.ui.btn_stop_2d.setEnabled(False)
+    ctx.ui.btn_stop_2d.clicked.connect(ctx.stop_tracking_2d)
 
-    run_row.addWidget(win.btn_start_2d, 1)
-    run_row.addWidget(win.btn_stop_2d)
+    run_row.addWidget(ctx.ui.btn_start_2d, 1)
+    run_row.addWidget(ctx.ui.btn_stop_2d)
     actbody.addLayout(run_row)
 
-    win.btn_export_2d_nuke = make_button(
+    ctx.ui.btn_export_2d_nuke = make_button(
         "Nuke Tracker Node",
         "Copy the solved Tracker4 node to the clipboard for Ctrl+V in Nuke", "export")
-    win.btn_export_2d_nuke.clicked.connect(win._export_2d_for_nuke)
+    ctx.ui.btn_export_2d_nuke.clicked.connect(ctx.export_2d_for_nuke)
 
-    win.btn_load_overlay_player = make_button(
+    ctx.ui.btn_load_overlay_player = make_button(
         "Play Overlay", "Load the rendered motion-trail video into the viewport", "export")
-    win.btn_load_overlay_player.clicked.connect(win._load_overlay_into_player)
+    ctx.ui.btn_load_overlay_player.clicked.connect(
+        ctx.player.load_overlay_into_player)
 
-    win.btn_open_2d_dir = make_button(
+    ctx.ui.btn_open_2d_dir = make_button(
         "Open Output", "Show the 2D track folder", "export")
-    win.btn_open_2d_dir.clicked.connect(win._open_2d_output_folder)
+    ctx.ui.btn_open_2d_dir.clicked.connect(ctx.media.open_2d_output_folder)
 
     # After a correction the delivered files no longer match the result the
     # artist is looking at, and nothing about rewriting them needs the GPU.
-    win.btn_reexport_2d = make_button(
+    ctx.ui.btn_reexport_2d = make_button(
         "Re-export 2D",
         "Write every 2D format again from the corrected result, without re-tracking",
         "export")
-    win.btn_reexport_2d.clicked.connect(win._reexport_2d_result)
+    ctx.ui.btn_reexport_2d.clicked.connect(ctx.correction.reexport_2d_result)
 
-    button_row(actbody, [win.btn_export_2d_nuke,
-                         win.btn_load_overlay_player,
-                         win.btn_open_2d_dir,
-                         win.btn_reexport_2d], compact=False)
+    button_row(actbody, [ctx.ui.btn_export_2d_nuke,
+                         ctx.ui.btn_load_overlay_player,
+                         ctx.ui.btn_open_2d_dir,
+                         ctx.ui.btn_reexport_2d], compact=False)
     rl.addWidget(act_card)
 
     splitter.addWidget(right)

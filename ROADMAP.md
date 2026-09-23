@@ -7,7 +7,7 @@ confidence in Nuke's error column (2.1, 2.2), per-shot settings in batch and
 quiet logs (2.3, 2.4), undo with a keyboard scheme (2.5) and the update check
 (2.6). Phase 3 is done except the window split: the DCC verification scripts,
 the installer trim and the continuous test run are in (3.2, 3.3, 3.4).
-Remaining: 3.1, splitting the main window.
+The roadmap is complete.
 
 Three things were found by testing rather than by reading, and fixed on the way
 through. A solve at Frame Step above 1 put camera keys on consecutive frames
