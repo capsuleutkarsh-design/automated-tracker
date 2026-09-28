@@ -146,6 +146,21 @@
   ol.steps li { margin: 8px 0; }
   ol.steps b { color: var(--text); font-weight: 600; }
 
+  /* screenshots */
+  .shot { margin: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+          overflow: hidden; box-shadow: 0 24px 60px rgba(0,0,0,0.45); }
+  .shot img { display: block; width: 100%; height: auto; }
+  .shot figcaption { padding: 12px 16px; font-size: 14px; color: var(--dim);
+                     border-top: 1px solid var(--border-soft); }
+  .shot figcaption b { color: var(--text); font-weight: 600; }
+  .shot-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  .shot-tabs button { font: inherit; font-size: 14px; font-weight: 600; cursor: pointer;
+                      padding: 8px 16px; border-radius: 999px; color: var(--dim);
+                      background: var(--raised); border: 1px solid var(--border); }
+  .shot-tabs button[aria-selected="true"] { color: var(--accent); background: var(--accent-wash);
+                                            border-color: var(--accent-dim); }
+  .shot[hidden] { display: none; }
+  .shots-small { margin-top: 18px; align-items: start; }
   footer { padding: 40px 0 56px; border-top: 1px solid var(--border-soft); color: var(--muted); font-size: 14px; }
   footer .wrap { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 16px; align-items: center; }
   footer a { color: var(--dim); }
@@ -157,6 +172,7 @@
   <div class="wrap">
     <a class="brand" href="#top"><img src="assets/mark.svg" alt=""> Automated Tracker</a>
     <a class="link" href="#features">Features</a>
+    <a class="link" href="#screenshots">Screenshots</a>
     <a class="link" href="#exports">Exports</a>
     <a class="link" href="#requirements">Requirements</a>
     <a class="link" href="#download">Download</a>
@@ -227,6 +243,42 @@
       <div class="step"><span class="n">03</span><b>Mask what moves</b>Draw and keyframe exclusion shapes over actors.</div>
       <div class="step"><span class="n">04</span><b>Solve</b>Run the 2D tracker, the 3D solver, or both.</div>
       <div class="step"><span class="n">05</span><b>Export</b>Every format is written at once, with the timeline start you set.</div>
+    </div>
+  </div>
+</section>
+
+<section id="screenshots">
+  <div class="wrap">
+    <div class="eyebrow">A look inside</div>
+    <h2>The app</h2>
+    <p class="lead">One window, two tabs. Settings on the left, the media pool or viewer on the right, and the licence line along the bottom.</p>
+
+    <div class="shot-tabs" role="tablist">
+      <button type="button" role="tab" aria-selected="true" data-shot="shot-3d">3D Camera Tracking</button>
+      <button type="button" role="tab" aria-selected="false" data-shot="shot-2d">2D Point Tracking</button>
+    </div>
+    <figure class="shot" id="shot-3d">
+      <img src="assets/screens/tracker_3d.png" width="1600" height="900" alt="The 3D Camera Tracking tab: shot preset, camera and solver settings, the media pool and the solver console" loading="lazy">
+      <figcaption><b>3D Camera Tracking.</b> Pick a shot preset, adjust the solver, and solve one shot or a whole batch from the media pool.</figcaption>
+    </figure>
+    <figure class="shot" id="shot-2d" hidden>
+      <img src="assets/screens/tracker_2d.png" width="1600" height="900" alt="The 2D Point Tracking tab: source clip, tracking layers, tools, the viewer with keys and range controls, and the tracker console" loading="lazy">
+      <figcaption><b>2D Point Tracking.</b> Layers, masks and point tools on the left; the viewer with keys, range and matte views on the right.</figcaption>
+    </figure>
+
+    <div class="grid three shots-small">
+      <figure class="shot">
+        <img src="assets/screens/tracker_shortcuts.png" width="520" height="600" alt="The keyboard shortcuts window" loading="lazy">
+        <figcaption><b>Keyboard shortcuts.</b> J/K/L transport, in and out points, roto keys.</figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="assets/screens/tracker_about.png" width="488" height="288" alt="The About window" loading="lazy">
+        <figcaption><b>About.</b> Version, engines and where the logs are.</figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="assets/screens/tracker_credits.png" width="820" height="600" alt="The credits window listing third-party parts and their licences" loading="lazy">
+        <figcaption><b>Credits.</b> Every third-party part and its licence, inside the app.</figcaption>
+      </figure>
     </div>
   </div>
 </section>
@@ -327,6 +379,17 @@
 </footer>
 
 <script>
+  // Screenshot tabs.
+  document.querySelectorAll(".shot-tabs button").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      document.querySelectorAll(".shot-tabs button").forEach(function (b) {
+        var on = b === btn;
+        b.setAttribute("aria-selected", on ? "true" : "false");
+        document.getElementById(b.dataset.shot).hidden = !on;
+      });
+    });
+  });
+
   // Set this once to the repository URL. Every GitHub / releases / issues link
   // on the page is filled from it.
   const REPO = "https://github.com/capsuleutkarsh-design/automated-tracker";

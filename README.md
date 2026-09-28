@@ -30,6 +30,20 @@ Blender `.py`, CSV, JSON, overlay `.mp4`. 3D: Nuke `.nk` and `.chan`, Blender
 `.py` and `.blend`, Alembic `.abc`, USD `.usda`, PLY, JSON. A Timeline Start
 control shifts every key onto the shot's real frame range.
 
+## Screenshots
+
+**3D Camera Tracking:** shot preset, solver settings, the media pool and the solver console.
+
+![The 3D Camera Tracking tab](docs/assets/screens/tracker_3d.png)
+
+**2D Point Tracking:** tracking layers, masks and point tools, the viewer and the tracker console.
+
+![The 2D Point Tracking tab](docs/assets/screens/tracker_2d.png)
+
+| Keyboard shortcuts | About | Credits |
+|---|---|---|
+| ![Keyboard shortcuts](docs/assets/screens/tracker_shortcuts.png) | ![About](docs/assets/screens/tracker_about.png) | ![Credits](docs/assets/screens/tracker_credits.png) |
+
 ## Requirements
 
 - Windows 10 / 11, 64-bit
