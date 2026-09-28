@@ -108,6 +108,11 @@ def test_window_opens_and_shows_the_sample_clip(window):
     assert win.current_fps > 0
 
 
+def test_window_carries_the_credit_line(window):
+    from core import licence
+    assert licence.window_problems(window) == []
+
+
 def test_transport_keys_move_the_playhead(window):
     win = window
     _select_sample(win)

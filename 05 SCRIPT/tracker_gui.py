@@ -35,6 +35,7 @@ from core.app_paths import (
     logs_dir, thumbs_dir,
 )
 from core.version import APP_VERSION, display_version
+from core import licence
 
 # The self-test exists to diagnose an install that will not start, so it runs
 # before the GUI package is imported - a broken gui module must not hide it.
@@ -83,6 +84,13 @@ from core.media_pool import (
 # QSettings identity - registry key on Windows.
 SETTINGS_ORG = "AutomatedTracker"
 SETTINGS_APP = "AutomatedTracker"
+
+# Why the status bar carries a "Non-commercial use only" chip; the About box
+# repeats it. README.md "Licences" has the full list.
+LICENCE_NOTE = (
+    "2D tracking uses CoTracker3 (CC BY-NC 4.0) and the 3D solve uses COLMAP\n"
+    "with SiftGPU (non-profit use only), so this tool may not be used for paid\n"
+    "work until those parts are replaced.")
 
 
 class TrackerMainWindow(QMainWindow):
@@ -362,6 +370,9 @@ class TrackerMainWindow(QMainWindow):
         content_layout.addWidget(self.update_banner)
 
         content_layout.addWidget(self.tabs, 1)
+        # Credit line under the tabs, not in the status bar, which is full of chips
+        # (licence section 5: must stay)
+        content_layout.addWidget(licence.credit_label(), 0, Qt.AlignmentFlag.AlignRight)
 
         stacked.addWidget(content)
         stacked.setCurrentWidget(content)
@@ -391,12 +402,20 @@ class TrackerMainWindow(QMainWindow):
         self.status_colmap = QLabel("COLMAP: Ready")
         self.status_colmap.setObjectName("statusChip")
 
+        # Both engines as shipped carry non-commercial terms, so the window
+        # says so once, quietly, for as long as those parts are in the build.
+        self.status_licence = QLabel("Non-commercial use only")
+        self.status_licence.setObjectName("statusChip")
+        self.status_licence.setToolTip(LICENCE_NOTE)
+        self._set_chip_state(self.status_licence, "warn")
+
         self.status_ver = QLabel(display_version())
         self.status_ver.setObjectName("statusChip")
 
         statusbar.addPermanentWidget(self.status_gpu)
         statusbar.addPermanentWidget(self.status_blender)
         statusbar.addPermanentWidget(self.status_colmap)
+        statusbar.addPermanentWidget(self.status_licence)
         statusbar.addPermanentWidget(self.status_ver)
 
         # The keys, and the stack they drive, last: both need the 2D tab's
@@ -491,7 +510,7 @@ class TrackerMainWindow(QMainWindow):
         self.status_undo.setText(
             ("↶ %s" % stack.undoText()) if stack.canUndo() else "Nothing to undo")
         # "ok" is the status bar's own green; the roto chips use "key" for the
-        # same colour, but a statusChip only knows these four states.
+        # same colour, but a statusChip only knows these five states.
         self._set_chip_state(self.status_undo, "ok" if stack.canUndo() else "idle")
 
     def _open_colmap_gui(self):
@@ -509,15 +528,19 @@ class TrackerMainWindow(QMainWindow):
             QMessageBox.warning(self, "COLMAP Missing", f"COLMAP executable not found at:\n{COLMAP_EXE}")
 
     def _show_about_dialog(self):
-        QMessageBox.information(
-            self,
-            "About Automated Tracker",
+        box = QMessageBox(QMessageBox.Icon.Information, "About Automated Tracker",
             "AUTOMATED TRACKER %s\n\n"
             "VFX Studio Camera Tracking & 2D Motion Tracking System\n"
             "Engines: COLMAP (3D SfM) & Meta CoTracker3 (2D Point Tracking)\n"
             "Pipeline Integrations: Blender (.abc) & Foundry Nuke (.nk / .abc)\n\n"
-            "Logs: %s" % (display_version(), logs_dir())
-        )
+            "Non-commercial use only.\n%s\n\n"
+            "%s\n\n"
+            "Logs: %s" % (display_version(), LICENCE_NOTE, licence.CREDIT_LINE, logs_dir()), parent=self)
+        credits = box.addButton("Credits", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if box.clickedButton() is credits:
+            licence.show_credits(self)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -1909,7 +1932,11 @@ def main():
     # arrows and spin buttons consistent instead of inheriting the Windows look.
     app.setStyle("Fusion")
     apply_dark_palette(app)
+    if not licence.check_startup():
+        sys.exit(3)
     window = TrackerMainWindow()
+    if not licence.check_window(window):
+        sys.exit(3)
     window.show()
     window._status("Ready  (logs: %s)" % log_folder)
     rc = app.exec()

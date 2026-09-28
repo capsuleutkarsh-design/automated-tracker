@@ -20,6 +20,8 @@ what is wrong.
 There is also no per-tracker error readout yet, so a solve that looks plausible
 cannot yet be told from a good one except by eye.
 
+Finally, it is for non-commercial use only; see [Licences](#licences).
+
 ## What changed in 1.2.0
 
 **A shot is now a shot.** Layers, masks, points, the in and out range, timeline
@@ -162,9 +164,18 @@ files inside the runtime past Windows' 260-character limit.
 
 ## Licences
 
-CoTracker3 and its weights are released by Meta under CC BY-NC 4.0, which
-permits non-commercial use only. COLMAP is BSD-licensed. FFmpeg is distributed
-under its own licence, included in the install.
+This release is for non-commercial use only. Do not use it for paid or client
+work.
+
+- CoTracker3 (the 2D tab): Meta releases the code and the weights under
+  CC BY-NC 4.0, which permits non-commercial use only.
+- COLMAP (the 3D solve): COLMAP's own code is BSD-licensed, but the bundled
+  `colmap.exe` also contains SiftGPU, which the University of North Carolina
+  allows for educational, research and non-profit use only and which runs in
+  every 3D solve on a machine with a CUDA GPU. It also contains the LSD line
+  detector (AGPL-3.0) and GPL parts (CGAL, SuiteSparse).
+
+FFmpeg is distributed under its own licence, included in the install.
 
 ---
 

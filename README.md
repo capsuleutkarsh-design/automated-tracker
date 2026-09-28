@@ -10,6 +10,8 @@ A Windows desktop app that runs Meta's **CoTracker3** for 2D point tracking and
 Blender and USD. Everything it needs is bundled; nothing is downloaded at run
 time.
 
+For now it is for **non-commercial use only**; see [Licences](#licences).
+
 **Website:** <https://capsuleutkarsh-design.github.io/automated-tracker/>
 (the page lives in [`docs/`](docs/) and is published with GitHub Pages).
 
@@ -117,6 +119,37 @@ The page is static: `docs/index.html` plus `docs/assets/`. To publish:
 
 ## Licences
 
-CoTracker3 and its weights are released by Meta under **CC BY-NC 4.0**, which
-permits non-commercial use only. COLMAP is BSD-licensed. FFmpeg is distributed
-under its own licence; see `03 FFMPEG/LICENSE`.
+Automated Tracker is released under the **[UT Community Licence 2.0](LICENSE.md)** by
+Utkarsh Tripathi: free to use, not for sale; if you change it, keep the name as
+*Automated Tracker (modified by …)* and send your changes back as a pull request
+within 30 days; keep the credits and the *Automated Tracker · © 2026 Utkarsh
+Tripathi · UT Community Licence 2.0* line under the tabs, or the app will not
+start. The full list of third-party parts is in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and on the Credits screen.
+
+As shipped, Automated Tracker is for **non-commercial use only**: each of its
+two engines contains a part whose licence does not allow commercial use.
+
+- **CoTracker3** (the 2D tab). Meta releases the code and the weights under
+  **CC BY-NC 4.0**, which permits non-commercial use only; see
+  `06 COTRACKER/LICENSE.md`.
+- **COLMAP** (the 3D solve). COLMAP's own code is BSD-licensed, but its
+  third-party parts are licensed separately, and the `colmap.exe` shipped here
+  is built with some that are not BSD:
+  - **SiftGPU** (University of North Carolina at Chapel Hill) may be used only
+    for educational, research and non-profit purposes. It runs in every 3D
+    solve on a machine with a CUDA GPU.
+  - The **LSD** line detector is under **AGPL-3.0**.
+  - **CGAL** and parts of **SuiteSparse** are under the **GPL**.
+
+  The AGPL and GPL parts do not forbid paid work, but they come with their own
+  conditions on passing the program on.
+
+FFmpeg is distributed under its own licence; see `03 FFMPEG/LICENSE`.
+
+### Commercial use
+
+Do not use this tool for paid or client work as it stands. That needs
+CoTracker3 replaced with a tracker whose licence allows commercial use, and
+COLMAP rebuilt without SiftGPU, with the AGPL and GPL parts checked. Until then
+the app shows a "Non-commercial use only" chip in its status bar.

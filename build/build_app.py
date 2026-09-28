@@ -322,6 +322,10 @@ def verify_track(exe, app_dir):
 def write_version_file():
     (HERE / "version.txt").write_text(APP_VERSION, encoding="utf-8")
     log("version.txt -> %s" % APP_VERSION)
+    # The installer's licence page (LicenseFile=LICENSE.txt): a plain-text copy of LICENSE.md
+    from core.licence import plain_text
+    (HERE / "LICENSE.txt").write_text(plain_text(HERE.parent / "LICENSE.md"), encoding="utf-8-sig")
+    log("LICENSE.txt written for the installer")
 
 
 def main():

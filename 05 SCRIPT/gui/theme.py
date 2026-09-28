@@ -241,6 +241,12 @@ QLabel#statusChip[state="bad"] {{
     border-color: #45262b;
 }}
 
+/* A standing notice rather than a fault: the licence chip. */
+QLabel#statusChip[state="warn"] {{
+    color: {WARN};
+    border-color: #4a3a1c;
+}}
+
 QToolTip {{
     background-color: {BG_RAISED};
     color: {TEXT};

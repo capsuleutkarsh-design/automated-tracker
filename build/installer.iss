@@ -38,6 +38,8 @@ AppPublisher={#AppPublisher}
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
+LicenseFile=LICENSE.txt
+AppCopyright=(c) 2026 Utkarsh Tripathi - UT Community Licence 2.0
 OutputDir=Output
 OutputBaseFilename=AutomatedTracker_Setup_{#AppVersion}
 Compression=lzma2/max
@@ -69,6 +71,12 @@ Name: "sampleclip";  Description: "Install the sample clip into 02 VIDEOS"; Grou
 [Files]
 ; ---- the frozen application -------------------------------------------------
 Source: "{#DistDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+; ---- licence (UT Community Licence 2.0): the app checks these at startup ----
+Source: "{#SrcRoot}\LICENSE.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SrcRoot}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SrcRoot}\06 COTRACKER\LICENSE.md"; DestDir: "{app}\06 COTRACKER"; \
+    Flags: ignoreversion skipifsourcedoesntexist
 
 ; ---- external tools the app runs -------------------------------------------
 Source: "{#SrcRoot}\01 COLMAP\*"; DestDir: "{app}\01 COLMAP"; \

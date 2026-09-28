@@ -54,7 +54,11 @@ try:
 except Exception:
     pass
 
-datas = []
+datas = [
+    # Licence (UT Community Licence 2.0): core/licence.py checks these at startup
+    (str(ROOT / "LICENSE.md"), "."),
+    (str(ROOT / "THIRD_PARTY_NOTICES.md"), "."),
+]
 
 # Packages that look themselves up through importlib.metadata at runtime need
 # their .dist-info copied in, or they raise PackageNotFoundError once frozen.
