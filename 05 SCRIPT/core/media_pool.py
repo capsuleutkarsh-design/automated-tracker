@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
-SEQ_EXTS = {".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+SEQ_EXTS = {".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".dpx"}
 
 LATEST_DIR = "_latest"
 

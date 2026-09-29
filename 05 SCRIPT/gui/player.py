@@ -23,7 +23,9 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPainter, QPen, QColor
 from PySide6.QtWidgets import QCheckBox, QComboBox, QLabel, QMessageBox, QSlider
 
+from core.image_io import read_pil_rgb
 from core.media_info import sequence_files
+from core.workers import scrub_cache_frames
 from gui.theme import OK
 from gui.ui_kit import divider, group_label, make_button, strip
 
@@ -321,7 +323,9 @@ class PlayerController:
             return
         scene_images_dir = self.ctx.scenes_dir / video_path.stem / "images"
         if scene_images_dir.exists():
-            jpgs = sorted(list(scene_images_dir.glob("*.jpg")))
+            # Only the stamped every-frame cache of this clip: a 3D solve's
+            # step-2 or de-squeezed frames would put the wrong frame on screen.
+            jpgs = scrub_cache_frames(scene_images_dir, video_path)
             if 0 <= val < len(jpgs):
                 self.load_frame_preview(jpgs[val], val, len(jpgs))
                 self.update_keyframe_status()
@@ -342,7 +346,8 @@ class PlayerController:
         from PIL import Image
         try:
             if isinstance(img_path_or_array, (str, Path)):
-                im = Image.open(img_path_or_array).convert("RGB")
+                # EXR and DPX frames are not PIL's to read (core.image_io).
+                im = read_pil_rgb(img_path_or_array)
             else:
                 im = Image.fromarray(img_path_or_array).convert("RGB")
             w, h = im.size

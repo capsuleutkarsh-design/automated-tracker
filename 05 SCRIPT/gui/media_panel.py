@@ -86,7 +86,7 @@ class MediaPanel:
     # =====================================================================
     def add_videos(self):
         files, _ = QFileDialog.getOpenFileNames(
-            self.ctx.dialog_parent(), "Select Video or Image Sequence Files", "", "Video & Image Files (*.mp4 *.mov *.avi *.mkv *.m4v *.exr *.png *.jpg *.jpeg *.tif *.tiff);;All Files (*.*)"
+            self.ctx.dialog_parent(), "Select Video or Image Sequence Files", "", "Video & Image Files (*.mp4 *.mov *.avi *.mkv *.m4v *.exr *.dpx *.png *.jpg *.jpeg *.tif *.tiff);;All Files (*.*)"
         )
         if files:
             self.ctx.import_media_files(files, overwrite=False)

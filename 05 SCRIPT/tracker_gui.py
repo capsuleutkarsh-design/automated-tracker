@@ -70,7 +70,7 @@ from gui import menus as menu_table
 from gui.tab_3d import build_3d_tab
 from gui.tab_2d import build_2d_tab
 from gui import shortcuts as shortcut_table
-from core.workers import TrackerWorker, CoTrackerWorker, FrameExtractorWorker
+from core.workers import TrackerWorker, CoTrackerWorker, FrameExtractorWorker, scrub_cache_frames
 from core.hardware import gpu_monitor
 from core.proc import popen_gui
 from core import media_info
@@ -1066,8 +1066,10 @@ class TrackerMainWindow(QMainWindow):
             return
 
         scene_images_dir = SCENES_DIR / video_path.stem / "images"
-        if scene_images_dir.exists() and list(scene_images_dir.glob("*.jpg")):
-            jpgs = sorted(list(scene_images_dir.glob("*.jpg")))
+        # Only the stamped every-frame cache of this clip; frames a 3D solve
+        # left at another step or de-squeezed are extracted again below.
+        jpgs = scrub_cache_frames(scene_images_dir, video_path)
+        if jpgs:
             self.slider_2d_frame.setRange(0, len(jpgs) - 1)
             self.slider_2d_frame.setValue(0)
             self.player.load_frame_preview(jpgs[0], 0, len(jpgs))

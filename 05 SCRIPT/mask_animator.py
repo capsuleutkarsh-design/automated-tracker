@@ -221,7 +221,8 @@ def export_to_nuke_roto_script(animated_masks, width, height, total_frames, outp
 
 
 def rasterize_masks_to_png(animated_masks, width, height, out_masks_dir, total_frames,
-                           frame_filenames=None, progress_callback=None, frame_step=1):
+                           frame_filenames=None, progress_callback=None, frame_step=1,
+                           scale_x=1.0, scale_y=1.0):
     """
     Renders binary PNG mask sequence for COLMAP 3D Feature Extractor.
     In COLMAP:
@@ -234,6 +235,10 @@ def rasterize_masks_to_png(animated_masks, width, height, out_masks_dir, total_f
     frame_step: Frame-skip used when the images were extracted. Mask keyframes are set
                 against the full-rate timeline, so rendered frame t must be looked up at
                 source frame t * frame_step or the shapes slide off over time.
+    scale_x, scale_y: From the pixels the shapes were drawn on to these frames. The
+                roto is drawn on the plate as delivered; an anamorphic plate is
+                de-squeezed before the solve, so its shapes are stretched by the
+                pixel aspect along the axis that grew.
     """
     out_path = Path(out_masks_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -243,6 +248,12 @@ def rasterize_masks_to_png(animated_masks, width, height, out_masks_dir, total_f
 
     generated_files = []
     step = max(1, int(frame_step))
+    sx, sy = float(scale_x or 1.0), float(scale_y or 1.0)
+
+    def _scaled(pts):
+        if sx == 1.0 and sy == 1.0:
+            return pts
+        return [(float(p[0]) * sx, float(p[1]) * sy) for p in pts]
 
     for t in range(total_frames):
         # Map the rendered frame back onto the timeline the keyframes were set on.
@@ -265,7 +276,7 @@ def rasterize_masks_to_png(animated_masks, width, height, out_masks_dir, total_f
                     continue
                 pts = geom.get("points", [])
                 if len(pts) >= 3:
-                    draw.polygon(pts, fill=255)
+                    draw.polygon(_scaled(pts), fill=255)
 
         # Exclusion masks: carved out as black (0)
         for m in exc_masks:
@@ -274,7 +285,7 @@ def rasterize_masks_to_png(animated_masks, width, height, out_masks_dir, total_f
                 continue
             pts = geom.get("points", [])
             if len(pts) >= 3:
-                draw.polygon(pts, fill=0)
+                draw.polygon(_scaled(pts), fill=0)
 
         # Save mask image matching COLMAP's expected naming:
         # COLMAP looks for <image_name>.png in --ImageReader.mask_path

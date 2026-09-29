@@ -17,6 +17,7 @@ from core.media_info import probe_fps, probe_pixel_aspect
 from core.proc import popen_hidden
 from core.colmap_model import find_best_model, model_stats, model_error, registered_indices
 from core import project as project_file
+from core.image_io import SEQUENCE_EXTS, image_size
 
 
 log = logging.getLogger("core.workers")
@@ -25,7 +26,11 @@ log = logging.getLogger("core.workers")
 # panel when the artist asks for it (2.4).
 engine_log = logging.getLogger("engine")
 
-IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.exr', '.tif', '.tiff'}
+IMAGE_EXTS = set(SEQUENCE_EXTS)
+
+# Formats COLMAP cannot open itself. A sequence in one of these always goes
+# through FFmpeg into JPEG for the solve, square pixels or not.
+DECODE_FOR_SOLVE_EXTS = {".dpx"}
 
 # How much worse the solve is allowed to get in exchange for more frames, and
 # the point past which a mean reprojection error is bad regardless (1.3).
@@ -128,6 +133,21 @@ def write_images_stamp(img_dir, source, frame_step, frame_count, pixel_aspect=1.
             json.dump(stamp, f, indent=2)
     except OSError:
         pass
+
+
+def scrub_cache_frames(img_dir, source):
+    """
+    The JPEGs in images/ the 2D scrubber may show for this clip, or [].
+
+    Only a folder stamped as every frame (step 1) of this very clip at square
+    pixels is the scrub cache. A 3D solve at Frame step 2, or a de-squeezed
+    one, leaves a folder with a different count and shape, and showing that on
+    the 2D timeline put the playhead on the wrong frame.
+    """
+    img_dir = Path(img_dir)
+    if not img_dir.is_dir() or not images_stamp_matches(img_dir, source, 1):
+        return []
+    return sorted(img_dir.glob("*.jpg"))
 
 
 def images_stamp_matches(img_dir, source, frame_step, pixel_aspect=1.0):
@@ -253,12 +273,7 @@ def squeezed_source_size(width, height, pixel_aspect):
 
 def frame_size(path):
     """(width, height) of an image on disk, or None when it cannot be read."""
-    try:
-        from PIL import Image
-        with Image.open(str(path)) as im:
-            return int(im.size[0]), int(im.size[1])
-    except Exception:
-        return None
+    return image_size(path)
 
 
 def sequence_import_plan(source, img_dir, ffmpeg_exe=None, frame_step=1, pixel_aspect=1.0):
@@ -268,7 +283,8 @@ def sequence_import_plan(source, img_dir, ffmpeg_exe=None, frame_step=1, pixel_a
     Square pixels are copied: a copy is faster than a decode and gives the solve
     the artist's own frames untouched. A squeezed sequence is read by FFmpeg
     instead, through the same de-squeeze filter a clip gets, so the plate is
-    square by the time COLMAP or any export sees it.
+    square by the time COLMAP or any export sees it. So is a DPX sequence,
+    square or not, because COLMAP cannot read DPX.
 
     Returns {"mode": "copy" | "ffmpeg" | "unnumbered", "files": [...],
              "command": [...] or None, "out_pattern": str or None}. "unnumbered"
@@ -285,7 +301,8 @@ def sequence_import_plan(source, img_dir, ffmpeg_exe=None, frame_step=1, pixel_a
 
     plan = {"mode": "copy", "files": files, "command": None, "out_pattern": None}
     pa = float(pixel_aspect or 1.0)
-    if abs(pa - 1.0) <= 1e-9 or not files:
+    needs_decode = bool(files) and files[0].suffix.lower() in DECODE_FOR_SOLVE_EXTS
+    if (abs(pa - 1.0) <= 1e-9 and not needs_decode) or not files:
         return plan
 
     from export_tools import source_sequence_plate
@@ -735,12 +752,14 @@ class TrackerWorker(QThread):
                     # Solving the squeeze instead of removing it gives a lens that
                     # is wrong in one axis and an export that inherits it, so this
                     # is a stop, not a warning.
+                    why = (f"pixel aspect {pixel_aspect:.4g} ({aspect_note}) means they have "
+                           f"to be de-squeezed" if abs(pixel_aspect - 1.0) > 1e-9 else
+                           "COLMAP cannot read DPX, so they have to be converted")
                     self.log_signal.emit(
-                        f"✖ Pixel aspect {pixel_aspect:.4g} ({aspect_note}), but the files in "
-                        f"{video.name} are not a numbered sequence, so FFmpeg cannot read them "
-                        f"as one and the frames cannot be de-squeezed. Renumber them "
-                        f"(shot.1001.exr, shot.1002.exr, ...) or track the movie instead.",
-                        "#ff4b4b")
+                        f"✖ The frames in {video.name} have to go through FFmpeg ({why}), but "
+                        f"they are not a numbered sequence, so FFmpeg cannot read them as one. "
+                        f"Renumber them (shot.1001.exr, shot.1002.exr, ...) or track the movie "
+                        f"instead.", "#ff4b4b")
                     self.video_status_signal.emit(video.name, "Not A Numbered Sequence ✖")
                     return False
                 if plan["mode"] == "ffmpeg":
@@ -816,9 +835,19 @@ class TrackerWorker(QThread):
             masks_dir = shot_dir / "masks"
             masks_dir.mkdir(parents=True, exist_ok=True)
             sorted_frame_names = [f.name for f in sorted(extracted_frames)]
-            from PIL import Image
-            im_sample = Image.open(extracted_frames[0])
-            w, h = im_sample.size
+            size = image_size(extracted_frames[0])
+            if size is None:
+                self.log_signal.emit(
+                    f"✖ Could not read {extracted_frames[0].name} to size the roto masks.",
+                    "#ff4b4b")
+                self.video_status_signal.emit(video.name, "Unreadable Frames ✖")
+                return False
+            w, h = size
+            # The roto was drawn on the plate as delivered. A squeezed plate
+            # was stretched to square pixels above, so the shapes have to be
+            # stretched the same way or they miss what they were drawn round.
+            src_w, src_h = squeezed_source_size(w, h, pixel_aspect)
+            mask_sx, mask_sy = w / float(src_w or w), h / float(src_h or h)
 
             mask_objs = []
             for m in animated_masks:
@@ -834,6 +863,7 @@ class TrackerWorker(QThread):
                     1.0, f"[{idx}/{total_videos}] Generating 3D Masks ({cur}/{tot})..."
                 ),
                 frame_step=frame_step,
+                scale_x=mask_sx, scale_y=mask_sy,
             )
             self.log_signal.emit(f"✔ Generated {len(extracted_frames)} binary masks in 04 SCENES/{video.stem}/masks/ (Excluding moving actors from 3D solve)!", "#00ff88")
 

@@ -37,6 +37,7 @@ if not getattr(sys, 'frozen', False) and str(_here) not in sys.path:
 from core.app_paths import BASE_DIR, COTRACKER_DIR, ffmpeg_exe, ffprobe_exe
 from core.proc import run_hidden
 from core.media_info import probe_frame_count
+from core.image_io import SEQUENCE_EXTS, UnreadableImage, read_pil_rgb
 from core.tracking_layer import point_in_poly, is_point_in_mask  # noqa: F401 (re-exported)
 
 # The cotracker package is vendored in 06 COTRACKER when running from source;
@@ -53,13 +54,63 @@ except ImportError:
 FFMPEG_EXE = ffmpeg_exe()
 
 
+def _arch_runs_on(arch, major, minor):
+    """
+    Whether one entry of torch.cuda.get_arch_list() can run on a card of that
+    compute capability. An 'sm_XY' binary runs on the same major version at the
+    same or a newer minor (sm_86 kernels run on an sm_89 RTX 40); 'compute_XY'
+    is PTX, which the driver compiles for any card at least that new.
+    """
+    try:
+        kind, digits = str(arch).split("_", 1)
+        a_major, a_minor = int(digits[:-1]), int(digits[-1])
+    except (ValueError, IndexError):
+        return False
+    if kind == "sm":
+        return a_major == major and a_minor <= minor
+    if kind == "compute":
+        return (a_major, a_minor) <= (major, minor)
+    return False
+
+
+_CUDA_PROBLEM = []
+
+
+def cuda_unsupported_reason():
+    """
+    None when this torch can run on the GPU, else the sentence to show the artist.
+
+    The bundled torch (2.6, CUDA 12.4) carries no kernels for the RTX 50-series
+    (Blackwell, sm_120): CUDA reports itself available and the first kernel
+    then fails with "no kernel image is available". Asked once and cached.
+    """
+    if _CUDA_PROBLEM:
+        return _CUDA_PROBLEM[0]
+    reason = None
+    try:
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability(0)
+            arches = torch.cuda.get_arch_list() or []
+            if arches and not any(_arch_runs_on(a, major, minor) for a in arches):
+                name = torch.cuda.get_device_name(0)
+                family = " (RTX 50-series)" if major >= 12 else ""
+                reason = ("Your %s%s isn't supported by this version yet — tracking will run "
+                          "on the CPU, which is slower." % (name, family))
+    except Exception:
+        reason = None
+    _CUDA_PROBLEM.append(reason)
+    return reason
+
+
 def get_default_device():
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    if not torch.cuda.is_available() or cuda_unsupported_reason():
+        return "cpu"
+    return "cuda"
 
 
 def get_gpu_memory_info():
     """Returns (allocated_mb, total_mb, device_name)"""
-    if torch.cuda.is_available():
+    if get_default_device() == "cuda":
         allocated = torch.cuda.memory_allocated() / (1024 * 1024)
         total = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
         name = torch.cuda.get_device_name(0)
@@ -67,7 +118,8 @@ def get_gpu_memory_info():
     return 0, 0, "CPU Only"
 
 
-IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.exr', '.tif', '.tiff'}
+# EXR and DPX are read through core.image_io, not PIL.
+IMAGE_EXTS = set(SEQUENCE_EXTS)
 
 
 class TrackingCancelled(Exception):
@@ -105,7 +157,10 @@ def _load_resized(files, max_dimension, orig_size=None):
     frames = []
     target = None
     for fpath in files:
-        img = Image.open(fpath).convert("RGB")
+        try:
+            img = read_pil_rgb(fpath)
+        except UnreadableImage as e:
+            raise ValueError(str(e)) from e
         if target is None:
             if orig_size is None:
                 orig_size = img.size
@@ -1784,15 +1839,32 @@ def write_2d_exports(layers_results, out_dir, orig_w, orig_h, fps, images_dir, f
     }
 
 
-def sync_latest_folder(out_dir, latest_dir):
+def sync_latest_folder(out_dir, latest_dir, keep=()):
     """
     Mirror a finished output folder into _latest, which every 1-click button reads.
+
+    _latest is emptied first, the way the 3D solve does it, so a file an older
+    run wrote (a corner pin for a layer that no longer asks for one) cannot sit
+    there looking current. `keep` names files to leave in place when the new
+    folder has none of its own - the re-export keeps the overlay video the
+    last real track rendered.
 
     Never raises: a locked file in _latest (Explorer is often sitting in it)
     must not lose the export that was just written next to it.
     """
     try:
         out_dir, latest_dir = Path(out_dir), Path(latest_dir)
+        if latest_dir.is_dir():
+            for old in latest_dir.iterdir():
+                if old.is_file() and old.name in keep and not (out_dir / old.name).exists():
+                    continue
+                if old.is_dir():
+                    shutil.rmtree(old, ignore_errors=True)
+                else:
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
         latest_dir.mkdir(parents=True, exist_ok=True)
         for f in out_dir.iterdir():
             if f.is_file():
@@ -1906,6 +1978,8 @@ def process_cotracker_2d(video_path, config=None, progress_callback=None, log_ca
         return cancelled_result()
 
     device = get_default_device()
+    if cuda_unsupported_reason():
+        log(f"! {cuda_unsupported_reason()}", "#e0a000")
     alloc_mb, total_mb, gpu_name = get_gpu_memory_info()
     fp_mode = "FP16 Autocast Active" if (device == "cuda" and is_fp16_supported()) else "FP32 Precision"
     if device == "cuda":
@@ -2197,6 +2271,8 @@ def retrack_correction(video_path, result, layer_key, point_index, frame_t, x, y
     video_tensor = torch.from_numpy(frames_np).permute(0, 3, 1, 2)[None]
 
     prog(30, "Loading the AI model...")
+    if cuda_unsupported_reason():
+        log("   ! %s" % cuda_unsupported_reason(), "#e0a000")
     model = model or load_predictor(offline=bool(config.get("offline", True)))
 
     kwargs = dict(chunk_size=120, overlap=30, device=get_default_device(),
@@ -2262,7 +2338,7 @@ def export_corrected_result(result, layers_meta, out_dir, fps=24.0, images_dir=N
                              fps, images_dir, fr, timeline_start,
                              source_name=source_name, log=log)
     if latest_dir:
-        sync_latest_folder(out_dir, latest_dir)
+        sync_latest_folder(out_dir, latest_dir, keep=("tracks_2d_overlay.mp4",))
     return paths
 
 

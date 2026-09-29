@@ -46,7 +46,7 @@ from core import lens as lens_math          # noqa: E402
 from core import scene_transform as transforms   # noqa: E402
 
 
-IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.exr', '.tif', '.tiff')
+IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.exr', '.tif', '.tiff', '.dpx')
 
 
 # =============================================================================
@@ -1792,39 +1792,52 @@ def find_blender_executable(custom_path=None):
     if which_b:
         return Path(which_b)
 
-    # Check common standard locations directly (no slow recursive drive scanning)
-    common_paths = [
-        r"C:\Program Files\Blender Foundation\Blender 4.3\blender.exe",
-        r"C:\Program Files\Blender Foundation\Blender 4.2\blender.exe",
-        r"C:\Program Files\Blender Foundation\Blender 4.1\blender.exe",
-        r"C:\Program Files\Blender Foundation\Blender 4.0\blender.exe",
-        r"C:\Program Files\Blender Foundation\Blender 3.6\blender.exe",
-        r"C:\Program Files\Blender Foundation\Blender 3.5\blender.exe",
-        r"C:\Program Files\Blender Foundation\Blender 3.4\blender.exe",
-        r"C:\Program Files\Blender Foundation\Blender 3.3\blender.exe",
-        r"C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe",
-        r"D:\SteamLibrary\steamapps\common\Blender\blender.exe",
-        r"D:\Program Files\Blender Foundation\Blender 4.2\blender.exe",
-        r"D:\Program Files\Blender Foundation\Blender 4.1\blender.exe",
-        r"D:\Program Files\Blender Foundation\Blender 4.0\blender.exe",
-    ]
+    # Every "Blender Foundation\Blender X.Y" install (one folder deep, no slow
+    # drive scan), newest version first: the artist almost always wants the
+    # Blender installed last, and a fixed list of versions goes stale with
+    # every release.
+    newest = newest_installed_blender()
+    if newest:
+        return newest
 
-    for p_str in common_paths:
+    for p_str in (r"C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe",
+                  r"D:\SteamLibrary\steamapps\common\Blender\blender.exe"):
         p = Path(p_str)
         if p.exists() and p.is_file():
             return p
 
-    # Check subfolders in Blender Foundation directly (non-recursive, depth 1)
-    bf_dir = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Blender Foundation"
-    if bf_dir.exists() and bf_dir.is_dir():
-        try:
-            for sub in bf_dir.iterdir():
-                if sub.is_dir() and (sub / "blender.exe").exists():
-                    return sub / "blender.exe"
-        except Exception:
-            pass
-
     return None
+
+
+def _blender_version_key(exe):
+    """(4, 10) for ...\\Blender 4.10\\blender.exe; () when the folder names no version."""
+    m = re.search(r"(\d+(?:\.\d+)*)", Path(exe).parent.name)
+    return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+
+
+def newest_installed_blender(roots=None):
+    """
+    The blender.exe with the highest version number under
+    <Program Files>\\Blender Foundation\\Blender *, or None.
+
+    Compared as numbers, so 4.10 is newer than 4.9 and 5.0 newer than both.
+    `roots` is for the tests; by default the Program Files folders on C: and D:.
+    """
+    if roots is None:
+        roots = []
+        for r in (os.environ.get("ProgramFiles"), r"C:\Program Files", r"D:\Program Files"):
+            if r and Path(r) not in roots:
+                roots.append(Path(r))
+    found = []
+    for root in roots:
+        try:
+            found.extend(p for p in (Path(root) / "Blender Foundation").glob("Blender*/blender.exe")
+                         if p.is_file())
+        except OSError:
+            continue
+    if not found:
+        return None
+    return max(found, key=lambda p: (_blender_version_key(p), str(p)))
 
 
 def auto_export_alembic_via_blender(scene_dir, blender_path=None, log_callback=None):
