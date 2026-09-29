@@ -951,9 +951,55 @@ def _tracker4_rows(tracks, orig_h, name_prefix, start_frame=1, frame_step=1, con
     return rows
 
 
+# The column definitions Nuke itself writes at the top of a Tracker4 `tracks`
+# knob: { type flags width name label visible } per column, 31 of them, in the
+# order every row has to follow. Without this block Nuke takes the block of
+# rows for the column list and the tracks come in empty or garbled.
+# From saved Nuke 12-15 scripts; confirm by pasting into Nuke whenever it is
+# touched.
+TRACKER4_COLUMNS = (
+    "{ 5 1 20 enable e 1 }",
+    "{ 3 1 75 name name 1 }",
+    "{ 2 1 58 track_x track_x 1 }",
+    "{ 2 1 58 track_y track_y 1 }",
+    "{ 2 1 63 offset_x offset_x 1 }",
+    "{ 2 1 63 offset_y offset_y 1 }",
+    "{ 4 1 27 T T 1 }",
+    "{ 4 1 27 R R 1 }",
+    "{ 4 1 27 S S 1 }",
+    "{ 2 0 45 error error 1 }",
+    "{ 1 1 0 error_min error_min 1 }",
+    "{ 1 1 0 error_max error_max 1 }",
+    "{ 1 1 0 pattern_x pattern_x 1 }",
+    "{ 1 1 0 pattern_y pattern_y 1 }",
+    "{ 1 1 0 pattern_r pattern_r 1 }",
+    "{ 1 1 0 pattern_t pattern_t 1 }",
+    "{ 1 1 0 search_x search_x 1 }",
+    "{ 1 1 0 search_y search_y 1 }",
+    "{ 1 1 0 search_r search_r 1 }",
+    "{ 1 1 0 search_t search_t 1 }",
+    "{ 2 1 0 key_track key_track 1 }",
+    "{ 2 1 0 key_search_x key_search_x 1 }",
+    "{ 2 1 0 key_search_y key_search_y 1 }",
+    "{ 2 1 0 key_search_r key_search_r 1 }",
+    "{ 2 1 0 key_search_t key_search_t 1 }",
+    "{ 2 1 0 key_track_x key_track_x 1 }",
+    "{ 2 1 0 key_track_y key_track_y 1 }",
+    "{ 2 1 0 key_track_r key_track_r 1 }",
+    "{ 2 1 0 key_track_t key_track_t 1 }",
+    "{ 2 1 0 key_centre_offset_x key_centre_offset_x 1 }",
+    "{ 2 1 0 key_centre_offset_y key_centre_offset_y 1 }",
+)
+
+
 def _tracker4_node(tracks, orig_h, name_prefix, node_name, start_frame=1, frame_step=1,
                    xpos=0, ypos=0, label=None, conf=None):
-    """A complete Tracker4 node (with its `push`), ready to append to a .nk script."""
+    """
+    A complete Tracker4 node (with its `push`), ready to append to a .nk script.
+
+    The `tracks` knob is three blocks, the way Nuke saves it: the size
+    { 1 31 <tracks> }, the 31 column definitions, then one row per track.
+    """
     T, N, _ = tracks.shape
     rows = _tracker4_rows(tracks, orig_h, name_prefix, start_frame, frame_step, conf=conf)
     label_line = f' label "{label}"\n' if label else ""
@@ -961,8 +1007,11 @@ def _tracker4_node(tracks, orig_h, name_prefix, node_name, start_frame=1, frame_
         f'push $cut_paste_input\n'
         f'Tracker4 {{\n'
         f' tracks {{ {{ 1 31 {N} }}\n'
-        f'  {{ ' + "\n    ".join(rows) + f' }}\n'
-        f' }}\n'
+        '{ ' + "\n".join(TRACKER4_COLUMNS) + '\n}\n'
+        '{\n'
+        + "".join(f' {row}\n' for row in rows) +
+        '}\n'
+        '}\n'
         f' name {node_name}\n'
         f'{label_line}'
         f' selected true\n'
@@ -1285,12 +1334,23 @@ def unpack_tracks_blob(blob):
 exec(_BLENDER_UNPACK_SRC)  # defines unpack_tracks_blob here from the same source Blender runs
 
 
-def _blender_tracks_script(layers, orig_w, orig_h, fps, images_dir, start_frame, frame_step, title, func_name):
+def _blender_tracks_script(layers, orig_w, orig_h, fps, images_dir, start_frame, frame_step, title, func_name,
+                           timeline_start=None):
     """
     One Blender script for any number of layers: reference camera + background sequence
     preamble, then every layer's tracks embedded as a compressed blob and keyframed in a
     loop inside Blender. layers: list of dicts {"collection", "prefix", "tracks"}.
+
+    The background is images/, numbered from 1 at the clip's first frame, and that
+    frame sits on `timeline_start` - so that is the image user's frame_start, the same
+    rule the 3D Blender export uses. `start_frame` is where the tracks begin, which is
+    later than the plate whenever the In point is past the head of the clip.
+
+    The reference camera is a 50 mm lens on a 36 mm wide sensor fitted HORIZONTALLY,
+    at z = 50 / 18: the frame is then exactly 2 units wide at z = 0 (half-width
+    z * 18 / 50 = 1), which is the -1..1 the empties are laid out on.
     """
+    plate_start = int(start_frame if timeline_start is None else timeline_start)
     images_dir_str = str(images_dir).replace('\\', '/') if images_dir else ""
     T_max = max(int(l["tracks"].shape[0]) for l in layers) if layers else 1
     data = {
@@ -1343,6 +1403,7 @@ def {func_name}():
     # 1. Create Reference Camera matching footage aspect ratio
     cam_name = "Camera_2D_Viewer"
     cam_data = bpy.data.cameras.get("Camera_2D_Data") or bpy.data.cameras.new("Camera_2D_Data")
+    cam_data.sensor_fit = 'HORIZONTAL'
     cam_data.sensor_width = 36.0
     cam_data.lens = 50.0
     cam_data.display_size = 0.5
@@ -1358,7 +1419,8 @@ def {func_name}():
                 img_data.source = 'SEQUENCE'
                 bg.image = img_data
                 bg.image_user.frame_duration = len(frame_files)
-                bg.image_user.frame_start = 1
+                # file 1 is the clip's first frame, which sits on the timeline start
+                bg.image_user.frame_start = {plate_start}
                 bg.image_user.use_auto_refresh = True
                 bg.alpha = 0.85
                 bg.display_depth = 'BACK'
@@ -1370,7 +1432,7 @@ def {func_name}():
         cam_obj = bpy.data.objects.new(cam_name, cam_data)
         scene.collection.objects.link(cam_obj)
 
-    cam_obj.location = (0.0, 0.0, 2.7475)
+    cam_obj.location = (0.0, 0.0, 50.0 / 18.0)
     cam_obj.rotation_euler = (0.0, 0.0, 0.0)
     scene.camera = cam_obj
 
@@ -1406,17 +1468,19 @@ if __name__ == "__main__":
 '''
 
 
-def export_2d_blender_empties(tracks_rescaled, vis, orig_w, orig_h, fps, out_path, images_dir=None, collection_name="CoTracker_2D_Tracks", start_frame=1, frame_step=1):
+def export_2d_blender_empties(tracks_rescaled, vis, orig_w, orig_h, fps, out_path, images_dir=None, collection_name="CoTracker_2D_Tracks", start_frame=1, frame_step=1,
+                              timeline_start=None):
     layers = [{"collection": collection_name, "prefix": "Track_2D_", "tracks": tracks_rescaled}]
     script = _blender_tracks_script(layers, orig_w, orig_h, fps, images_dir, start_frame, frame_step,
                                     "1-CLICK BLENDER 2D POINT TRACKS & REFERENCE CAMERA IMPORTER",
-                                    "import_2d_tracks")
+                                    "import_2d_tracks", timeline_start=timeline_start)
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(script)
     return True
 
 
-def export_multi_layer_blender(layers_data, orig_w, orig_h, fps, out_path, images_dir=None, start_frame=1, frame_step=1):
+def export_multi_layer_blender(layers_data, orig_w, orig_h, fps, out_path, images_dir=None, start_frame=1, frame_step=1,
+                               timeline_start=None):
     """
     Generates a master Blender script creating separate collections for each tracking layer.
     """
@@ -1426,7 +1490,7 @@ def export_multi_layer_blender(layers_data, orig_w, orig_h, fps, out_path, image
         layers.append({"collection": f"Layer_{l_name}", "prefix": f"{l_name}_Track_", "tracks": ldata["tracks"]})
     script = _blender_tracks_script(layers, orig_w, orig_h, fps, images_dir, start_frame, frame_step,
                                     "1-CLICK BLENDER MULTI-LAYER 2D POINT TRACKS & REFERENCE CAMERA IMPORTER",
-                                    "import_multi_layer_tracks")
+                                    "import_multi_layer_tracks", timeline_start=timeline_start)
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(script)
     return True
@@ -1724,7 +1788,8 @@ def _export_layer_files(ldata, out_dir, orig_w, orig_h, fps, images_dir, fr, tim
     export_2d_nuke_tracker(tracks, vis, orig_w, orig_h, fps, out_dir / "tracks_2d_nuke.nk", node_name=node_name, conf=conf, **fr)
     export_2d_after_effects_jsx(tracks, vis, orig_w, orig_h, fps, out_dir / "tracks_2d_ae.jsx", **ae_fr)
     export_2d_blender_empties(tracks, vis, orig_w, orig_h, fps, out_dir / "tracks_2d_blender.py",
-                              images_dir=images_dir, collection_name=collection_name, **fr)
+                              images_dir=images_dir, collection_name=collection_name,
+                              timeline_start=timeline_start, **fr)
     log(f"   ✔ [{ldata['name']}] JSON, CSV, Nuke Tracker4, After Effects and Blender scripts written.", "#00ff88")
 
     if not ldata.get("export_cornerpin"):
@@ -1796,7 +1861,7 @@ def write_2d_exports(layers_results, out_dir, orig_w, orig_h, fps, images_dir, f
         log(f"   ✔ Generated Multi-Layer Nuke Tracker: {nuke_path.name}", "#00ff88")
 
         export_multi_layer_blender(layers_results, orig_w, orig_h, fps, blender_path,
-                                   images_dir=images_dir, **fr)
+                                   images_dir=images_dir, timeline_start=timeline_start, **fr)
         log(f"   ✔ Generated Multi-Layer Blender Script: {blender_path.name}", "#00ff88")
 
         # Master combined JSON

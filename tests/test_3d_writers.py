@@ -67,7 +67,6 @@ BackdropNode {
  bdheight 480
  z_order 0
 }
-push $cut_paste_input
 Read {
  inputs 0
  file "IMGDIR/frame_%06d.png"
@@ -84,7 +83,7 @@ Read {
  xpos -180
  ypos 0
 }
-push $cut_paste_input
+set RigPlate [stack 0]
 Camera3 {
  inputs 0
  rot_order XYZ
@@ -99,7 +98,7 @@ Camera3 {
  xpos 0
  ypos 100
 }
-push $cut_paste_input
+set RigCamera [stack 0]
 ReadGeo2 {
  inputs 0
  file "PLYPATH"
@@ -108,18 +107,21 @@ ReadGeo2 {
  xpos 160
  ypos 0
 }
+set RigPoints [stack 0]
+push $RigPoints
 Scene {
- inputs 2
+ inputs 1
  name Scene3D
  selected false
  xpos 160
  ypos 140
 }
+set RigScene [stack 0]
+push $RigCamera
+push $RigScene
+push $RigPlate
 ScanlineRender {
  inputs 3
- bg Plate_Footage
- obj Scene3D
- cam Solved_Camera
  output_motion_vectors false
  name ScanlineRender_Comp
  selected false
@@ -171,7 +173,8 @@ def test_nuke_ground_card_and_mesh_are_in_the_y_up_world(tmp_path):
     assert tr[1] == pytest.approx(-2.0, abs=0.05)
     assert rot[0] == pytest.approx(-90.0, abs=1.0)
     assert "TransformGeo {\n inputs 1\n rot_order XYZ\n rotate {180 0 0}\n name Environment_Mesh" in nk
-    assert "\n inputs 4\n name Scene3D" in nk
+    # point cloud, ground card and mesh: one Scene input each
+    assert "\n inputs 3\n name Scene3D" in nk
 
 
 def test_ply_writer_is_y_up_with_unix_newlines(tmp_path):

@@ -251,7 +251,8 @@ def test_timewarp_maps_the_timeline_onto_the_stepped_frames(tmp_path):
     assert "TimeWarp {\n inputs 1\n" in nk and "name Plate_Timewarp" in nk
     # the Read keeps its own 1..M numbering; the TimeWarp does the mapping
     assert "frame_mode" not in nk
-    assert " bg Plate_Timewarp\n" in nk
+    # ...and it is the TimeWarp, saved as $RigPlate, that ScanlineRender gets as bg
+    assert "name Plate_Timewarp\n" in nk.split("set RigPlate [stack 0]")[0]
 
     lookup = nuke_lookup(nk)
     assert lookup(1001) == 1

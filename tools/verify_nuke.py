@@ -1,11 +1,13 @@
 """
 Check an exported camera inside Nuke and print a report to paste back.
 
-Three things in the Nuke export were written to the documented conventions but
+Four things in the Nuke export were written to the documented conventions but
 have never been confirmed inside Nuke itself: the sign of the camera's window
 translate, whether the .chan importer tolerates the two leading comment lines,
-and whether the Read lands the plate on the timeline frames we claim. This
-script answers all three and says plainly which look wrong.
+whether the Read lands the plate on the timeline frames we claim, and whether
+the stack order in the .nk file wires ScanlineRender (bg = plate, obj = Scene,
+cam = camera) and the STMaps (src = image, stmap = map) the way it is meant
+to. This script answers all four and says plainly which look wrong.
 
 Run it inside Nuke (Script Editor, or `nuke -t verify_nuke.py <scene folder>`):
 
@@ -39,6 +41,60 @@ def find_scene():
         if os.path.isdir(d) and os.path.getmtime(d) > best_t:
             best, best_t = d, os.path.getmtime(d)
     return best
+
+
+def _named(nodes, base):
+    """The pasted node whose name is `base`, or `base` plus the digits Nuke adds on a clash."""
+    for n in nodes:
+        name = n.name()
+        if name == base or (name.startswith(base) and name[len(base):].isdigit()):
+            return n
+    return None
+
+
+def _input_name(node, i):
+    src = node.input(i)
+    return src.name() if src is not None else None
+
+
+def check_wiring(added):
+    """Every input of the rig and the STMap chain, against what the export meant."""
+    print("\nWiring")
+    render = _named(added, "ScanlineRender_Comp")
+    plate = _named(added, "Plate_Timewarp") or _named(added, "Plate_Footage")
+    scene3d = _named(added, "Scene3D")
+    cam = _named(added, "Solved_Camera")
+    if render is None:
+        print(BAD + "no ScanlineRender_Comp in the script")
+    else:
+        for i, label, want in ((0, "bg", plate), (1, "obj", scene3d), (2, "cam", cam)):
+            got = _input_name(render, i)
+            ok = want is not None and got == want.name()
+            print((OK if ok else BAD) + "ScanlineRender input %d (%s) = %s  (expected %s)"
+                  % (i, label, got, want.name() if want is not None else "?"))
+    if scene3d is not None:
+        geo = [_input_name(scene3d, i) for i in range(scene3d.inputs())]
+        points = _named(added, "Sparse_PointCloud")
+        ok = points is not None and points.name() in geo and None not in geo
+        print((OK if ok else BAD) + "Scene3D inputs = %s" % ", ".join(str(g) for g in geo))
+
+    undist = _named(added, "Undistort_Plate")
+    if undist is not None:
+        for i, label, base in ((0, "src", "Plate_Original"), (1, "stmap", "Undistort_Map")):
+            want = _named(added, base)
+            got = _input_name(undist, i)
+            ok = want is not None and got == want.name()
+            print((OK if ok else BAD) + "Undistort_Plate input %d (%s) = %s  (expected %s)"
+                  % (i, label, got, base))
+    redist = _named(added, "Redistort_Comp")
+    if redist is not None:
+        got_src = _input_name(redist, 0)
+        print((OK if got_src is None else BAD) + "Redistort_Comp input 0 (src) = %s  (expected empty)"
+              % got_src)
+        want = _named(added, "Redistort_Map")
+        got = _input_name(redist, 1)
+        ok = want is not None and got == want.name()
+        print((OK if ok else BAD) + "Redistort_Comp input 1 (stmap) = %s  (expected Redistort_Map)" % got)
 
 
 def report(scene):
@@ -132,6 +188,8 @@ def report(scene):
 
     for s in stmaps:
         print("\nSTMap '%s' (disabled=%s)" % (s.name(), s["disable"].value() if "disable" in s.knobs() else "?"))
+
+    check_wiring(added)
 
     # --- chan -------------------------------------------------------------
     chan = os.path.join(scene, "camera_track.chan")

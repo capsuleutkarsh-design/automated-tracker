@@ -210,17 +210,18 @@ def test_the_stmap_nodes_appear_only_when_the_maps_were_written(tmp_path):
     redist = str(given["redistort_map"]).replace("\\", "/")
     assert f' file "{undist}"\n name Undistort_Map\n' in nk
     assert f' file "{redist}"\n name Redistort_Map\n' in nk
-    # The original plate goes into the undistort STMap, the map into its second
-    # input - the two nodes just above it, deepest first.
+    # The original plate goes into the undistort STMap's src (input 0, the top
+    # of the stack), the map into its stmap input (1): map first, plate pushed
+    # on top of it.
     chain = nk[nk.index("Plate_Original"):]
     assert chain.index("name Undistort_Map") < chain.index("name Undistort_Plate")
-    assert "STMap {\n inputs 2\n channels rgba\n name Undistort_Plate\n" in nk
+    assert "}\npush $LensPlate\nSTMap {\n inputs 2\n channels rgba\n name Undistort_Plate\n" in nk
     # ...and that plate is the one the artist shot, at its own timeline offset.
     images_dir = str(scene / "images").replace(chr(92), "/")
     assert f' file "{images_dir}/frame_%06d.png"\n' in nk
     assert " name Plate_Original\n" in nk
     # The redistort one is ready but off, and its source input is left empty.
-    assert "push 0\nRead {" in nk
+    assert "push 0\nSTMap {" in nk
     assert "STMap {\n inputs 2\n channels rgba\n disable true\n name Redistort_Comp\n" in nk
     assert "Lens_Distortion" in nk
 

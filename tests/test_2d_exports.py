@@ -37,21 +37,117 @@ TRACKER4_ROW_1 = (
 )
 
 
+# The `tracks` knob the way Nuke saves it: the size block, the 31 column
+# definitions, then one row per track. Written from memory of Nuke 12-15 saved
+# scripts - still to be confirmed by pasting the file into a real Nuke.
+TRACKER4_COLUMNS_GOLDEN = """{ { 5 1 20 enable e 1 }
+{ 3 1 75 name name 1 }
+{ 2 1 58 track_x track_x 1 }
+{ 2 1 58 track_y track_y 1 }
+{ 2 1 63 offset_x offset_x 1 }
+{ 2 1 63 offset_y offset_y 1 }
+{ 4 1 27 T T 1 }
+{ 4 1 27 R R 1 }
+{ 4 1 27 S S 1 }
+{ 2 0 45 error error 1 }
+{ 1 1 0 error_min error_min 1 }
+{ 1 1 0 error_max error_max 1 }
+{ 1 1 0 pattern_x pattern_x 1 }
+{ 1 1 0 pattern_y pattern_y 1 }
+{ 1 1 0 pattern_r pattern_r 1 }
+{ 1 1 0 pattern_t pattern_t 1 }
+{ 1 1 0 search_x search_x 1 }
+{ 1 1 0 search_y search_y 1 }
+{ 1 1 0 search_r search_r 1 }
+{ 1 1 0 search_t search_t 1 }
+{ 2 1 0 key_track key_track 1 }
+{ 2 1 0 key_search_x key_search_x 1 }
+{ 2 1 0 key_search_y key_search_y 1 }
+{ 2 1 0 key_search_r key_search_r 1 }
+{ 2 1 0 key_search_t key_search_t 1 }
+{ 2 1 0 key_track_x key_track_x 1 }
+{ 2 1 0 key_track_y key_track_y 1 }
+{ 2 1 0 key_track_r key_track_r 1 }
+{ 2 1 0 key_track_t key_track_t 1 }
+{ 2 1 0 key_centre_offset_x key_centre_offset_x 1 }
+{ 2 1 0 key_centre_offset_y key_centre_offset_y 1 }
+}
+"""
+
+
+def _tracker4_row(name, x, y):
+    return ('{ {curve K x1001 1} "%s" {curve x1001 %s x1002 %s} {curve x1001 %s x1002 %s} '
+            '{curve K x1001 0} {curve K x1001 0} 1 0 0 {curve x1001 0.0000 x1002 0.0000} 0 1 '
+            '-15 -15 15 15 -25 -25 25 25 '
+            '{} {} {} {} {} {} {} {} {} {} {} }' % (name, x[0], x[1], y[0], y[1]))
+
+
 def test_tracker4_golden(tmp_path):
     out = tmp_path / "t.nk"
     assert c2d.export_2d_nuke_tracker(TRACKS, VIS, W, H, FPS, out, start_frame=1001)
-    text = _read(out)
-    expected_head = (
+    expected = (
         "set cut_paste_input [stack 0]\n"
         "version 14.0 v1\n"
         "push $cut_paste_input\n"
         "Tracker4 {\n"
         " tracks { { 1 31 4 }\n"
-        "  { " + TRACKER4_ROW_1 + "\n"
+        + TRACKER4_COLUMNS_GOLDEN +
+        "{\n"
+        " " + TRACKER4_ROW_1 + "\n"
+        " " + _tracker4_row("track_002", ("100.00", "101.00"), ("80.00", "79.00")) + "\n"
+        " " + _tracker4_row("track_003", ("100.00", "101.00"), ("10.00", "9.00")) + "\n"
+        " " + _tracker4_row("track_004", ("10.00", "11.00"), ("10.00", "9.00")) + "\n"
+        "}\n"
+        "}\n"
+        " name CoTracker2D_Tracker\n selected true\n xpos 0\n ypos 0\n}\n"
     )
-    assert text.startswith(expected_head)
-    assert text.endswith(" }\n }\n name CoTracker2D_Tracker\n selected true\n xpos 0\n ypos 0\n}\n")
-    assert text.count('"track_0') == 4
+    assert _read(out) == expected
+    assert TRACKER4_ROW_1 == _tracker4_row("track_001", ("10.00", "11.00"), ("80.00", "79.00"))
+
+
+def _brace_split(text):
+    """Top-level {...} groups and bare words of a Tcl list, the way Nuke splits a row."""
+    out, depth, cur = [], 0, ""
+    for ch in text:
+        if ch == "{":
+            depth += 1
+            if depth == 1:
+                cur = ""
+                continue
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                out.append("{" + cur + "}")
+                cur = ""
+                continue
+        if depth == 0:
+            if ch.isspace():
+                if cur:
+                    out.append(cur)
+                cur = ""
+            else:
+                cur += ch
+        else:
+            cur += ch
+    if cur:
+        out.append(cur)
+    return out
+
+
+def test_tracker4_every_row_has_one_value_per_column(tmp_path):
+    out = tmp_path / "t.nk"
+    c2d.export_2d_nuke_tracker(TRACKS, VIS, W, H, FPS, out, start_frame=1001)
+    text = _read(out)
+    assert len(c2d.TRACKER4_COLUMNS) == 31
+    names = [c.split()[4] for c in c2d.TRACKER4_COLUMNS]
+    assert names[:4] == ["enable", "name", "track_x", "track_y"]
+    assert names[9] == "error" and names[-1] == "key_centre_offset_y"
+    rows_block = text.split("}\n{\n", 1)[1].rsplit("}\n}\n", 1)[0]
+    rows = [r.strip() for r in rows_block.strip().split("\n")]
+    assert len(rows) == 4
+    for row in rows:
+        assert row.startswith("{ ") and row.endswith(" }")
+        assert len(_brace_split(row[2:-2])) == 31
 
 
 def test_tracker4_error_column_is_one_minus_confidence(tmp_path):

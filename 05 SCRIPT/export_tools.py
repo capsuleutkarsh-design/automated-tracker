@@ -102,6 +102,36 @@ def colmap_points_to(xyz, target, transform=None):
     return xyz @ WORLD_BASES[target].T
 
 
+def _nk_num(v):
+    """A knob value as Nuke would type it: 180, -90, 0.5, never -0 or 180.000000."""
+    text = ("%.6f" % (float(v) + 0.0)).rstrip("0").rstrip(".")
+    return "0" if text in ("-0", "") else text
+
+
+def mesh_placement(target, transform=None):
+    """
+    (translate, rotate XYZ in degrees, uniform scale) for a mesh read in COLMAP's world.
+
+    environment_mesh.ply is written by COLMAP and is not rewritten, so the DCC
+    has to move it the way colmap_points_to moves the points: the artist's
+    scene transform first (s * Rot @ p + t, in COLMAP's world), then the
+    target's basis W. Together that is one similarity,
+        p' = s * (W @ Rot) @ p + W @ t,
+    which a TransformGeo or a Blender object holds as a uniform scale, an XYZ
+    rotation and a translation (scale before rotate before translate - the
+    default order in both). Without a scene transform it is the plain basis
+    change: rotate 180 about X in Nuke, -90 about X in Blender.
+    """
+    W = WORLD_BASES[target]
+    s, Rot, t = transforms.parts(transform)
+    if transform is None or transforms.is_identity(transform):
+        s, Rot, t = 1.0, np.eye(3), np.zeros(3)
+    R = W @ Rot
+    loc = W @ np.asarray(t, dtype=float) + 0.0
+    rot = tuple(math.degrees(a) + 0.0 for a in rotmat2euler(R))
+    return loc, rot, float(s)
+
+
 def usd_matrix_rows(C, R):
     """
     The 16 row-major values for Gf.Matrix4d(...) of a camera-to-world pose.
@@ -911,6 +941,12 @@ def export_blender_script(scene_dir, cameras, images, points, output_script_path
     output_script_dir_str = str(Path(output_script_path).parent).replace('\\', '/')
     ply_path_str = str(Path(output_script_path).parent / "points3D.ply").replace('\\', '/')
     mesh_path_str = str(scene_path / "environment_mesh.ply").replace('\\', '/')
+    # The mesh is in COLMAP's world; carry it through the Scene Setup transform
+    # and into Blender's Z-up exactly as the points were (see mesh_placement).
+    mesh_loc, mesh_rot, mesh_scale = mesh_placement("blender", scene_transform)
+    mesh_loc_repr = "(%.6f, %.6f, %.6f)" % tuple(float(v) + 0.0 for v in mesh_loc)
+    mesh_rot_repr = ", ".join("math.radians(%.6f)" % (float(v) + 0.0) for v in mesh_rot)
+    mesh_scale_repr = "(%.6f, %.6f, %.6f)" % ((mesh_scale,) * 3)
     image_exts_repr = repr((img_ext,) if img_ext else IMAGE_EXTS)
     try:
         _ensure_script_dir_on_path()
@@ -1169,7 +1205,8 @@ def setup_tracked_scene():
             print(f"Notice on ground plane: {{e}}")
 
     # 6. 3D Environment Surface Mesh (if available). COLMAP writes it in its own
-    #    world (y down), so -90 deg about X brings it into Blender's Z-up.
+    #    world (y down): the Scene Setup transform (scale, ground, origin) and
+    #    then -90 deg about X bring it into Blender's Z-up, like the points.
     mesh_path = r"{mesh_path_str}"
     if os.path.exists(mesh_path):
         try:
@@ -1183,7 +1220,10 @@ def setup_tracked_scene():
             if imported_mesh:
                 imported_mesh.name = "Environment_Mesh"
                 imported_mesh.display_type = 'WIRE'
-                imported_mesh.rotation_euler = (math.radians(-90.0), 0.0, 0.0)
+                imported_mesh.rotation_mode = 'XYZ'
+                imported_mesh.rotation_euler = ({mesh_rot_repr})
+                imported_mesh.location = {mesh_loc_repr}
+                imported_mesh.scale = {mesh_scale_repr}
                 if imported_mesh.name not in col.objects:
                     col.objects.link(imported_mesh)
                 if imported_mesh.name in scene.collection.objects:
@@ -1475,7 +1515,6 @@ def export_nuke_camera_script(scene_dir, cameras, images, points, output_nk_path
     #    can fix that, so a TimeWarp maps the timeline onto them instead and
     #    holds the ends.
     timewarp_node_str = ""
-    plate_input = "Plate_Footage"
     img_dir_str = str(img_dir).replace('\\', '/')
     if undistorted_plate:
         img_seq_path = undistorted_plate["pattern"]
@@ -1495,7 +1534,6 @@ def export_nuke_camera_script(scene_dir, cameras, images, points, output_nk_path
     frame_knobs = f" frame_mode offset\n frame {read_offset}\n" if read_offset else ""
 
     if step > 1 and not (source_sequence and not undistorted_plate):
-        plate_input = "Plate_Timewarp"
         timewarp_node_str = f'''TimeWarp {{
  inputs 1
  lookup {{{{clamp((frame - {timeline_start}) / {step} + 1, {read_first}, {read_last})}}}}
@@ -1510,15 +1548,23 @@ def export_nuke_camera_script(scene_dir, cameras, images, points, output_nk_path
     # RANSAC ground plane for Nuke Card (fitted once by the caller so Blender and Nuke agree)
     if ground is None:
         ground = fit_ground_plane(points, scene_transform)
+    # HOW THE RIG IS WIRED. A .nk file is a stack machine: every node is pushed
+    # when it is written, a node with `inputs N` pops the top N, and the one on
+    # TOP becomes its input 0 (the next one down input 1, and so on). Relying
+    # on whatever happens to be on the stack is how the old rig came out wired
+    # as bg=Scene, obj=Camera, cam=empty. So every node here is written once,
+    # saved with `set <name> [stack 0]`, and the inputs of Scene and
+    # ScanlineRender are pushed explicitly just before them, last input first.
+    # Scene's inputs are the geometry: the point cloud, then the ground card
+    # and the mesh when they exist.
+    scene_geo = ["RigPoints"]
     card_node_str = ""
-    extra_inputs = 0
     if ground is not None:
         loc_nuke, norm_nuke = ground.in_convention("nuke")
         # a Card faces +Z; rotate it onto the fitted normal (degrees, XYZ order)
         crx, cry, crz = (math.degrees(a) for a in rotmat2euler(rotation_from_z_to(norm_nuke)))
-        extra_inputs += 1
-        card_node_str = f'''push $cut_paste_input
-Card2 {{
+        scene_geo.append("RigGround")
+        card_node_str = f'''Card2 {{
  inputs 0
  rot_order XYZ
  translate {{{loc_nuke[0]:.4f} {loc_nuke[1]:.4f} {loc_nuke[2]:.4f}}}
@@ -1530,17 +1576,26 @@ Card2 {{
  xpos 320
  ypos 0
 }}
+set RigGround [stack 0]
 '''
 
-    # 3D Environment Mesh node. COLMAP writes the mesh in its own world (y down),
-    # so a half turn about X puts it in the Y-up world the camera lives in.
+    # 3D Environment Mesh node. COLMAP writes the mesh in its own world (y down)
+    # and it is not rewritten, so the TransformGeo does what colmap_points_to
+    # did to points3D.ply: the Scene Setup transform, then the half turn about
+    # X into the Y-up world the camera lives in (see mesh_placement).
     mesh_node_str = ""
     mesh_file = scene_path / "environment_mesh.ply"
     if mesh_file.exists():
-        extra_inputs += 1
+        scene_geo.append("RigMesh")
         mesh_ply_str = str(mesh_file).replace('\\', '/')
-        mesh_node_str = f'''push $cut_paste_input
-ReadGeo2 {{
+        m_loc, m_rot, m_scale = mesh_placement("nuke", scene_transform)
+        mesh_xform = ""
+        if any(abs(v) > 1e-12 for v in m_loc):
+            mesh_xform += f" translate {{{_nk_num(m_loc[0])} {_nk_num(m_loc[1])} {_nk_num(m_loc[2])}}}\n"
+        mesh_xform += f" rotate {{{_nk_num(m_rot[0])} {_nk_num(m_rot[1])} {_nk_num(m_rot[2])}}}\n"
+        if abs(m_scale - 1.0) > 1e-12:
+            mesh_xform += f" uniform_scale {_nk_num(m_scale)}\n"
+        mesh_node_str = f'''ReadGeo2 {{
  inputs 0
  file "{mesh_ply_str}"
  name Environment_Mesh_Geo
@@ -1551,15 +1606,17 @@ ReadGeo2 {{
 TransformGeo {{
  inputs 1
  rot_order XYZ
- rotate {{180 0 0}}
- name Environment_Mesh
+{mesh_xform} name Environment_Mesh
  selected false
  xpos 480
  ypos 70
 }}
+set RigMesh [stack 0]
 '''
 
-    scene_inputs = str(2 + extra_inputs)
+    # Last input first, so the point cloud ends on top as input 0.
+    scene_pushes = "".join(f"push ${name}\n" for name in reversed(scene_geo))
+    scene_inputs = str(len(scene_geo))
     nk_fps = float(fps) if fps else 24.0
     # The label is the first thing an artist reads: say that the camera is keyed
     # every Nth frame rather than letting the gaps look like a failed solve.
@@ -1570,10 +1627,12 @@ TransformGeo {{
     # original plate goes in, undistort.exr takes the bend out, and a disabled
     # STMap with redistort.exr already loaded waits for the comp's output.
     #
-    # The stack is the wiring in a .nk file. Inside this block nothing else is
-    # pushed, so `inputs 2` takes the two nodes just written, deepest first:
-    # src then stmap. `push 0` is Nuke's own spelling for "input left empty",
-    # which is how the redistort node keeps its src free for the artist.
+    # The stack is the wiring in a .nk file, and the node on TOP of the stack
+    # becomes input 0. An STMap's input 0 is src (the image to warp) and input
+    # 1 is stmap (the map), so each map Read is written first and the image
+    # pushed on top of it: the original plate (saved as $LensPlate) for the
+    # undistort node, and `push 0` - Nuke's own spelling for "input left
+    # empty" - for the redistort node, which keeps its src free for the comp.
     stmap_nodes_str = ""
     undistort_map = (undistort or {}).get("undistort_map")
     redistort_map = (undistort or {}).get("redistort_map")
@@ -1607,7 +1666,6 @@ TransformGeo {{
  bdheight 560
  z_order 0
 }}
-push $cut_paste_input
 Read {{
  inputs 0
  file "{orig_path}"
@@ -1622,6 +1680,7 @@ Read {{
  xpos -680
  ypos 0
 }}
+set LensPlate [stack 0]
 '''
         if undistort_map:
             stmap_nodes_str += f'''Read {{
@@ -1632,6 +1691,7 @@ Read {{
  xpos -540
  ypos 0
 }}
+push $LensPlate
 STMap {{
  inputs 2
  channels rgba
@@ -1643,8 +1703,7 @@ STMap {{
 }}
 '''
         if redistort_map:
-            stmap_nodes_str += f'''push 0
-Read {{
+            stmap_nodes_str += f'''Read {{
  inputs 0
  file "{str(redistort_map).replace(chr(92), '/')}"
  name Redistort_Map
@@ -1652,6 +1711,7 @@ Read {{
  xpos -540
  ypos 240
 }}
+push 0
 STMap {{
  inputs 2
  channels rgba
@@ -1682,7 +1742,6 @@ BackdropNode {{
  bdheight 480
  z_order 0
 }}
-push $cut_paste_input
 Read {{
  inputs 0
  file "{img_seq_path}"
@@ -1697,7 +1756,7 @@ Read {{
  xpos -180
  ypos 0
 }}
-{timewarp_node_str}push $cut_paste_input
+{timewarp_node_str}set RigPlate [stack 0]
 Camera3 {{
  inputs 0
  rot_order XYZ
@@ -1712,7 +1771,7 @@ Camera3 {{
  xpos 0
  ypos 100
 }}
-push $cut_paste_input
+set RigCamera [stack 0]
 ReadGeo2 {{
  inputs 0
  file "{ply_path_str}"
@@ -1721,18 +1780,20 @@ ReadGeo2 {{
  xpos 160
  ypos 0
 }}
-{card_node_str}{mesh_node_str}Scene {{
+set RigPoints [stack 0]
+{card_node_str}{mesh_node_str}{scene_pushes}Scene {{
  inputs {scene_inputs}
  name Scene3D
  selected false
  xpos 160
  ypos 140
 }}
+set RigScene [stack 0]
+push $RigCamera
+push $RigScene
+push $RigPlate
 ScanlineRender {{
  inputs 3
- bg {plate_input}
- obj Scene3D
- cam Solved_Camera
  output_motion_vectors false
  name ScanlineRender_Comp
  selected false
