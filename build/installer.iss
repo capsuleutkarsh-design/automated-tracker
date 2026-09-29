@@ -90,8 +90,10 @@ Source: "{#SrcRoot}\06 COTRACKER\checkpoints\*"; DestDir: "{app}\06 COTRACKER\ch
     Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; ---- optional sample footage ------------------------------------------------
-Source: "{#SrcRoot}\02 VIDEOS\*"; DestDir: "{app}\02 VIDEOS"; \
-    Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist; Tasks: sampleclip
+; The one sample clip by name: 02 VIDEOS on the build machine also holds
+; whatever clips were being worked on, and a wildcard would ship them all.
+Source: "{#SrcRoot}\02 VIDEOS\uhd_30fps.mp4"; DestDir: "{app}\02 VIDEOS"; \
+    Flags: ignoreversion skipifsourcedoesntexist; Tasks: sampleclip
 
 [InstallDelete]
 ; PyInstaller's _internal folder is replaced wholesale on upgrade. Without this,
