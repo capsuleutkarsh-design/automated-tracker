@@ -246,7 +246,7 @@ class CorrectionController:
         if checked and not (self._track_result and self._track_layer_map):
             self.btn_show_result.setChecked(False)
             QMessageBox.information(
-                self, "No 2D Result",
+                self.ctx.dialog_parent(), "No 2D Result",
                 self._track_problem or
                 "There is no 2D result for this shot yet.\n\nRun 2D Point Tracking first.")
             return
@@ -324,7 +324,7 @@ class CorrectionController:
         target = target or self._last_correction
         if not target:
             QMessageBox.information(
-                self, "Nothing to Re-track",
+                self.ctx.dialog_parent(), "Nothing to Re-track",
                 "Switch Result on, drag a tracked point onto the feature it slid off, "
                 "and then re-track from that frame.\n\n"
                 "You can also right-click any marker to re-track it from the frame in view.")
@@ -341,7 +341,7 @@ class CorrectionController:
         t = self.canvas.tracked_index_for_frame(frame)
         if block is None or layer is None or t is None:
             QMessageBox.warning(
-                self, "Frame Not in the Result",
+                self.ctx.dialog_parent(), "Frame Not in the Result",
                 "The saved result does not cover frame %d, so it cannot be re-tracked from "
                 "there." % (int(frame) + 1))
             return
@@ -370,7 +370,8 @@ class CorrectionController:
             "offline": "Offline" in self.ctx.ui.combo_2d_model.currentText(),
             "auto_chunk": self.ctx.ui.chk_vram_chunk.isChecked(),
         }
-        self.player.pause_playback()
+        if self.ctx.player is not None:
+            self.ctx.player.pause_playback()
         self.ctx.log_2d(
             "▶ Re-tracking [%s] point #%d from frame %d%s — one point only, not the grid."
             % (layer_name, int(point_index) + 1, int(frame) + 1,
@@ -394,7 +395,7 @@ class CorrectionController:
             return
         if not (self._track_result and self._track_layer_map):
             QMessageBox.information(
-                self, "No 2D Result",
+                self.ctx.dialog_parent(), "No 2D Result",
                 self._track_problem or
                 "There is no 2D result to export yet.\n\nRun 2D Point Tracking first.")
             return
@@ -413,12 +414,13 @@ class CorrectionController:
         self.ctx.log_2d(
             "▶ Re-exporting the corrected 2D tracks (no re-tracking, the overlay video "
             "stays as the last real track rendered it).", self.ctx.ACCENT)
+        fps = self.ctx.fps
         self.ctx.start_correction_worker({
             "mode": "export",
             "result": self._track_result,
             "track_root": self._track_root_for(shot),
             "layers_meta": layers_meta,
-            "fps": self.current_fps if self.current_fps and self.current_fps > 0 else 24.0,
+            "fps": fps if fps and fps > 0 else 24.0,
             "images_dir": self.ctx.scenes_dir / shot / "images",
             "timeline_start": int(self.ctx.timeline_start),
             "source_name": self.ctx.current_clip_name(),

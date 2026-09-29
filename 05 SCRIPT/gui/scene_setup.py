@@ -339,7 +339,7 @@ class SceneSetupPanel:
             self.ctx.show_2d_tab()
             self.ctx.log_3d(
                 "Picking %s points: click the amber solved points on the 2D tab." % which,
-                ACCENT)
+                self.ctx.ACCENT)
 
     def update_scene_overlay(self):
         """Reproject the solve onto the frame in view, or take the overlay away."""
